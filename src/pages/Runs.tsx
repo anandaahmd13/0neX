@@ -7,6 +7,8 @@ import { SendIcon, ClockIcon, TokenIcon } from '../components/icons'
 import { runs as seedRuns, workflows } from '../data/mock'
 import type { Run } from '../types'
 import { fmtTime, fmtDuration, fmtInt } from '../lib/format'
+import { useLogStream } from '../lib/useLogStream'
+import type { StreamStatus } from '../lib/useLogStream'
 import { cn } from '../lib/cn'
 
 export function Runs() {
@@ -116,7 +118,26 @@ export function Runs() {
   )
 }
 
+const streamMeta: Record<StreamStatus, { label: string; dot: string }> = {
+  live: { label: 'LIVE · WebSocket', dot: 'bg-ok' },
+  simulated: { label: 'SIMULASI', dot: 'bg-mustard' },
+  connecting: { label: 'MENYAMBUNG…', dot: 'bg-sky' },
+  closed: { label: '', dot: '' },
+}
+
 function RunDetail({ run }: { run: Run }) {
+  // Streaming aktif cuma buat run yang lagi jalan.
+  const streaming = run.status === 'running'
+  const { logs: liveLogs, status: streamStatus } = useLogStream({
+    enabled: streaming,
+    seed: run.logs,
+    agents: run.agentsInvolved.length ? run.agentsInvolved : ['Orchestrator'],
+  })
+
+  // Run yang jalan → pakai log streamed; selain itu → log historis.
+  const logs = streaming ? liveLogs : run.logs
+  const meta = streamMeta[streamStatus]
+
   return (
     <Card className="flex flex-col">
       <CardHeader
@@ -162,11 +183,25 @@ function RunDetail({ run }: { run: Run }) {
 
         {/* Logs terminal */}
         <div>
-          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-ink/40">
-            Log
+          <div className="mb-1.5 flex items-center justify-between">
+            <div className="text-[10px] font-bold uppercase tracking-wider text-ink/40">
+              Log
+            </div>
+            {streaming && meta.label && (
+              <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-ink/50">
+                <span
+                  className={cn(
+                    'inline-block h-2 w-2 rounded-full border border-ink',
+                    meta.dot,
+                    streamStatus !== 'closed' && 'animate-pulse',
+                  )}
+                />
+                {meta.label}
+              </div>
+            )}
           </div>
           <div className="term max-h-64 overflow-y-auto rounded-lg border-2 border-ink p-3 font-mono text-xs leading-relaxed">
-            {run.logs.map((log, i) => (
+            {logs.map((log, i) => (
               <div key={i} className="flex gap-2">
                 <span className="term-dim shrink-0">{log.ts}</span>
                 <span className="term-accent shrink-0">[{log.agent}]</span>
@@ -186,7 +221,7 @@ function RunDetail({ run }: { run: Run }) {
                 </span>
               </div>
             ))}
-            {run.status === 'running' && (
+            {streaming && (
               <div className="term-dim2 mt-1 flex items-center gap-2">
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-ok" />
                 streaming…
