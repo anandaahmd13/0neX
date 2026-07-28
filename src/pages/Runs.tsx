@@ -165,21 +165,21 @@ function RunDetail({ run }: { run: Run }) {
           <div className="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-ink/40">
             Log
           </div>
-          <div className="max-h-64 overflow-y-auto rounded-lg border-2 border-ink bg-ink p-3 font-mono text-xs leading-relaxed text-cream">
+          <div className="term max-h-64 overflow-y-auto rounded-lg border-2 border-ink p-3 font-mono text-xs leading-relaxed">
             {run.logs.map((log, i) => (
               <div key={i} className="flex gap-2">
-                <span className="shrink-0 text-cream/40">{log.ts}</span>
-                <span className="shrink-0 text-sky">[{log.agent}]</span>
+                <span className="term-dim shrink-0">{log.ts}</span>
+                <span className="term-accent shrink-0">[{log.agent}]</span>
                 <span
                   className={cn(
                     'break-words',
                     log.level === 'error'
-                      ? 'text-danger'
+                      ? 'term-error'
                       : log.level === 'warn'
-                        ? 'text-mustard'
+                        ? 'term-warn'
                         : log.level === 'debug'
-                          ? 'text-cream/50'
-                          : 'text-cream',
+                          ? 'term-dim'
+                          : '',
                   )}
                 >
                   {log.message}
@@ -187,7 +187,7 @@ function RunDetail({ run }: { run: Run }) {
               </div>
             ))}
             {run.status === 'running' && (
-              <div className="mt-1 flex items-center gap-2 text-cream/60">
+              <div className="term-dim2 mt-1 flex items-center gap-2">
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-ok" />
                 streaming…
               </div>

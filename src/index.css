@@ -33,9 +33,38 @@
   --shadow-hard-lg: 6px 6px 0 0 #1a1a1a;
 }
 
+/*
+  Dark theme — override the same tokens under html.dark so every
+  bg-cream / text-ink / border-ink utility remaps automatically.
+  "ink" becomes the light foreground, "cream/paper" become dark surfaces.
+*/
+html.dark {
+  --color-cream: #16160f;
+  --color-ink: #f4f1e6;
+  --color-paper: #23231a;
+
+  --color-mustard: #f5b338;
+  --color-mustard-dark: #d99c22;
+  --color-sky: #4bb4c4;
+  --color-sky-soft: #1d3438;
+
+  --color-ok: #57b869;
+  --color-warn: #f5b338;
+  --color-danger: #e8735a;
+  --color-idle: #6b6b5e;
+
+  /* Shadow ink stays dark-on-dark but a touch lighter for definition */
+  --shadow-hard: 4px 4px 0 0 #000000;
+  --shadow-hard-sm: 2px 2px 0 0 #000000;
+  --shadow-hard-lg: 6px 6px 0 0 #000000;
+}
+
 @layer base {
   html {
     color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
   }
   body {
     margin: 0;
@@ -44,6 +73,9 @@
     font-family: var(--font-mono);
     font-size: 16px;
     -webkit-font-smoothing: antialiased;
+    transition:
+      background-color 0.2s ease,
+      color 0.2s ease;
   }
   * {
     border-color: var(--color-ink);
@@ -92,10 +124,45 @@
   /* Faint grid background like tukeria hero */
   .bg-grid {
     background-image:
-      linear-gradient(to right, rgba(26, 26, 26, 0.04) 1px, transparent 1px),
-      linear-gradient(to bottom, rgba(26, 26, 26, 0.04) 1px, transparent 1px);
+      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
     background-size: 24px 24px;
   }
+}
+
+:root {
+  --grid-line: rgba(26, 26, 26, 0.04);
+}
+html.dark {
+  --grid-line: rgba(244, 241, 230, 0.05);
+}
+
+/*
+  Terminal log surface — fixed colors, theme-independent.
+  A console should always read as dark-bg / light-text in both themes
+  instead of inverting when the ink/cream tokens remap.
+*/
+.term {
+  background-color: #14140f;
+  color: #ece6d6;
+}
+.term-dim {
+  color: rgba(236, 230, 214, 0.42);
+}
+.term-dim2 {
+  color: rgba(236, 230, 214, 0.55);
+}
+.term-accent {
+  color: #6fd3e0;
+}
+.term-ok {
+  color: #6fcf7f;
+}
+.term-warn {
+  color: #f5b338;
+}
+.term-error {
+  color: #f2836b;
 }
 
 /* Scrollbar — thin, inky */

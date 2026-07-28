@@ -2,13 +2,15 @@ import { useState } from 'react'
 import type { ReactNode } from 'react'
 import { Sidebar } from './Sidebar'
 import { Button } from './ui/Button'
-import { MenuIcon, GitIcon } from './icons'
+import { MenuIcon, GitIcon, SunIcon, MoonIcon } from './icons'
+import { useTheme } from '../lib/theme'
 
 const PROMO =
   'model baru gpt · sol · terra · luna! orkestrasi agent lo sekarang di 0neX 🔥'
 
 export function Layout({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false)
+  const { theme, toggle } = useTheme()
 
   return (
     <div className="flex h-screen flex-col overflow-hidden">
@@ -45,6 +47,18 @@ export function Layout({ children }: { children: ReactNode }) {
             </div>
 
             <div className="flex items-center gap-2">
+              <button
+                onClick={toggle}
+                aria-label={theme === 'dark' ? 'Mode terang' : 'Mode gelap'}
+                title={theme === 'dark' ? 'Mode terang' : 'Mode gelap'}
+                className="press flex h-8 w-8 items-center justify-center rounded-lg border-2 border-ink bg-paper shadow-hard-sm"
+              >
+                {theme === 'dark' ? (
+                  <SunIcon width={16} height={16} />
+                ) : (
+                  <MoonIcon width={16} height={16} />
+                )}
+              </button>
               <Button variant="ghost" size="sm">
                 <GitIcon width={16} height={16} />
                 <span className="hidden sm:inline">Docs</span>
