@@ -123,7 +123,21 @@ export function useClaudeStream() {
     [cleanup],
   )
 
+  /**
+   * Batalin run yang lagi jalan. Kirim { type: "cancel" } ke bridge; bridge
+   * bakal kill proses dan balikin { done }, yang nge-set status jadi 'done'.
+   * Kalau socket udah nggak kebuka, cukup rapihin state lokal.
+   */
+  const stop = useCallback(() => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'cancel' }))
+    } else {
+      setStatus((s) => (s === 'running' || s === 'connecting' ? 'idle' : s))
+    }
+  }, [])
+
   useEffect(() => cleanup, [cleanup])
 
-  return { run, output, status, cleanup }
+  return { run, stop, output, status, cleanup }
 }

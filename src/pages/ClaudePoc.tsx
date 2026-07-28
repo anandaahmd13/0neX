@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Card, CardHeader, CardBody } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { PageTitle } from '../components/PageTitle'
-import { SendIcon } from '../components/icons'
+import { SendIcon, StopIcon } from '../components/icons'
 import { useClaudeStream } from '../lib/useClaudeStream'
 import type { ClaudeStatus } from '../lib/useClaudeStream'
 import { cn } from '../lib/cn'
@@ -20,7 +20,7 @@ const statusMeta: Record<ClaudeStatus, { label: string; dot: string }> = {
 
 export function ClaudePoc() {
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
-  const { run, output, status } = useClaudeStream()
+  const { run, stop, output, status } = useClaudeStream()
   const termRef = useRef<HTMLDivElement>(null)
 
   const busy = status === 'connecting' || status === 'running'
@@ -62,14 +62,21 @@ export function ClaudePoc() {
               />
               {meta.label}
             </div>
-            <Button
-              variant="primary"
-              onClick={() => run(prompt)}
-              disabled={busy || !prompt.trim()}
-            >
-              <SendIcon width={16} height={16} />
-              Jalankan Claude
-            </Button>
+            {busy ? (
+              <Button variant="ghost" onClick={() => stop()}>
+                <StopIcon width={16} height={16} />
+                Stop
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                onClick={() => run(prompt)}
+                disabled={!prompt.trim()}
+              >
+                <SendIcon width={16} height={16} />
+                Jalankan Claude
+              </Button>
+            )}
           </div>
         </CardBody>
       </Card>

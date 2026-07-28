@@ -204,7 +204,19 @@ wss.on('connection', (socket) => {
       return
     }
 
-    // Allowlist ketat: cuma type "run" + field prompt yang diproses.
+    // "cancel": stop run yang lagi jalan. Idempoten — aman walau nggak ada
+    // proses aktif. 'close' handler bakal ngirim { done } setelah kill.
+    if (msg?.type === 'cancel') {
+      if (child) {
+        send(socket, { type: 'chunk', text: '⏹ Dibatalkan oleh user' })
+        killChild(child)
+      } else {
+        send(socket, { type: 'error', text: 'Nggak ada run yang jalan' })
+      }
+      return
+    }
+
+    // Allowlist ketat: cuma type "run" + "cancel" yang diproses.
     if (msg?.type !== 'run') {
       send(socket, { type: 'error', text: `Tipe pesan nggak didukung: ${msg?.type}` })
       return
