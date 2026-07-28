@@ -7,6 +7,7 @@ import { Dashboard } from './pages/Dashboard'
 import { Agents } from './pages/Agents'
 import { Workflows } from './pages/Workflows'
 import { Runs } from './pages/Runs'
+import { ClaudePoc } from './pages/ClaudePoc'
 
 function NotFound() {
   return (
@@ -37,6 +38,7 @@ export default function App() {
                 <Route path="/agents" element={<Agents />} />
                 <Route path="/workflows" element={<Workflows />} />
                 <Route path="/runs" element={<Runs />} />
+                <Route path="/claude-poc" element={<ClaudePoc />} />
                 <Route path="*" element={<NotFound />} />
               </Routes>
             </Layout>

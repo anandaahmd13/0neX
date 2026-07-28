@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "ws": "node server/log-stream.mjs"
+    "ws": "node server/log-stream.mjs",
+    "claude-bridge": "node server/claude-bridge.mjs"
   },
   "dependencies": {
     "react": "^19.2.7",
