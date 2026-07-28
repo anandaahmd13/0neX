@@ -1,62 +1,85 @@
 @import 'tailwindcss';
 
 /*
-  0neX design system — cloned from tukeria.com (neo-brutalist)
-  Palette + tokens extracted via getComputedStyle on the live site.
+  0neX design system — NEON edition.
+  Neo-brutalist bones (2px borders, offset hard shadows, press interaction)
+  re-skinned with an electric neon palette + glow. Every surface reads off a
+  handful of CSS custom properties, so the whole app re-themes from this file
+  alone — components never hardcode a color.
+
+  Token roles (utility name -> meaning):
+    bg-cream   -> app base / canvas
+    bg-paper   -> raised surface (cards, inputs)
+    text-ink   -> foreground text + borders
+    bg-mustard -> PRIMARY accent   (neon cyan)
+    bg-sky     -> SECONDARY accent (neon magenta)
+    ok/warn/danger/idle -> semantic status
 */
 
 @theme {
-  /* Core surface */
-  --color-cream: #fafaf5;
-  --color-ink: #1a1a1a;
+  /* Core surface — light "daylight neon": near-white canvas, ink is deep space */
+  --color-cream: #f4f3ff;
+  --color-ink: #14121f;
   --color-paper: #ffffff;
 
-  /* Accents (from tukeria) */
-  --color-mustard: #faae2a;
-  --color-mustard-dark: #e59a1f;
-  --color-sky: #8bd3dd;
-  --color-sky-soft: #d6eff2;
+  /* Accents — neon (kept vivid enough to pop on the light canvas) */
+  --color-mustard: #00c2d1; /* PRIMARY  — neon cyan   */
+  --color-mustard-dark: #009fac;
+  --color-sky: #c026d3; /* SECONDARY — neon magenta */
+  --color-sky-soft: #f5d0fe;
 
-  /* Semantic status */
-  --color-ok: #6fcf7f;
-  --color-warn: #faae2a;
-  --color-danger: #f2836b;
-  --color-idle: #b8b8ad;
+  /* Semantic status — neon */
+  --color-ok: #10d979; /* neon green  */
+  --color-warn: #f5c211; /* neon amber  */
+  --color-danger: #ff2e63; /* neon pink-red */
+  --color-idle: #9a97b8;
+
+  /* Neon halo used inside glow shadows */
+  --neon-halo: rgba(0, 194, 209, 0.35);
 
   /* Fonts */
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
   --font-brand: 'Comfortaa', ui-sans-serif, system-ui, sans-serif;
 
-  /* Neo-brutalist shadow */
-  --shadow-hard: 4px 4px 0 0 #1a1a1a;
-  --shadow-hard-sm: 2px 2px 0 0 #1a1a1a;
-  --shadow-hard-lg: 6px 6px 0 0 #1a1a1a;
+  /* Neo-brutalist offset shadow + faint neon halo */
+  --shadow-hard: 4px 4px 0 0 var(--color-ink), 0 0 14px -4px var(--neon-halo);
+  --shadow-hard-sm: 2px 2px 0 0 var(--color-ink), 0 0 8px -4px var(--neon-halo);
+  --shadow-hard-lg: 6px 6px 0 0 var(--color-ink), 0 0 22px -4px var(--neon-halo);
 }
 
 /*
-  Dark theme — override the same tokens under html.dark so every
-  bg-cream / text-ink / border-ink utility remaps automatically.
-  "ink" becomes the light foreground, "cream/paper" become dark surfaces.
+  Dark theme — the star of the neon show. Deep near-black canvas, luminous
+  foreground, and shadows that GLOW neon instead of casting a black offset.
+  Same token names, so bg-cream / text-ink / bg-mustard remap automatically.
 */
 html.dark {
-  --color-cream: #16160f;
-  --color-ink: #f4f1e6;
-  --color-paper: #23231a;
+  --color-cream: #08070f; /* void black-violet canvas */
+  --color-ink: #e8f6ff; /* luminous foreground     */
+  --color-paper: #12111f; /* raised surface          */
 
-  --color-mustard: #f5b338;
-  --color-mustard-dark: #d99c22;
-  --color-sky: #4bb4c4;
-  --color-sky-soft: #1d3438;
+  --color-mustard: #22f0ff; /* PRIMARY  — electric cyan   */
+  --color-mustard-dark: #12c6d6;
+  --color-sky: #ff3df2; /* SECONDARY — hot neon magenta */
+  --color-sky-soft: #2a0f33;
 
-  --color-ok: #57b869;
-  --color-warn: #f5b338;
-  --color-danger: #e8735a;
-  --color-idle: #6b6b5e;
+  --color-ok: #39ff14; /* neon green   */
+  --color-warn: #ffe23d; /* neon yellow  */
+  --color-danger: #ff2e63; /* neon pink    */
+  --color-idle: #56536e;
 
-  /* Shadow ink stays dark-on-dark but a touch lighter for definition */
-  --shadow-hard: 4px 4px 0 0 #000000;
-  --shadow-hard-sm: 2px 2px 0 0 #000000;
-  --shadow-hard-lg: 6px 6px 0 0 #000000;
+  /* Brighter halo for the dark canvas */
+  --neon-halo: rgba(34, 240, 255, 0.55);
+
+  /*
+    On dark, the offset "shadow ink" becomes a neon cyan edge and the halo
+    does the heavy lifting — cards look like they're lit from within.
+  */
+  --shadow-hard: 3px 3px 0 0 rgba(34, 240, 255, 0.9),
+    0 0 20px -2px var(--neon-halo);
+  --shadow-hard-sm: 2px 2px 0 0 rgba(34, 240, 255, 0.85),
+    0 0 12px -2px var(--neon-halo);
+  --shadow-hard-lg: 5px 5px 0 0 rgba(34, 240, 255, 0.95),
+    0 0 32px -2px var(--neon-halo);
 }
 
 @layer base {
@@ -113,6 +136,16 @@ html.dark {
   .font-brand {
     font-family: var(--font-brand);
   }
+  /* Neon text glow — for brand marks / hero headings */
+  .neon-text {
+    text-shadow:
+      0 0 6px var(--neon-halo),
+      0 0 18px var(--neon-halo);
+  }
+  /* Standalone neon glow ring for focus / active states */
+  .neon-glow {
+    box-shadow: 0 0 18px -2px var(--neon-halo);
+  }
   @keyframes marquee {
     from {
       transform: translateX(0);
@@ -121,7 +154,7 @@ html.dark {
       transform: translateX(-100%);
     }
   }
-  /* Faint grid background like tukeria hero */
+  /* Faint neon grid background like a synthwave floor */
   .bg-grid {
     background-image:
       linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
@@ -131,41 +164,40 @@ html.dark {
 }
 
 :root {
-  --grid-line: rgba(26, 26, 26, 0.04);
+  --grid-line: rgba(192, 38, 211, 0.08);
 }
 html.dark {
-  --grid-line: rgba(244, 241, 230, 0.05);
+  --grid-line: rgba(34, 240, 255, 0.08);
 }
 
 /*
-  Terminal log surface — fixed colors, theme-independent.
-  A console should always read as dark-bg / light-text in both themes
-  instead of inverting when the ink/cream tokens remap.
+  Terminal log surface — fixed neon-on-black, theme-independent.
+  A console stays dark-bg / light-text in both themes with neon accents.
 */
 .term {
-  background-color: #14140f;
-  color: #ece6d6;
+  background-color: #06060c;
+  color: #d8f6ff;
 }
 .term-dim {
-  color: rgba(236, 230, 214, 0.42);
+  color: rgba(216, 246, 255, 0.4);
 }
 .term-dim2 {
-  color: rgba(236, 230, 214, 0.55);
+  color: rgba(216, 246, 255, 0.55);
 }
 .term-accent {
-  color: #6fd3e0;
+  color: #22f0ff;
 }
 .term-ok {
-  color: #6fcf7f;
+  color: #39ff14;
 }
 .term-warn {
-  color: #f5b338;
+  color: #ffe23d;
 }
 .term-error {
-  color: #f2836b;
+  color: #ff2e63;
 }
 
-/* Scrollbar — thin, inky */
+/* Scrollbar — neon thumb */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -174,7 +206,7 @@ html.dark {
   background: var(--color-cream);
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--color-ink);
+  background: var(--color-mustard);
   border: 2px solid var(--color-cream);
   border-radius: 0;
 }
