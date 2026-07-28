@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Env — jangan pernah commit kredensial/token asli
+.env
+.env.*
+!.env.example
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

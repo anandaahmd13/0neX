@@ -3,9 +3,25 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 export type ClaudeStatus = 'idle' | 'connecting' | 'running' | 'done' | 'error'
 
 // URL bridge Claude Code. Override lewat VITE_CLAUDE_WS_URL saat build/dev.
-const WS_URL =
+const WS_BASE =
   (import.meta.env.VITE_CLAUDE_WS_URL as string | undefined) ??
   'ws://localhost:8788'
+
+// Token handshake — bridge nolak koneksi tanpa token yang cocok. Ambil dari
+// env; kalau kosong, koneksi bakal ditolak dan UI nampilin error yang jelas.
+const WS_TOKEN = (import.meta.env.VITE_CLAUDE_WS_TOKEN as string | undefined) ?? ''
+
+/** Susun URL WS lengkap dengan token di query string. */
+function buildWsUrl(): string {
+  try {
+    const u = new URL(WS_BASE)
+    if (WS_TOKEN) u.searchParams.set('token', WS_TOKEN)
+    return u.toString()
+  } catch {
+    // WS_BASE nggak valid — balikin apa adanya, biar error muncul saat connect.
+    return WS_BASE
+  }
+}
 
 interface ChunkMsg {
   type: 'chunk'
@@ -56,7 +72,7 @@ export function useClaudeStream() {
 
       let ws: WebSocket
       try {
-        ws = new WebSocket(WS_URL)
+        ws = new WebSocket(buildWsUrl())
       } catch {
         setStatus('error')
         setOutput(['Gagal bikin koneksi ke bridge Claude Code'])

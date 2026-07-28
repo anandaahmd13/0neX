@@ -5,21 +5,86 @@
 // { type: "run", prompt: "<teks>" }, bridge nyalain `claude -p` dan
 // ngirim balik { type: "chunk" } per event, ditutup { type: "done" }.
 //
-// Keamanan: cuma binary "claude" yang dijalanin. Prompt dilewatin sebagai
-// argumen array (bukan shell string) biar aman dari injection. Nggak ada
-// command arbitrer dari client — cuma field `prompt` yang dipakai.
+// KEAMANAN — bridge ini nge-spawn Claude Code CLI, jadi setiap koneksi =
+// kemampuan jalanin proses di mesin ini. Lapisan proteksi:
+//   1. Bind ke 127.0.0.1 doang (HOST) — nggak kebuka ke jaringan.
+//   2. Wajib token (CLAUDE_BRIDGE_TOKEN) di query `?token=` handshake.
+//   3. Validasi Origin header terhadap allowlist (ALLOWED_ORIGINS).
+//   4. Prompt dilewatin sebagai argumen array (bukan shell string) — aman
+//      dari injection. Cuma binary "claude" + field `prompt` yang dipakai.
+//
+// Config lewat env:
+//   WS_PORT               (default 8788)
+//   WS_HOST               (default 127.0.0.1 — JANGAN 0.0.0.0 kecuali paham risikonya)
+//   CLAUDE_BRIDGE_TOKEN   (default: auto-generate + print saat start)
+//   ALLOWED_ORIGINS       (CSV, default: http://localhost:5199,http://127.0.0.1:5199 + dev vite umum)
 //
 // Jalankan: pnpm claude-bridge   (atau: node server/claude-bridge.mjs)
 
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 
 const PORT = Number(process.env.WS_PORT ?? 8788)
+// Default bind ke loopback — bridge TIDAK boleh kebuka ke jaringan tanpa sadar.
+const HOST = process.env.WS_HOST ?? '127.0.0.1'
+
+// Token wajib buat handshake. Kalau nggak di-set, auto-generate + print sekali
+// biar dev tetep aman-by-default tanpa harus setup manual.
+const TOKEN = process.env.CLAUDE_BRIDGE_TOKEN ?? randomBytes(24).toString('hex')
+const TOKEN_AUTOGEN = !process.env.CLAUDE_BRIDGE_TOKEN
+
+// Origin allowlist — tolak koneksi dari asal yang nggak dikenal (mis. web jahat
+// yang nyoba nyambung ke bridge lokal lewat browser korban).
+const DEFAULT_ORIGINS = [
+  'http://localhost:5199',
+  'http://127.0.0.1:5199',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+]
+const ALLOWED_ORIGINS = new Set(
+  (process.env.ALLOWED_ORIGINS?.split(',').map((s) => s.trim()).filter(Boolean) ??
+    DEFAULT_ORIGINS),
+)
 
 // Argumen tetap buat mode headless + streaming JSON.
 const CLAUDE_ARGS = ['--output-format', 'stream-json', '--verbose']
 
-const wss = new WebSocketServer({ port: PORT })
+/** Bandingin dua string secara constant-time biar nggak bocor lewat timing. */
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a))
+  const bb = Buffer.from(String(b))
+  if (ba.length !== bb.length) return false
+  return timingSafeEqual(ba, bb)
+}
+
+/**
+ * Gate handshake WS: cek Origin + token SEBELUM koneksi di-upgrade. Return
+ * true kalau boleh lanjut, atau tolak (return false) sambil nutup socket.
+ */
+function verifyClient({ origin, req }, done) {
+  // Origin: browser selalu ngirim; tool non-browser (mis. test) boleh tanpa.
+  if (origin && !ALLOWED_ORIGINS.has(origin)) {
+    console.warn(`[claude-bridge] tolak koneksi: origin nggak diizinkan (${origin})`)
+    done(false, 403, 'Origin tidak diizinkan')
+    return
+  }
+  // Token wajib, dikirim lewat query string `?token=...`.
+  let token = ''
+  try {
+    token = new URL(req.url, 'http://localhost').searchParams.get('token') ?? ''
+  } catch {
+    token = ''
+  }
+  if (!safeEqual(token, TOKEN)) {
+    console.warn('[claude-bridge] tolak koneksi: token salah/kosong')
+    done(false, 401, 'Token tidak valid')
+    return
+  }
+  done(true)
+}
+
+const wss = new WebSocketServer({ host: HOST, port: PORT, verifyClient })
 
 /** Kirim objek JSON ke socket kalau masih kebuka. */
 function send(socket, payload) {
@@ -186,4 +251,16 @@ wss.on('connection', (socket) => {
   })
 })
 
-console.log(`[claude-bridge] listening on ws://localhost:${PORT}`)
+console.log(`[claude-bridge] listening on ws://${HOST}:${PORT}`)
+if (TOKEN_AUTOGEN) {
+  // Token di-generate otomatis — print sekali biar client bisa dipakein.
+  // Set CLAUDE_BRIDGE_TOKEN sendiri kalau mau token stabil antar restart.
+  console.log(`[claude-bridge] token (auto): ${TOKEN}`)
+  console.log(`[claude-bridge] connect: ws://${HOST}:${PORT}/?token=${TOKEN}`)
+  console.log(
+    '[claude-bridge] set VITE_CLAUDE_WS_TOKEN=<token> di apps/web biar UI kepakein',
+  )
+} else {
+  console.log('[claude-bridge] token: dari env CLAUDE_BRIDGE_TOKEN')
+}
+console.log(`[claude-bridge] origin allowlist: ${[...ALLOWED_ORIGINS].join(', ')}`)
