@@ -1,6 +1,7 @@
 import { Routes, Route, Link, Navigate } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { ProtectedRoute } from './components/ProtectedRoute'
+import { ComingSoon } from './components/ComingSoon'
 import { Button } from './components/ui/Button'
 import { Login } from './pages/Login'
 import { Dashboard } from './pages/Dashboard'
@@ -33,18 +34,20 @@ export default function App() {
         path="/*"
         element={
           <ProtectedRoute>
-            <Layout>
-              <Routes>
-                <Route path="/" element={<Dashboard />} />
-                <Route path="/agents" element={<Agents />} />
-                <Route path="/workflows" element={<Workflows />} />
-                <Route path="/runs" element={<Runs />} />
-                <Route path="/gateway" element={<Gateway />} />
-                <Route path="/playground" element={<Playground />} />
-                <Route path="/claude-poc" element={<Navigate to="/playground" replace />} />
-                <Route path="*" element={<NotFound />} />
-              </Routes>
-            </Layout>
+            <ComingSoon>
+              <Layout>
+                <Routes>
+                  <Route path="/" element={<Dashboard />} />
+                  <Route path="/agents" element={<Agents />} />
+                  <Route path="/workflows" element={<Workflows />} />
+                  <Route path="/runs" element={<Runs />} />
+                  <Route path="/gateway" element={<Gateway />} />
+                  <Route path="/playground" element={<Playground />} />
+                  <Route path="/claude-poc" element={<Navigate to="/playground" replace />} />
+                  <Route path="*" element={<NotFound />} />
+                </Routes>
+              </Layout>
+            </ComingSoon>
           </ProtectedRoute>
         }
       />
