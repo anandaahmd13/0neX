@@ -6,7 +6,7 @@ import { MenuIcon, GitIcon, SunIcon, MoonIcon } from './icons'
 import { useTheme } from '../lib/theme'
 
 const PROMO =
-  'model baru gpt · sol · terra · luna! orkestrasi agent lo sekarang di 0neX 🔥'
+  '0neX — AI Helper · orkestrasi banyak AI agent dalam satu tempat · bikin, jalanin & pantau workflow agent lo 🚀'
 
 export function Layout({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false)
