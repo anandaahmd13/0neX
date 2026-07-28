@@ -1,12 +1,20 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge, AgentStatusBadge } from '../components/ui/Badge'
 import { PageTitle } from '../components/PageTitle'
-import { PlusIcon, TokenIcon, PulseIcon, ClockIcon, CheckIcon } from '../components/icons'
+import {
+  PlusIcon,
+  TokenIcon,
+  PulseIcon,
+  ClockIcon,
+  CheckIcon,
+  SearchIcon,
+} from '../components/icons'
 import { agents } from '../data/mock'
 import type { Agent, AgentStatus } from '../types'
 import { fmtCompact, fmtInt } from '../lib/format'
+import { useToast } from '../lib/toast'
 import { cn } from '../lib/cn'
 
 const filters: { key: AgentStatus | 'all'; label: string }[] = [
@@ -18,8 +26,23 @@ const filters: { key: AgentStatus | 'all'; label: string }[] = [
 ]
 
 export function Agents() {
+  const { push } = useToast()
   const [filter, setFilter] = useState<AgentStatus | 'all'>('all')
-  const list = agents.filter((a) => filter === 'all' || a.status === filter)
+  const [query, setQuery] = useState('')
+
+  const list = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return agents.filter((a) => {
+      if (filter !== 'all' && a.status !== filter) return false
+      if (!q) return true
+      return (
+        a.name.toLowerCase().includes(q) ||
+        a.role.toLowerCase().includes(q) ||
+        a.model.toLowerCase().includes(q) ||
+        a.tools.some((t) => t.toLowerCase().includes(q))
+      )
+    })
+  }, [filter, query])
 
   return (
     <div className="space-y-6">
@@ -27,37 +50,77 @@ export function Agents() {
         title="Agents"
         subtitle={`${agents.length} agent terdaftar di orchestrator lo.`}
         action={
-          <Button variant="primary">
+          <Button
+            variant="primary"
+            onClick={() => push('Bikin agent baru belum tersedia di demo', 'info')}
+          >
             <PlusIcon width={16} height={16} />
             Agent baru
           </Button>
         }
       />
 
-      {/* Filter pills */}
-      <div className="flex flex-wrap gap-2">
-        {filters.map((f) => (
-          <button
-            key={f.key}
-            onClick={() => setFilter(f.key)}
-            className={cn(
-              'rounded-lg border-2 border-ink px-3 py-1.5 text-sm font-semibold transition-all',
-              filter === f.key
-                ? 'bg-mustard shadow-hard-sm'
-                : 'bg-paper hover:bg-sky-soft',
-            )}
-          >
-            {f.label}
-          </button>
-        ))}
+      {/* Search + filter */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 sm:max-w-xs">
+          <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-ink/40">
+            <SearchIcon width={16} height={16} />
+          </span>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Cari agent, role, model, tool…"
+            className="w-full rounded-lg border-2 border-ink bg-paper py-1.5 pl-8 pr-3 text-sm outline-none placeholder:text-ink/40 focus:bg-cream"
+          />
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {filters.map((f) => (
+            <button
+              key={f.key}
+              onClick={() => setFilter(f.key)}
+              className={cn(
+                'rounded-lg border-2 border-ink px-3 py-1.5 text-sm font-semibold transition-all',
+                filter === f.key
+                  ? 'bg-mustard shadow-hard-sm'
+                  : 'bg-paper hover:bg-sky-soft',
+              )}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* Grid */}
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {list.map((a) => (
-          <AgentCard key={a.id} agent={a} />
-        ))}
-      </div>
+      {/* Grid / empty state */}
+      {list.length === 0 ? (
+        <div className="rounded-xl border-2 border-dashed border-ink/40 bg-paper/50 p-12 text-center">
+          <div className="font-brand text-2xl font-bold text-ink/40">
+            Nggak ada agent
+          </div>
+          <p className="mt-1 text-sm text-ink/50">
+            Coba ganti filter atau kata kunci pencarian.
+          </p>
+          {(query || filter !== 'all') && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="mt-4"
+              onClick={() => {
+                setQuery('')
+                setFilter('all')
+              }}
+            >
+              Reset filter
+            </Button>
+          )}
+        </div>
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {list.map((a) => (
+            <AgentCard key={a.id} agent={a} />
+          ))}
+        </div>
+      )}
     </div>
   )
 }

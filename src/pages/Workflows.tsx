@@ -4,7 +4,15 @@ import { Card, CardHeader } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
 import { PageTitle } from '../components/PageTitle'
-import { PlusIcon, BoltIcon, TrashIcon, PlayIcon, StopIcon } from '../components/icons'
+import {
+  PlusIcon,
+  BoltIcon,
+  TrashIcon,
+  PlayIcon,
+  StopIcon,
+  DownloadIcon,
+  UploadIcon,
+} from '../components/icons'
 import { workflows as seedWorkflows } from '../data/mock'
 import type { LogEntry, Run, Workflow, WorkflowNode, NodeKind } from '../types'
 import { fmtInt, fmtTime } from '../lib/format'
@@ -47,6 +55,59 @@ export function Workflows() {
   const { addRun, updateRun } = useRuns()
   const { push } = useToast()
   const navigate = useNavigate()
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Export workflow aktif jadi file JSON.
+  function exportWorkflow() {
+    if (!active) return
+    const blob = new Blob([JSON.stringify(active, null, 2)], {
+      type: 'application/json',
+    })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${active.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.0nex.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    push(`Workflow "${active.name}" diexport`, 'success')
+  }
+
+  // Validasi bentuk workflow yang di-import.
+  function isValidWorkflow(v: unknown): v is Workflow {
+    if (!v || typeof v !== 'object') return false
+    const w = v as Record<string, unknown>
+    return (
+      typeof w.name === 'string' &&
+      Array.isArray(w.nodes) &&
+      Array.isArray(w.edges)
+    )
+  }
+
+  async function importWorkflow(file: File) {
+    try {
+      const text = await file.text()
+      const parsed = JSON.parse(text)
+      if (!isValidWorkflow(parsed)) {
+        push('File bukan workflow 0neX yang valid', 'error')
+        return
+      }
+      // ID baru biar nggak bentrok sama yang ada.
+      const imported: Workflow = {
+        ...parsed,
+        id: newId(),
+        runs: parsed.runs ?? 0,
+        lastRun: parsed.lastRun ?? new Date().toISOString(),
+        description: parsed.description ?? 'Workflow hasil import.',
+      }
+      setWfList((list) => [...list, imported])
+      setActiveId(imported.id)
+      push(`Workflow "${imported.name}" berhasil di-import`, 'success')
+    } catch {
+      push('Gagal baca file — pastikan format JSON-nya bener', 'error')
+    }
+  }
 
   // Update satu workflow (immutable) di dalam list.
   const patchActive = useCallback(
@@ -94,7 +155,30 @@ export function Workflows() {
         title="Workflows"
         subtitle="Rangkai agent jadi alur kerja. Drag node buat mindahin, tarik dari titik kanan ke node lain buat nyambungin."
         action={
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0]
+                if (file) importWorkflow(file)
+                e.target.value = ''
+              }}
+            />
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <UploadIcon width={16} height={16} />
+              Import
+            </Button>
+            <Button variant="ghost" size="sm" onClick={exportWorkflow}>
+              <DownloadIcon width={16} height={16} />
+              Export
+            </Button>
             <Button variant="ghost" size="sm" onClick={resetToSeed}>
               Reset
             </Button>
