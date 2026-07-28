@@ -38,10 +38,10 @@ export function Layout({ children }: { children: ReactNode }) {
               </button>
               <div className="hidden items-center gap-2 sm:flex">
                 <span className="rounded-md border-2 border-ink bg-sky-soft px-2 py-0.5 text-xs font-semibold">
-                  v0.1
+                  v0.3
                 </span>
                 <span className="text-sm text-ink/60">
-                  AI Agent Orchestration
+                  Personal AI Gateway
                 </span>
               </div>
             </div>

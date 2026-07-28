@@ -7,6 +7,7 @@ import {
   WorkflowIcon,
   RunsIcon,
   BoltIcon,
+  PlayIcon,
   CloseIcon,
   LogoutIcon,
 } from './icons'
@@ -17,6 +18,7 @@ const nav = [
   { to: '/workflows', label: 'Workflows', icon: WorkflowIcon, end: false },
   { to: '/runs', label: 'Runs', icon: RunsIcon, end: false },
   { to: '/gateway', label: 'AI Gateway', icon: BoltIcon, end: false },
+  { to: '/playground', label: 'CLI Playground', icon: PlayIcon, end: false },
 ]
 
 export function Sidebar({
@@ -91,9 +93,9 @@ export function Sidebar({
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-ok opacity-75" />
                 <span className="relative inline-flex h-2.5 w-2.5 rounded-full border border-ink bg-ok" />
               </span>
-              Orchestrator online
+              Personal gateway
             </div>
-            <p className="mt-1 text-[11px] text-ink/60">4 agent aktif · 2 run jalan</p>
+            <p className="mt-1 text-[11px] text-ink/60">OpenAI-compatible · usage tracking</p>
           </div>
 
           {user && (

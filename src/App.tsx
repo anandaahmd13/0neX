@@ -1,4 +1,4 @@
-import { Routes, Route, Link } from 'react-router-dom'
+import { Routes, Route, Link, Navigate } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { ProtectedRoute } from './components/ProtectedRoute'
 import { Button } from './components/ui/Button'
@@ -8,6 +8,7 @@ import { Agents } from './pages/Agents'
 import { Workflows } from './pages/Workflows'
 import { Runs } from './pages/Runs'
 import { Gateway } from './pages/Gateway'
+import { Playground } from './pages/Playground'
 
 function NotFound() {
   return (
@@ -39,7 +40,8 @@ export default function App() {
                 <Route path="/workflows" element={<Workflows />} />
                 <Route path="/runs" element={<Runs />} />
                 <Route path="/gateway" element={<Gateway />} />
-                <Route path="/claude-poc" element={<Gateway />} />
+                <Route path="/playground" element={<Playground />} />
+                <Route path="/claude-poc" element={<Navigate to="/playground" replace />} />
                 <Route path="*" element={<NotFound />} />
               </Routes>
             </Layout>

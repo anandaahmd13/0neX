@@ -122,7 +122,7 @@ export function Agents() {
             <AgentCard
               key={a.id}
               agent={a}
-              onRun={() => navigate(`/gateway?agent=${a.id}`)}
+              onRun={() => navigate(`/playground?agent=${a.id}`)}
             />
           ))}
         </div>
