@@ -50,6 +50,17 @@ const ALLOWED_ORIGINS = new Set(
 // Argumen tetap buat mode headless + streaming JSON.
 const CLAUDE_ARGS = ['--output-format', 'stream-json', '--verbose']
 
+// --- Batas robustness (semua bisa di-override lewat env) ---
+// Timeout run: proses claude yang lewat batas ini di-kill paksa biar nggak
+// gantung selamanya nyedot resource.
+const RUN_TIMEOUT_MS = Number(process.env.CLAUDE_RUN_TIMEOUT_MS ?? 120_000)
+// Batas koneksi concurrent — cegah satu aktor spawn banyak proses via reconnect.
+const MAX_CLIENTS = Number(process.env.CLAUDE_MAX_CLIENTS ?? 4)
+// Batas panjang prompt (char) — tolak payload gede sebelum spawn.
+const MAX_PROMPT_LEN = Number(process.env.CLAUDE_MAX_PROMPT_LEN ?? 20_000)
+// Jeda antara SIGTERM dan SIGKILL saat kill proces (biar sempat cleanup).
+const KILL_GRACE_MS = Number(process.env.CLAUDE_KILL_GRACE_MS ?? 3_000)
+
 /** Bandingin dua string secara constant-time biar nggak bocor lewat timing. */
 function safeEqual(a, b) {
   const ba = Buffer.from(String(a))
@@ -94,6 +105,29 @@ function send(socket, payload) {
 }
 
 /**
+ * Kill proses child secara bertahap: SIGTERM dulu (biar sempat cleanup),
+ * lalu SIGKILL kalau masih hidup setelah KILL_GRACE_MS. Aman dipanggil
+ * berkali-kali dan buat child yang udah mati.
+ */
+function killChild(child) {
+  if (!child || child.killed) return
+  try {
+    child.kill('SIGTERM')
+  } catch {
+    // proses mungkin udah mati
+  }
+  const t = setTimeout(() => {
+    try {
+      if (!child.killed) child.kill('SIGKILL')
+    } catch {
+      // abaikan
+    }
+  }, KILL_GRACE_MS)
+  // Jangan tahan event loop cuma buat timer kill.
+  if (typeof t.unref === 'function') t.unref()
+}
+
+/**
  * Ambil teks yang enak dibaca dari satu event stream-json Claude Code.
  * Bentuk event beda-beda antar versi CLI, jadi kita coba beberapa jalur
  * umum dan fallback ke JSON mentah biar nggak ada info yang ilang.
@@ -133,10 +167,33 @@ function extractText(evt) {
 }
 
 wss.on('connection', (socket) => {
+  // Batas koneksi concurrent — tolak kalau udah penuh biar satu aktor nggak
+  // bisa nyedot resource lewat banyak koneksi. (wss.clients udah termasuk
+  // socket ini, jadi bandingin dengan > MAX_CLIENTS.)
+  if (wss.clients.size > MAX_CLIENTS) {
+    send(socket, {
+      type: 'error',
+      text: `Bridge penuh (maks ${MAX_CLIENTS} koneksi) — coba lagi nanti`,
+    })
+    socket.close()
+    return
+  }
+
   console.log(`[claude-bridge] client connected (${wss.clients.size} total)`)
 
   // Satu proses claude aktif per socket. Cegah run paralel dobel.
   let child = null
+  // Timer timeout run yang lagi jalan (di-clear saat proses selesai).
+  let runTimer = null
+
+  /** Bersihin timer + referensi child. Dipanggil di semua jalur akhir run. */
+  function clearRun() {
+    if (runTimer) {
+      clearTimeout(runTimer)
+      runTimer = null
+    }
+    child = null
+  }
 
   socket.on('message', (raw) => {
     let msg
@@ -159,6 +216,15 @@ wss.on('connection', (socket) => {
       return
     }
 
+    // Tolak prompt kegedean sebelum spawn — cegah abuse payload.
+    if (prompt.length > MAX_PROMPT_LEN) {
+      send(socket, {
+        type: 'error',
+        text: `Prompt kepanjangan (${prompt.length} char, maks ${MAX_PROMPT_LEN})`,
+      })
+      return
+    }
+
     if (child) {
       send(socket, { type: 'error', text: 'Masih ada run yang jalan — tunggu selesai' })
       return
@@ -170,10 +236,20 @@ wss.on('connection', (socket) => {
     try {
       child = spawn('claude', args, { stdio: ['ignore', 'pipe', 'pipe'] })
     } catch {
-      child = null
+      clearRun()
       send(socket, { type: 'error', text: 'claude CLI tidak ditemukan' })
       return
     }
+
+    // Arm timeout: proses yang lewat batas di-kill paksa + kabarin client.
+    runTimer = setTimeout(() => {
+      send(socket, {
+        type: 'error',
+        text: `Run timeout (${Math.round(RUN_TIMEOUT_MS / 1000)}s) — proses dihentikan`,
+      })
+      killChild(child)
+      // 'close' bakal firing setelah kill dan ngirim { done }.
+    }, RUN_TIMEOUT_MS)
 
     // Kalau binary nggak ada di PATH, error muncul async lewat 'error'.
     child.on('error', (err) => {
@@ -182,7 +258,7 @@ wss.on('connection', (socket) => {
         type: 'error',
         text: notFound ? 'claude CLI tidak ditemukan' : `Gagal spawn claude: ${err.message}`,
       })
-      child = null
+      clearRun()
     })
 
     // stdout: baca baris per baris, parse tiap baris stream-json.
@@ -230,24 +306,20 @@ wss.on('connection', (socket) => {
       stdoutBuf = ''
       stderrBuf = ''
       send(socket, { type: 'done', code })
-      child = null
+      clearRun()
     })
   })
 
   socket.on('close', () => {
-    // Bunuh proses yang masih jalan kalau client putus.
-    if (child) {
-      child.kill()
-      child = null
-    }
+    // Bunuh proses yang masih jalan kalau client putus (graceful → paksa).
+    killChild(child)
+    clearRun()
     console.log(`[claude-bridge] client disconnected (${wss.clients.size} left)`)
   })
 
   socket.on('error', () => {
-    if (child) {
-      child.kill()
-      child = null
-    }
+    killChild(child)
+    clearRun()
   })
 })
 
@@ -264,3 +336,7 @@ if (TOKEN_AUTOGEN) {
   console.log('[claude-bridge] token: dari env CLAUDE_BRIDGE_TOKEN')
 }
 console.log(`[claude-bridge] origin allowlist: ${[...ALLOWED_ORIGINS].join(', ')}`)
+console.log(
+  `[claude-bridge] limits: timeout=${RUN_TIMEOUT_MS}ms, maxClients=${MAX_CLIENTS}, ` +
+    `maxPromptLen=${MAX_PROMPT_LEN}, killGrace=${KILL_GRACE_MS}ms`,
+)
