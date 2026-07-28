@@ -23,7 +23,7 @@
 
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 
 const PORT = Number(process.env.WS_PORT ?? 8788)
 // Default bind ke loopback — bridge TIDAK boleh kebuka ke jaringan tanpa sadar.
@@ -135,7 +135,19 @@ function killChild(child) {
 function extractText(evt) {
   if (evt == null) return ''
 
-  // Event assistant/user: { message: { content: [{ type, text }] } }
+  // Event "result" akhir: teksnya DUPLIKAT dari event assistant terakhir yang
+  // sudah di-stream (dikonfirmasi ke output CLI v2.1.220). Skip biar jawaban
+  // nggak muncul dua kali. Return '' = jangan emit chunk.
+  if (evt.type === 'result') return ''
+
+  // Event system: "init" berguna sebagai penanda mulai; "thinking_tokens" cuma
+  // progress counter yang muncul belasan kali per run → skip biar nggak spam.
+  if (evt.type === 'system') {
+    if (evt.subtype === 'thinking_tokens') return ''
+    return `system: ${evt.subtype ?? ''}`.trim()
+  }
+
+  // Event assistant/user: { message: { content: [{ type, ... }] } }
   const content = evt.message?.content ?? evt.content
   if (Array.isArray(content)) {
     const parts = []
@@ -144,25 +156,22 @@ function extractText(evt) {
         parts.push(block)
       } else if (block?.type === 'text' && typeof block.text === 'string') {
         parts.push(block.text)
+      } else if (block?.type === 'thinking' && typeof block.thinking === 'string') {
+        // Blok reasoning — tanpa branch ini, jatuh ke fallback JSON mentah.
+        parts.push(`[thinking] ${block.thinking}`)
       } else if (block?.type === 'tool_use') {
-        parts.push(`⚙︎ tool_use: ${block.name ?? '?'}`)
+        const input = block.input ? ` ${JSON.stringify(block.input)}` : ''
+        parts.push(`⚙︎ tool_use: ${block.name ?? '?'}${input}`)
       } else if (block?.type === 'tool_result') {
         const t = typeof block.content === 'string' ? block.content : JSON.stringify(block.content)
         parts.push(`↳ tool_result: ${t}`)
       }
     }
-    if (parts.length) return parts.join('\n')
+    // Bisa '' kalau semua block di-skip — emitLine nggak akan ngirim chunk kosong.
+    return parts.join('\n')
   }
 
-  // Event result akhir: { type: "result", result: "<teks>" }
-  if (typeof evt.result === 'string') return evt.result
-
-  // Event system (init dsb) — kasih ringkasan singkat.
-  if (evt.type === 'system') {
-    return `system: ${evt.subtype ?? ''}`.trim()
-  }
-
-  // Fallback: JSON mentah biar nggak ada yang ketinggalan.
+  // Fallback: JSON mentah biar nggak ada yang ketinggalan (harusnya jarang).
   return JSON.stringify(evt)
 }
 
@@ -193,6 +202,157 @@ wss.on('connection', (socket) => {
       runTimer = null
     }
     child = null
+  }
+
+  /**
+   * Spawn satu run `claude` buat sesi tertentu, lalu stream output-nya.
+   *
+   * Mode ditentukan `resume`:
+   *   resume=false → `--session-id <id>`  (BIKIN sesi baru dgn id tetap)
+   *   resume=true  → `--resume <id>`      (LANJUTIN konteks sesi itu)
+   *
+   * Self-heal sekali (attempt < 1) kalau anggapan client soal state sesi beda
+   * sama CLI:
+   *   - resume tapi sesi keprune ("No conversation found") → bikin baru.
+   *   - create tapi id udah kepakai ("already in use")      → resume.
+   * Kejadian mis. bridge di-restart (sesi CLI ilang) atau localStorage client
+   * ke-reset. Prompt-nya di-run ulang di mode yang bener.
+   */
+  function startRun({ prompt, sessionId, resume, attempt }) {
+    // Prompt + sessionId dilewatin sebagai argumen array — TANPA shell — jadi
+    // aman dari injection. Cuma binary "claude" yang dieksekusi.
+    const modeArgs = resume ? ['--resume', sessionId] : ['--session-id', sessionId]
+    const args = ['-p', prompt, ...modeArgs, ...CLAUDE_ARGS]
+    try {
+      child = spawn('claude', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch {
+      clearRun()
+      send(socket, { type: 'error', text: 'claude CLI tidak ditemukan' })
+      return
+    }
+
+    // Kalau kedeteksi mismatch mode, di-set ke mode kebalikan biar 'close'
+    // nge-retry (bukan ngirim { done }). null = nggak perlu heal.
+    let healTo = null // null | true (→resume) | false (→create)
+    // Tandai kalau udah ada konten beneran ke-emit — jangan self-heal setelah
+    // ada output (cegah dobel), heal cuma buat kasus error-only di awal.
+    let emitted = false
+
+    // Deteksi signature error yang bisa di-heal. Return true = suppress baris
+    // ini (jangan tampilin ke user; kita retry aja diam-diam).
+    function detectHeal(line) {
+      if (attempt >= 1 || emitted) return false
+      if (resume && line.includes('No conversation found with session ID')) {
+        healTo = false
+        return true
+      }
+      if (!resume && line.includes('is already in use')) {
+        healTo = true
+        return true
+      }
+      return false
+    }
+
+    // Arm timeout: proses yang lewat batas di-kill paksa + kabarin client.
+    runTimer = setTimeout(() => {
+      send(socket, {
+        type: 'error',
+        text: `Run timeout (${Math.round(RUN_TIMEOUT_MS / 1000)}s) — proses dihentikan`,
+      })
+      killChild(child)
+      // 'close' bakal firing setelah kill dan ngirim { done }.
+    }, RUN_TIMEOUT_MS)
+
+    // Kalau binary nggak ada di PATH, error muncul async lewat 'error'.
+    child.on('error', (err) => {
+      const notFound = err && err.code === 'ENOENT'
+      send(socket, {
+        type: 'error',
+        text: notFound ? 'claude CLI tidak ditemukan' : `Gagal spawn claude: ${err.message}`,
+      })
+      clearRun()
+    })
+
+    // stdout: baca baris per baris, parse tiap baris stream-json.
+    let stdoutBuf = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (data) => {
+      stdoutBuf += data
+      let nl
+      while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
+        const line = stdoutBuf.slice(0, nl)
+        stdoutBuf = stdoutBuf.slice(nl + 1)
+        emitLine(line)
+      }
+    })
+
+    // stderr: kirim apa adanya sebagai chunk level error (kecuali signature heal).
+    let stderrBuf = ''
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (data) => {
+      stderrBuf += data
+      let nl
+      while ((nl = stderrBuf.indexOf('\n')) !== -1) {
+        const line = stderrBuf.slice(0, nl)
+        stderrBuf = stderrBuf.slice(nl + 1)
+        emitErrLine(line)
+      }
+    })
+
+    function emitLine(line) {
+      const trimmed = line.trim()
+      if (!trimmed) return
+      if (detectHeal(trimmed)) return
+      try {
+        const evt = JSON.parse(trimmed)
+        const text = extractText(evt)
+        // extractText bisa balikin '' untuk event yang sengaja di-skip
+        // (result duplikat, thinking_tokens) — jangan kirim chunk kosong.
+        if (text) {
+          emitted = true
+          send(socket, { type: 'chunk', text })
+        }
+      } catch {
+        // Bukan JSON valid → kirim apa adanya.
+        emitted = true
+        send(socket, { type: 'chunk', text: line })
+      }
+    }
+
+    function emitErrLine(line) {
+      if (!line.trim()) return
+      if (detectHeal(line)) return
+      send(socket, { type: 'chunk', level: 'error', text: line })
+    }
+
+    child.on('close', (code) => {
+      // Flush sisa buffer yang belum ada newline-nya.
+      if (stdoutBuf.trim()) emitLine(stdoutBuf)
+      if (stderrBuf.trim()) emitErrLine(stderrBuf)
+      stdoutBuf = ''
+      stderrBuf = ''
+
+      // Self-heal: mode salah, retry sekali dgn mode kebalikan (prompt sama).
+      if (healTo !== null && attempt < 1) {
+        send(socket, {
+          type: 'chunk',
+          text:
+            healTo === true
+              ? '↻ Sesi udah ada — nyambung ke konteks yang lama'
+              : '↻ Sesi lama nggak ketemu — mulai sesi baru (konteks ke-reset)',
+        })
+        if (runTimer) {
+          clearTimeout(runTimer)
+          runTimer = null
+        }
+        child = null
+        startRun({ prompt, sessionId, resume: healTo, attempt: attempt + 1 })
+        return
+      }
+
+      send(socket, { type: 'done', code, sessionId })
+      clearRun()
+    })
   }
 
   socket.on('message', (raw) => {
@@ -242,84 +402,31 @@ wss.on('connection', (socket) => {
       return
     }
 
-    // Prompt dilewatin sebagai argumen array — TANPA shell — jadi aman
-    // dari injection. Cuma binary "claude" yang dieksekusi.
-    const args = ['-p', prompt, ...CLAUDE_ARGS]
-    try {
-      child = spawn('claude', args, { stdio: ['ignore', 'pipe', 'pipe'] })
-    } catch {
-      clearRun()
-      send(socket, { type: 'error', text: 'claude CLI tidak ditemukan' })
+    // Sesi: client ngirim sessionId (UUID stabil per-pane, persisted di
+    // localStorage) + `resume` (true kalau pane udah pernah sukses run).
+    // Kalau sessionId kosong (mis. client non-pane / test), bridge bikinin.
+    let sessionId =
+      typeof msg.sessionId === 'string' && msg.sessionId.trim()
+        ? msg.sessionId.trim()
+        : ''
+    let resume = msg.resume === true
+    if (!sessionId) {
+      sessionId = randomUUID()
+      resume = false // baru dibikin — mustahil resume
+    }
+
+    // Validasi bentuk UUID: sessionId dilempar sebagai argumen CLI, jadi tolak
+    // apa pun yang bukan UUID biar nggak ada value aneh (mis. diawali '-').
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    if (!UUID_RE.test(sessionId)) {
+      send(socket, { type: 'error', text: 'sessionId bukan UUID valid' })
       return
     }
 
-    // Arm timeout: proses yang lewat batas di-kill paksa + kabarin client.
-    runTimer = setTimeout(() => {
-      send(socket, {
-        type: 'error',
-        text: `Run timeout (${Math.round(RUN_TIMEOUT_MS / 1000)}s) — proses dihentikan`,
-      })
-      killChild(child)
-      // 'close' bakal firing setelah kill dan ngirim { done }.
-    }, RUN_TIMEOUT_MS)
+    // Kabarin client sessionId yang dipakai — biar disimpen buat resume nanti.
+    send(socket, { type: 'session', sessionId })
 
-    // Kalau binary nggak ada di PATH, error muncul async lewat 'error'.
-    child.on('error', (err) => {
-      const notFound = err && err.code === 'ENOENT'
-      send(socket, {
-        type: 'error',
-        text: notFound ? 'claude CLI tidak ditemukan' : `Gagal spawn claude: ${err.message}`,
-      })
-      clearRun()
-    })
-
-    // stdout: baca baris per baris, parse tiap baris stream-json.
-    let stdoutBuf = ''
-    child.stdout.setEncoding('utf8')
-    child.stdout.on('data', (data) => {
-      stdoutBuf += data
-      let nl
-      while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
-        const line = stdoutBuf.slice(0, nl)
-        stdoutBuf = stdoutBuf.slice(nl + 1)
-        emitLine(line)
-      }
-    })
-
-    // stderr: kirim apa adanya sebagai chunk level error.
-    let stderrBuf = ''
-    child.stderr.setEncoding('utf8')
-    child.stderr.on('data', (data) => {
-      stderrBuf += data
-      let nl
-      while ((nl = stderrBuf.indexOf('\n')) !== -1) {
-        const line = stderrBuf.slice(0, nl)
-        stderrBuf = stderrBuf.slice(nl + 1)
-        if (line.trim()) send(socket, { type: 'chunk', level: 'error', text: line })
-      }
-    })
-
-    function emitLine(line) {
-      const trimmed = line.trim()
-      if (!trimmed) return
-      try {
-        const evt = JSON.parse(trimmed)
-        send(socket, { type: 'chunk', text: extractText(evt) })
-      } catch {
-        // Bukan JSON valid → kirim apa adanya.
-        send(socket, { type: 'chunk', text: line })
-      }
-    }
-
-    child.on('close', (code) => {
-      // Flush sisa buffer yang belum ada newline-nya.
-      if (stdoutBuf.trim()) emitLine(stdoutBuf)
-      if (stderrBuf.trim()) send(socket, { type: 'chunk', level: 'error', text: stderrBuf })
-      stdoutBuf = ''
-      stderrBuf = ''
-      send(socket, { type: 'done', code })
-      clearRun()
-    })
+    startRun({ prompt, sessionId, resume, attempt: 0 })
   })
 
   socket.on('close', () => {
