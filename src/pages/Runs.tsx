@@ -1,30 +1,61 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Card, CardHeader, CardBody } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge, RunStatusBadge } from '../components/ui/Badge'
 import { PageTitle } from '../components/PageTitle'
-import { SendIcon, ClockIcon, TokenIcon } from '../components/icons'
-import { runs as seedRuns, workflows } from '../data/mock'
-import type { Run } from '../types'
+import { SendIcon, ClockIcon, TokenIcon, SearchIcon } from '../components/icons'
+import { workflows } from '../data/mock'
+import type { Run, RunStatus } from '../types'
 import { fmtTime, fmtDuration, fmtInt } from '../lib/format'
 import { useLogStream } from '../lib/useLogStream'
 import type { StreamStatus } from '../lib/useLogStream'
+import { useRuns } from '../lib/runs'
+import { newRunId } from '../lib/execWorkflow'
 import { cn } from '../lib/cn'
 
+const runFilters: { key: RunStatus | 'all'; label: string }[] = [
+  { key: 'all', label: 'Semua' },
+  { key: 'running', label: 'Running' },
+  { key: 'success', label: 'Sukses' },
+  { key: 'failed', label: 'Gagal' },
+  { key: 'queued', label: 'Antri' },
+]
+
 export function Runs() {
-  const [runList, setRunList] = useState<Run[]>(seedRuns)
-  const [selectedId, setSelectedId] = useState(seedRuns[0].id)
+  const { runs, addRun } = useRuns()
+  const [selectedId, setSelectedId] = useState<string | null>(runs[0]?.id ?? null)
   const [task, setTask] = useState('')
   const [workflow, setWorkflow] = useState(workflows[0].name)
+  const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState<RunStatus | 'all'>('all')
 
-  const selected = runList.find((r) => r.id === selectedId)!
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return runs.filter((r) => {
+      if (filter !== 'all' && r.status !== filter) return false
+      if (!q) return true
+      return (
+        r.task.toLowerCase().includes(q) ||
+        r.workflow.toLowerCase().includes(q) ||
+        r.id.toLowerCase().includes(q)
+      )
+    })
+  }, [runs, query, filter])
+
+  // Jaga selectedId tetap valid saat list berubah.
+  useEffect(() => {
+    if (selectedId && runs.some((r) => r.id === selectedId)) return
+    setSelectedId(runs[0]?.id ?? null)
+  }, [runs, selectedId])
+
+  const selected = runs.find((r) => r.id === selectedId) ?? null
 
   function submit() {
     const trimmed = task.trim()
     if (!trimmed) return
     const now = new Date()
     const newRun: Run = {
-      id: 'run_' + Math.random().toString(16).slice(2, 6),
+      id: newRunId(),
       task: trimmed,
       workflow,
       status: 'queued',
@@ -42,7 +73,7 @@ export function Runs() {
         },
       ],
     }
-    setRunList([newRun, ...runList])
+    addRun(newRun)
     setSelectedId(newRun.id)
     setTask('')
   }
@@ -83,36 +114,81 @@ export function Runs() {
         </CardBody>
       </Card>
 
+      {/* Search + filter */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 sm:max-w-xs">
+          <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-ink/40">
+            <SearchIcon width={16} height={16} />
+          </span>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Cari run…"
+            className="w-full rounded-lg border-2 border-ink bg-paper py-1.5 pl-8 pr-3 text-sm outline-none placeholder:text-ink/40 focus:bg-cream"
+          />
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {runFilters.map((f) => (
+            <button
+              key={f.key}
+              onClick={() => setFilter(f.key)}
+              className={cn(
+                'rounded-lg border-2 border-ink px-2.5 py-1.5 text-xs font-semibold transition-all',
+                filter === f.key
+                  ? 'bg-mustard shadow-hard-sm'
+                  : 'bg-paper hover:bg-sky-soft',
+              )}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
       {/* Split: list + detail */}
       <div className="grid gap-4 lg:grid-cols-[340px_1fr]">
         {/* List */}
         <div className="space-y-3">
-          {runList.map((r) => (
-            <button
-              key={r.id}
-              onClick={() => setSelectedId(r.id)}
-              className={cn(
-                'w-full rounded-xl border-2 border-ink p-3 text-left transition-all',
-                r.id === selectedId
-                  ? 'bg-mustard shadow-hard'
-                  : 'bg-paper shadow-hard-sm hover:bg-sky-soft',
-              )}
-            >
-              <div className="flex items-start justify-between gap-2">
-                <span className="min-w-0 flex-1 truncate text-sm font-semibold">
-                  {r.task}
-                </span>
-                <RunStatusBadge status={r.status} />
-              </div>
-              <div className="mt-1.5 flex items-center gap-2 text-[11px] text-ink/50">
-                <span className="font-mono">{r.id}</span>· {r.workflow}
-              </div>
-            </button>
-          ))}
+          {filtered.length === 0 ? (
+            <div className="rounded-xl border-2 border-dashed border-ink/40 bg-paper/50 p-6 text-center text-sm text-ink/50">
+              {runs.length === 0
+                ? 'Belum ada run. Kirim task atau jalankan workflow.'
+                : 'Nggak ada run yang cocok sama filter/pencarian.'}
+            </div>
+          ) : (
+            filtered.map((r) => (
+              <button
+                key={r.id}
+                onClick={() => setSelectedId(r.id)}
+                className={cn(
+                  'w-full rounded-xl border-2 border-ink p-3 text-left transition-all',
+                  r.id === selectedId
+                    ? 'bg-mustard shadow-hard'
+                    : 'bg-paper shadow-hard-sm hover:bg-sky-soft',
+                )}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+                    {r.task}
+                  </span>
+                  <RunStatusBadge status={r.status} />
+                </div>
+                <div className="mt-1.5 flex items-center gap-2 text-[11px] text-ink/50">
+                  <span className="font-mono">{r.id}</span>· {r.workflow}
+                </div>
+              </button>
+            ))
+          )}
         </div>
 
         {/* Detail */}
-        <RunDetail run={selected} />
+        {selected ? (
+          <RunDetail run={selected} />
+        ) : (
+          <Card className="flex items-center justify-center p-12 text-sm text-ink/50">
+            Pilih run buat lihat detail & log-nya.
+          </Card>
+        )}
       </div>
     </div>
   )

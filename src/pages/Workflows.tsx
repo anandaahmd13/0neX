@@ -1,13 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Card, CardHeader } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
 import { PageTitle } from '../components/PageTitle'
-import { PlusIcon, BoltIcon, TrashIcon } from '../components/icons'
+import { PlusIcon, BoltIcon, TrashIcon, PlayIcon, StopIcon } from '../components/icons'
 import { workflows as seedWorkflows } from '../data/mock'
-import type { Workflow, WorkflowNode, NodeKind } from '../types'
+import type { LogEntry, Run, Workflow, WorkflowNode, NodeKind } from '../types'
 import { fmtInt, fmtTime } from '../lib/format'
 import { usePersistentState } from '../lib/usePersistentState'
+import { useRuns } from '../lib/runs'
+import { runWorkflow } from '../lib/execWorkflow'
+import type { NodeRunStatus } from '../lib/execWorkflow'
+import { useToast } from '../lib/toast'
 import { cn } from '../lib/cn'
 
 const NODE_W = 150
@@ -39,6 +44,9 @@ export function Workflows() {
   )
   const [activeId, setActiveId] = useState(wfList[0]?.id ?? '')
   const active = wfList.find((w) => w.id === activeId) ?? wfList[0]
+  const { addRun, updateRun } = useRuns()
+  const { push } = useToast()
+  const navigate = useNavigate()
 
   // Update satu workflow (immutable) di dalam list.
   const patchActive = useCallback(
@@ -131,6 +139,26 @@ export function Workflows() {
           key={active.id}
           workflow={active}
           onChange={patchActive}
+          onRunComplete={(run) => {
+            addRun(run)
+            // Update jumlah run + lastRun di kartu workflow.
+            setWfList((list) =>
+              list.map((w) =>
+                w.id === active.id
+                  ? { ...w, runs: w.runs + 1, lastRun: run.startedAt }
+                  : w,
+              ),
+            )
+            push(
+              run.status === 'success'
+                ? `Workflow "${active.name}" selesai — run tercatat`
+                : `Run "${active.name}" dihentikan`,
+              run.status === 'success' ? 'success' : 'warn',
+            )
+          }}
+          onRunStart={(run) => addRun(run)}
+          onRunTick={updateRun}
+          onViewRun={() => navigate('/runs')}
         />
       </div>
     </div>
@@ -142,19 +170,103 @@ type DragState =
   | { mode: 'connect'; from: string; x: number; y: number }
   | null
 
+interface BuilderProps {
+  workflow: Workflow
+  onChange: (fn: (w: Workflow) => Workflow) => void
+  onRunStart: (run: Run) => void
+  onRunTick: (id: string, fn: (r: Run) => Run) => void
+  onRunComplete: (run: Run) => void
+  onViewRun: () => void
+}
+
 function WorkflowBuilder({
   workflow,
   onChange,
-}: {
-  workflow: Workflow
-  onChange: (fn: (w: Workflow) => Workflow) => void
-}) {
+  onRunStart,
+  onRunTick,
+  onRunComplete,
+  onViewRun,
+}: BuilderProps) {
   const canvasRef = useRef<HTMLDivElement>(null)
   const [drag, setDrag] = useState<DragState>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [addKind, setAddKind] = useState<NodeKind>('agent')
 
+  // ── State eksekusi ──
+  const [running, setRunning] = useState(false)
+  const [nodeStatus, setNodeStatus] = useState<Record<string, NodeRunStatus>>({})
+  const [activeNode, setActiveNode] = useState<string | null>(null)
+  const [execLogs, setExecLogs] = useState<LogEntry[]>([])
+  const abortRef = useRef<{ aborted: boolean }>({ aborted: false })
+  const logEndRef = useRef<HTMLDivElement>(null)
+
   const nodeById = (id: string) => workflow.nodes.find((n) => n.id === id)
+
+  // Auto-scroll log ke bawah saat ada baris baru.
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [execLogs])
+
+  async function runNow() {
+    if (running) return
+    if (workflow.nodes.length === 0) return
+    setRunning(true)
+    setExecLogs([])
+    setActiveNode(null)
+    // Reset semua node ke idle.
+    const init: Record<string, NodeRunStatus> = {}
+    workflow.nodes.forEach((n) => (init[n.id] = 'idle'))
+    setNodeStatus(init)
+
+    const abort = { aborted: false }
+    abortRef.current = abort
+
+    // Bikin run "running" dulu biar langsung nongol di halaman Runs.
+    const runId = `run_${Date.now().toString(36)}_${Math.random()
+      .toString(16)
+      .slice(2, 5)}`
+    const startedAtIso = new Date().toISOString()
+    onRunStart({
+      id: runId,
+      task: `Eksekusi workflow: ${workflow.name}`,
+      workflow: workflow.name,
+      status: 'running',
+      startedAt: startedAtIso,
+      durationMs: 0,
+      tokensUsed: 0,
+      agentsInvolved: [],
+      logs: [],
+      output: '',
+    })
+
+    const finalRun = await runWorkflow({
+      workflow,
+      runId,
+      startedAtIso,
+      stepMs: 650,
+      signal: abort,
+      onEvent: (ev) => {
+        setNodeStatus(ev.nodeStatus)
+        setActiveNode(ev.activeNode)
+        if (ev.log) {
+          setExecLogs((prev) => [...prev, ev.log!])
+          // Sinkronkan log ke run di store biar live di halaman Runs.
+          const entry = ev.log
+          onRunTick(runId, (r) => ({ ...r, logs: [...r.logs, entry] }))
+        }
+      },
+    })
+
+    // Tulis hasil final ke run yang sama (replace, bukan tambah baru).
+    onRunTick(runId, () => finalRun)
+    onRunComplete(finalRun)
+    setRunning(false)
+    setActiveNode(null)
+  }
+
+  function stopRun() {
+    abortRef.current.aborted = true
+  }
 
   // Konversi koordinat pointer ke koordinat canvas.
   const toCanvas = useCallback((clientX: number, clientY: number) => {
@@ -297,7 +409,22 @@ function WorkflowBuilder({
         action={
           <div className="flex items-center gap-2">
             <Badge color="neutral">{workflow.nodes.length} node</Badge>
-            <Badge color="neutral">{workflow.edges.length} edge</Badge>
+            {running ? (
+              <Button variant="danger" size="sm" onClick={stopRun}>
+                <StopIcon width={14} height={14} />
+                Stop
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={runNow}
+                disabled={workflow.nodes.length === 0}
+              >
+                <PlayIcon width={14} height={14} />
+                Jalankan
+              </Button>
+            )}
           </div>
         }
       />
@@ -433,6 +560,8 @@ function WorkflowBuilder({
               key={n.id}
               node={n}
               selected={selected === n.id}
+              runStatus={nodeStatus[n.id] ?? 'idle'}
+              active={activeNode === n.id}
               onMoveStart={(e) => startMove(e, n)}
               onConnectStart={(e) => startConnect(e, n)}
             />
@@ -440,10 +569,57 @@ function WorkflowBuilder({
         </div>
       </div>
 
+      {/* Panel log eksekusi — muncul saat/ setelah run */}
+      {(running || execLogs.length > 0) && (
+        <div className="border-t-2 border-ink">
+          <div className="flex items-center justify-between px-4 py-2">
+            <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-ink/50">
+              <span
+                className={cn(
+                  'inline-block h-2 w-2 rounded-full border border-ink',
+                  running ? 'animate-pulse bg-ok' : 'bg-idle',
+                )}
+              />
+              {running ? 'Eksekusi berjalan' : 'Log eksekusi terakhir'}
+            </div>
+            <button
+              onClick={onViewRun}
+              className="text-[11px] font-semibold text-ink/60 underline-offset-2 hover:underline"
+            >
+              Lihat di Runs →
+            </button>
+          </div>
+          <div className="term max-h-40 overflow-y-auto border-t-2 border-ink p-3 font-mono text-xs leading-relaxed">
+            {execLogs.map((log, i) => (
+              <div key={i} className="flex gap-2">
+                <span className="term-dim shrink-0">{log.ts}</span>
+                <span className="term-accent shrink-0">[{log.agent}]</span>
+                <span
+                  className={cn(
+                    'break-words',
+                    log.level === 'error'
+                      ? 'term-error'
+                      : log.level === 'warn'
+                        ? 'term-warn'
+                        : log.level === 'debug'
+                          ? 'term-dim'
+                          : '',
+                  )}
+                >
+                  {log.message}
+                </span>
+              </div>
+            ))}
+            <div ref={logEndRef} />
+          </div>
+        </div>
+      )}
+
       <div className="border-t-2 border-ink px-4 py-2 text-[11px] text-ink/50">
-        Tip: drag badan node buat mindahin · tarik titik kuning di kanan node ke
-        node lain buat nyambungin · klik garis buat hapus koneksi · pilih node
-        lalu tekan Delete buat hapus.
+        Tip: klik <b>Jalankan</b> buat eksekusi workflow (node nyala sesuai
+        urutan) · drag badan node buat mindahin · tarik titik kuning ke node
+        lain buat nyambungin · klik garis buat hapus koneksi · pilih node lalu
+        Delete buat hapus.
       </div>
     </Card>
   )
@@ -452,28 +628,64 @@ function WorkflowBuilder({
 function NodeBox({
   node,
   selected,
+  runStatus,
+  active,
   onMoveStart,
   onConnectStart,
 }: {
   node: WorkflowNode
   selected: boolean
+  runStatus: NodeRunStatus
+  active: boolean
   onMoveStart: (e: React.PointerEvent) => void
   onConnectStart: (e: React.PointerEvent) => void
 }) {
   const style = kindStyle[node.kind]
+
+  // Highlight ring berdasarkan status eksekusi.
+  const statusRing =
+    runStatus === 'running'
+      ? 'ring-2 ring-sky shadow-hard-lg'
+      : runStatus === 'done'
+        ? 'ring-2 ring-ok'
+        : runStatus === 'error'
+          ? 'ring-2 ring-danger'
+          : selected
+            ? 'ring-2 ring-ink shadow-hard-lg'
+            : ''
+
   return (
     <div
       data-node-id={node.id}
       onPointerDown={onMoveStart}
       className={cn(
-        'absolute flex cursor-grab flex-col justify-center rounded-lg border-2 border-ink px-3 active:cursor-grabbing',
+        'absolute flex cursor-grab flex-col justify-center rounded-lg border-2 border-ink px-3 shadow-hard-sm transition-all active:cursor-grabbing',
         style.bg,
-        selected ? 'shadow-hard-lg ring-2 ring-ink' : 'shadow-hard-sm',
+        statusRing,
+        active && 'scale-[1.04]',
+        runStatus === 'idle' && !selected ? '' : '',
       )}
       style={{ left: node.x, top: node.y, width: NODE_W, height: NODE_H }}
     >
-      <div className="text-[9px] font-bold uppercase tracking-widest text-ink/50">
-        {style.tag}
+      <div className="flex items-center justify-between">
+        <div className="text-[9px] font-bold uppercase tracking-widest text-ink/50">
+          {style.tag}
+        </div>
+        {runStatus !== 'idle' && (
+          <span
+            className={cn(
+              'flex h-3.5 w-3.5 items-center justify-center rounded-full border border-ink text-[8px] font-bold',
+              runStatus === 'running'
+                ? 'animate-pulse bg-sky'
+                : runStatus === 'done'
+                  ? 'bg-ok'
+                  : 'bg-danger',
+            )}
+            title={runStatus}
+          >
+            {runStatus === 'done' ? '✓' : runStatus === 'error' ? '✕' : ''}
+          </span>
+        )}
       </div>
       <div className="truncate text-sm font-bold leading-tight">
         {node.label}

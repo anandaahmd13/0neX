@@ -141,3 +141,34 @@ export const LogoutIcon = (p: P) => (
     <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
   </svg>
 )
+
+export const SearchIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m21 21-4.3-4.3" />
+  </svg>
+)
+
+export const DownloadIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="M12 3v12M7 10l5 5 5-5M5 21h14" />
+  </svg>
+)
+
+export const UploadIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="M12 21V9M7 14l5-5 5 5M5 3h14" />
+  </svg>
+)
+
+export const PlayIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <polygon points="6 4 20 12 6 20 6 4" />
+  </svg>
+)
+
+export const StopIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <rect x="6" y="6" width="12" height="12" rx="1" />
+  </svg>
+)
