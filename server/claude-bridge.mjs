@@ -330,7 +330,7 @@ if (TOKEN_AUTOGEN) {
   console.log(`[claude-bridge] token (auto): ${TOKEN}`)
   console.log(`[claude-bridge] connect: ws://${HOST}:${PORT}/?token=${TOKEN}`)
   console.log(
-    '[claude-bridge] set VITE_CLAUDE_WS_TOKEN=<token> di apps/web biar UI kepakein',
+    '[claude-bridge] set VITE_CLAUDE_WS_TOKEN=<token> di .env biar UI kepakein',
   )
 } else {
   console.log('[claude-bridge] token: dari env CLAUDE_BRIDGE_TOKEN')
