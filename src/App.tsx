@@ -1,6 +1,8 @@
 import { Routes, Route, Link } from 'react-router-dom'
 import { Layout } from './components/Layout'
+import { ProtectedRoute } from './components/ProtectedRoute'
 import { Button } from './components/ui/Button'
+import { Login } from './pages/Login'
 import { Dashboard } from './pages/Dashboard'
 import { Agents } from './pages/Agents'
 import { Workflows } from './pages/Workflows'
@@ -20,14 +22,27 @@ function NotFound() {
 
 export default function App() {
   return (
-    <Layout>
-      <Routes>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/agents" element={<Agents />} />
-        <Route path="/workflows" element={<Workflows />} />
-        <Route path="/runs" element={<Runs />} />
-        <Route path="*" element={<NotFound />} />
-      </Routes>
-    </Layout>
+    <Routes>
+      {/* Public */}
+      <Route path="/login" element={<Login />} />
+
+      {/* Protected — semua halaman app butuh login */}
+      <Route
+        path="/*"
+        element={
+          <ProtectedRoute>
+            <Layout>
+              <Routes>
+                <Route path="/" element={<Dashboard />} />
+                <Route path="/agents" element={<Agents />} />
+                <Route path="/workflows" element={<Workflows />} />
+                <Route path="/runs" element={<Runs />} />
+                <Route path="*" element={<NotFound />} />
+              </Routes>
+            </Layout>
+          </ProtectedRoute>
+        }
+      />
+    </Routes>
   )
 }

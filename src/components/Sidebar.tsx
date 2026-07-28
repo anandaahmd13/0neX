@@ -1,11 +1,13 @@
 import { NavLink } from 'react-router-dom'
 import { cn } from '../lib/cn'
+import { useAuth } from '../lib/auth'
 import {
   DashboardIcon,
   AgentsIcon,
   WorkflowIcon,
   RunsIcon,
   CloseIcon,
+  LogoutIcon,
 } from './icons'
 
 const nav = [
@@ -22,6 +24,7 @@ export function Sidebar({
   open: boolean
   onClose: () => void
 }) {
+  const { user, logout } = useAuth()
   return (
     <>
       {/* Mobile scrim */}
@@ -78,8 +81,8 @@ export function Sidebar({
           ))}
         </nav>
 
-        {/* Footer status */}
-        <div className="border-t-2 border-ink p-3">
+        {/* Footer status + user */}
+        <div className="space-y-2 border-t-2 border-ink p-3">
           <div className="rounded-lg border-2 border-ink bg-sky-soft p-3">
             <div className="flex items-center gap-2 text-xs font-semibold">
               <span className="relative flex h-2.5 w-2.5">
@@ -90,6 +93,30 @@ export function Sidebar({
             </div>
             <p className="mt-1 text-[11px] text-ink/60">4 agent aktif · 2 run jalan</p>
           </div>
+
+          {user && (
+            <div className="flex items-center gap-2 rounded-lg border-2 border-ink bg-paper p-2">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border-2 border-ink bg-mustard font-brand text-sm font-bold">
+                {user.name.charAt(0).toUpperCase()}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-xs font-bold leading-tight">
+                  {user.name}
+                </div>
+                <div className="truncate text-[10px] text-ink/50">
+                  {user.email}
+                </div>
+              </div>
+              <button
+                onClick={logout}
+                title="Keluar"
+                aria-label="Keluar"
+                className="press flex h-7 w-7 shrink-0 items-center justify-center rounded-md border-2 border-ink bg-danger shadow-hard-sm"
+              >
+                <LogoutIcon width={14} height={14} />
+              </button>
+            </div>
+          )}
         </div>
       </aside>
     </>
