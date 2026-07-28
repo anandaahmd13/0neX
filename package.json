@@ -9,7 +9,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "ws": "node server/log-stream.mjs",
-    "claude-bridge": "node server/claude-bridge.mjs"
+    "claude-bridge": "node --env-file-if-exists=.env server/claude-bridge.mjs"
   },
   "dependencies": {
     "react": "^19.2.7",
