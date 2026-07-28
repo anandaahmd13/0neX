@@ -16,7 +16,7 @@ const nav = [
   { to: '/agents', label: 'Agents', icon: AgentsIcon, end: false },
   { to: '/workflows', label: 'Workflows', icon: WorkflowIcon, end: false },
   { to: '/runs', label: 'Runs', icon: RunsIcon, end: false },
-  { to: '/claude-poc', label: 'Claude POC', icon: BoltIcon, end: false },
+  { to: '/gateway', label: 'AI Gateway', icon: BoltIcon, end: false },
 ]
 
 export function Sidebar({

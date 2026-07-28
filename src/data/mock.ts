@@ -16,6 +16,9 @@ export const agents: Agent[] = [
     status: 'active',
     description:
       'Menjelajah web, mengumpulkan sumber, dan merangkum temuan jadi brief singkat.',
+    providerId: 'claude-cli',
+    systemPrompt: 'Ikuti role agent dengan teliti. Berikan hasil yang ringkas, akurat, dan dapat ditindaklanjuti.',
+    toolPolicy: 'standard',
     tools: ['web_search', 'web_extract', 'browser'],
     tokensUsed: 8_420_000,
     requests: 1284,
@@ -31,6 +34,9 @@ export const agents: Agent[] = [
     status: 'active',
     description:
       'Nulis, refactor, dan review kode. Bisa buka PR langsung ke repo.',
+    providerId: 'claude-cli',
+    systemPrompt: 'Ikuti role agent dengan teliti. Berikan hasil yang ringkas, akurat, dan dapat ditindaklanjuti.',
+    toolPolicy: 'standard',
     tools: ['terminal', 'file', 'github', 'code_exec'],
     tokensUsed: 12_930_000,
     requests: 2041,
@@ -46,6 +52,9 @@ export const agents: Agent[] = [
     status: 'idle',
     description:
       'Memecah goal besar jadi langkah-langkah kecil dan nge-assign ke agent lain.',
+    providerId: 'claude-cli',
+    systemPrompt: 'Ikuti role agent dengan teliti. Berikan hasil yang ringkas, akurat, dan dapat ditindaklanjuti.',
+    toolPolicy: 'standard',
     tools: ['delegation', 'todo'],
     tokensUsed: 3_110_000,
     requests: 512,
@@ -61,6 +70,9 @@ export const agents: Agent[] = [
     status: 'active',
     description:
       'Analisa dataset, bikin agregasi, dan generate visualisasi dari data mentah.',
+    providerId: 'claude-cli',
+    systemPrompt: 'Ikuti role agent dengan teliti. Berikan hasil yang ringkas, akurat, dan dapat ditindaklanjuti.',
+    toolPolicy: 'standard',
     tools: ['code_exec', 'file'],
     tokensUsed: 6_740_000,
     requests: 903,
@@ -76,6 +88,9 @@ export const agents: Agent[] = [
     status: 'paused',
     description:
       'Nulis artikel, dokumentasi, dan copy dengan tone yang bisa diatur.',
+    providerId: 'claude-cli',
+    systemPrompt: 'Ikuti role agent dengan teliti. Berikan hasil yang ringkas, akurat, dan dapat ditindaklanjuti.',
+    toolPolicy: 'standard',
     tools: ['web_search', 'file'],
     tokensUsed: 4_980_000,
     requests: 671,
@@ -91,6 +106,9 @@ export const agents: Agent[] = [
     status: 'error',
     description:
       'Ngawasin health service, kirim alert kalau ada anomali. Lagi ada gangguan koneksi.',
+    providerId: 'claude-cli',
+    systemPrompt: 'Ikuti role agent dengan teliti. Berikan hasil yang ringkas, akurat, dan dapat ditindaklanjuti.',
+    toolPolicy: 'standard',
     tools: ['terminal', 'web_extract'],
     tokensUsed: 1_240_000,
     requests: 4820,

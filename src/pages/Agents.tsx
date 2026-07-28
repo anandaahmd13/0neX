@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge, AgentStatusBadge } from '../components/ui/Badge'
@@ -27,6 +28,7 @@ const filters: { key: AgentStatus | 'all'; label: string }[] = [
 
 export function Agents() {
   const { push } = useToast()
+  const navigate = useNavigate()
   const [filter, setFilter] = useState<AgentStatus | 'all'>('all')
   const [query, setQuery] = useState('')
 
@@ -117,7 +119,11 @@ export function Agents() {
       ) : (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           {list.map((a) => (
-            <AgentCard key={a.id} agent={a} />
+            <AgentCard
+              key={a.id}
+              agent={a}
+              onRun={() => navigate(`/gateway?agent=${a.id}`)}
+            />
           ))}
         </div>
       )}
@@ -125,7 +131,7 @@ export function Agents() {
   )
 }
 
-function AgentCard({ agent }: { agent: Agent }) {
+function AgentCard({ agent, onRun }: { agent: Agent; onRun: () => void }) {
   return (
     <Card hover className="flex flex-col">
       <div className="flex items-start justify-between border-b-2 border-ink p-4">
@@ -150,6 +156,8 @@ function AgentCard({ agent }: { agent: Agent }) {
 
         <div className="mt-3 flex flex-wrap gap-1.5">
           <Badge color="sky">{agent.model}</Badge>
+          <Badge color="mustard">{agent.providerId}</Badge>
+          <Badge color="neutral">tools: {agent.toolPolicy}</Badge>
           {agent.tools.slice(0, 3).map((t) => (
             <Badge key={t} color="neutral">
               {t}
@@ -169,7 +177,7 @@ function AgentCard({ agent }: { agent: Agent }) {
         </div>
 
         <div className="mt-auto flex gap-2 pt-4">
-          <Button variant="secondary" size="sm" className="flex-1">
+          <Button variant="secondary" size="sm" className="flex-1" onClick={onRun}>
             Jalankan
           </Button>
           <Button variant="ghost" size="sm" className="flex-1">

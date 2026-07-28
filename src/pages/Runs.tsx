@@ -202,8 +202,10 @@ const streamMeta: Record<StreamStatus, { label: string; dot: string }> = {
 }
 
 function RunDetail({ run }: { run: Run }) {
-  // Streaming aktif cuma buat run yang lagi jalan.
-  const streaming = run.status === 'running'
+  // Gateway menulis log aktual langsung ke Runs store. Stream mock hanya
+  // dipakai oleh run workflow lama, supaya aktivitas Gateway tidak tertutup
+  // log simulasi dari port 8787.
+  const streaming = run.status === 'running' && run.source !== 'gateway'
   const { logs: liveLogs, status: streamStatus } = useLogStream({
     enabled: streaming,
     seed: run.logs,

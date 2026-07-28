@@ -1,12 +1,17 @@
 // Domain types for 0neX — AI agent orchestration platform.
 
 export type AgentStatus = 'active' | 'idle' | 'error' | 'paused'
+export type ProviderId = 'claude-cli'
+export type AgentToolPolicy = 'none' | 'read-only' | 'standard'
 
 export interface Agent {
   id: string
   name: string
   role: string
+  providerId: ProviderId
   model: string
+  systemPrompt: string
+  toolPolicy: AgentToolPolicy
   status: AgentStatus
   description: string
   tools: string[]
@@ -30,6 +35,7 @@ export interface Run {
   id: string
   task: string
   workflow: string
+  source?: 'workflow' | 'gateway'
   status: RunStatus
   startedAt: string
   durationMs: number

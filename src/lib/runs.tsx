@@ -32,7 +32,30 @@ function loadInitial(): Run[] {
   if (typeof window === 'undefined') return seedRuns
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY)
-    if (raw) return JSON.parse(raw) as Run[]
+    if (raw) {
+      const parsed = JSON.parse(raw) as Run[]
+      return parsed.map((run) => {
+        if (run.source !== 'gateway' || run.status !== 'running') return run
+        return {
+          ...run,
+          status: 'failed',
+          output: run.output || 'Gateway run terputus saat aplikasi ditutup atau dimuat ulang.',
+          logs: [
+            ...run.logs,
+            {
+              ts: new Date().toLocaleTimeString('id-ID', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+              }),
+              level: 'warn',
+              agent: 'Gateway',
+              message: 'Run direkonsiliasi sebagai gagal setelah aplikasi dimuat ulang',
+            },
+          ],
+        }
+      })
+    }
   } catch {
     // abaikan payload rusak
   }

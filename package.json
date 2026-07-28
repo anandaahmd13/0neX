@@ -9,6 +9,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "ws": "node server/log-stream.mjs",
+    "gateway": "node --env-file-if-exists=.env server/gateway-server.mjs",
     "claude-bridge": "node --env-file-if-exists=.env server/claude-bridge.mjs"
   },
   "dependencies": {

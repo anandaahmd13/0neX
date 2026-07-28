@@ -1,37 +1,35 @@
 import { useCallback, useState } from 'react'
 
-// Satu "pane" = satu percakapan Claude yang berdiri sendiri. sessionId-nya
-// stabil dan di-persist, jadi konteks bisa dilanjutin lintas reload (bridge
-// nyambungin lewat `--resume <sessionId>`). transcript = riwayat output yang
-// dirender di pane; turns = jumlah giliran yang udah kelar (nentuin run
-// berikutnya create atau resume).
 export interface Pane {
   id: string
   sessionId: string
+  agentId: string
   title: string
   transcript: string[]
   turns: number
   createdAt: number
 }
 
-const KEY = 'onex.claude.panes'
-// Batas pane biar UI + resource kebendung. Bridge juga batasin koneksi
-// concurrent (MAX_CLIENTS), tapi socket ditutup tiap run kelar jadi ini murni
-// batas UX.
+const STORAGE_KEY = 'onex.gateway.panes'
+const LEGACY_STORAGE_KEY = 'onex.claude.panes'
+const DEFAULT_AGENT_ID = 'agt_coder'
 export const MAX_PANES = 4
-// Cap baris transcript per pane biar localStorage nggak tumbuh tanpa batas.
 const MAX_LINES = 2000
 
 function load(): Pane[] {
   try {
-    const raw = localStorage.getItem(KEY)
+    const raw = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY)
     if (!raw) return []
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
-    // Saring bentuk minimal — data lama/korup nggak boleh bikin crash.
-    return (parsed as Pane[]).filter(
-      (p) => p && typeof p.id === 'string' && typeof p.sessionId === 'string',
-    )
+    return parsed
+      .filter((pane) => pane && typeof pane.id === 'string' && typeof pane.sessionId === 'string')
+      .map((pane) => ({
+        ...pane,
+        agentId: typeof pane.agentId === 'string' ? pane.agentId : DEFAULT_AGENT_ID,
+        transcript: Array.isArray(pane.transcript) ? pane.transcript.slice(-MAX_LINES) : [],
+        turns: typeof pane.turns === 'number' ? pane.turns : 0,
+      })) as Pane[]
   } catch {
     return []
   }
@@ -39,16 +37,18 @@ function load(): Pane[] {
 
 function save(panes: Pane[]) {
   try {
-    localStorage.setItem(KEY, JSON.stringify(panes))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(panes))
+    localStorage.removeItem(LEGACY_STORAGE_KEY)
   } catch {
-    // localStorage penuh / disabled — persist best-effort, abaikan.
+    // Persistence bersifat best-effort.
   }
 }
 
-function makePane(): Pane {
+function makePane(agentId = DEFAULT_AGENT_ID): Pane {
   return {
     id: crypto.randomUUID(),
     sessionId: crypto.randomUUID(),
+    agentId,
     title: 'Sesi baru',
     transcript: [],
     turns: 0,
@@ -56,41 +56,39 @@ function makePane(): Pane {
   }
 }
 
-/**
- * Kelola daftar pane yang persisted di localStorage. Tiap operasi nulis balik
- * ke storage biar reload mulus (pane + sessionId + transcript tetap ada).
- */
 export function usePanes() {
   const [panes, setPanes] = useState<Pane[]>(load)
 
-  // Simpen + kembaliin array baru (dipakai di dalam setPanes updater).
   const persist = useCallback((next: Pane[]) => {
     save(next)
     return next
   }, [])
 
-  const addPane = useCallback(() => {
-    setPanes((prev) =>
-      prev.length >= MAX_PANES ? prev : persist([...prev, makePane()]),
-    )
-  }, [persist])
+  const addPane = useCallback(
+    (agentId?: string) => {
+      setPanes((previous) =>
+        previous.length >= MAX_PANES
+          ? previous
+          : persist([...previous, makePane(agentId)]),
+      )
+    },
+    [persist],
+  )
 
   const removePane = useCallback(
-    (id: string) => {
-      setPanes((prev) => persist(prev.filter((p) => p.id !== id)))
-    },
+    (id: string) => setPanes((previous) => persist(previous.filter((pane) => pane.id !== id))),
     [persist],
   )
 
   const appendOutput = useCallback(
     (id: string, lines: string[]) => {
-      if (lines.length === 0) return
-      setPanes((prev) =>
+      if (!lines.length) return
+      setPanes((previous) =>
         persist(
-          prev.map((p) =>
-            p.id === id
-              ? { ...p, transcript: [...p.transcript, ...lines].slice(-MAX_LINES) }
-              : p,
+          previous.map((pane) =>
+            pane.id === id
+              ? { ...pane, transcript: [...pane.transcript, ...lines].slice(-MAX_LINES) }
+              : pane,
           ),
         ),
       )
@@ -99,43 +97,63 @@ export function usePanes() {
   )
 
   const bumpTurn = useCallback(
-    (id: string) => {
-      setPanes((prev) =>
-        persist(prev.map((p) => (p.id === id ? { ...p, turns: p.turns + 1 } : p))),
-      )
-    },
+    (id: string) =>
+      setPanes((previous) =>
+        persist(
+          previous.map((pane) =>
+            pane.id === id ? { ...pane, turns: pane.turns + 1 } : pane,
+          ),
+        ),
+      ),
     [persist],
   )
 
   const setTitle = useCallback(
-    (id: string, title: string) => {
-      setPanes((prev) =>
-        persist(prev.map((p) => (p.id === id ? { ...p, title } : p))),
-      )
-    },
+    (id: string, title: string) =>
+      setPanes((previous) =>
+        persist(previous.map((pane) => (pane.id === id ? { ...pane, title } : pane))),
+      ),
     [persist],
   )
 
-  // Reset pane jadi percakapan baru: sessionId baru + transcript kosong. Slot
-  // pane-nya tetap (nggak nutup), cuma konteksnya yang di-mulai dari nol.
   const resetPane = useCallback(
-    (id: string) => {
-      setPanes((prev) =>
+    (id: string) =>
+      setPanes((previous) =>
         persist(
-          prev.map((p) =>
-            p.id === id
+          previous.map((pane) =>
+            pane.id === id
               ? {
-                  ...p,
+                  ...pane,
                   sessionId: crypto.randomUUID(),
                   transcript: [],
                   turns: 0,
                   title: 'Sesi baru',
                 }
-              : p,
+              : pane,
           ),
         ),
-      )
-    },
+      ),
+    [persist],
+  )
+
+  const setAgent = useCallback(
+    (id: string, agentId: string) =>
+      setPanes((previous) =>
+        persist(
+          previous.map((pane) =>
+            pane.id === id && pane.agentId !== agentId
+              ? {
+                  ...pane,
+                  agentId,
+                  sessionId: crypto.randomUUID(),
+                  transcript: [],
+                  turns: 0,
+                  title: 'Sesi baru',
+                }
+              : pane,
+          ),
+        ),
+      ),
     [persist],
   )
 
@@ -147,5 +165,6 @@ export function usePanes() {
     bumpTurn,
     setTitle,
     resetPane,
+    setAgent,
   }
 }
