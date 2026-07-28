@@ -49,7 +49,7 @@ export function Sidebar({
             <div className="flex h-9 w-9 items-center justify-center rounded-lg border-2 border-ink bg-mustard shadow-hard-sm">
               <span className="font-brand text-sm font-bold">0X</span>
             </div>
-            <span className="font-brand text-xl font-bold tracking-tight">0neX</span>
+            <span className="font-brand text-xl font-bold tracking-tight">0neX - Ai Helper</span>
           </div>
           <button
             className="rounded-md border-2 border-ink bg-paper p-1 lg:hidden"
