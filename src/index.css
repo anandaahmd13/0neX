@@ -1,0 +1,113 @@
+@import 'tailwindcss';
+
+/*
+  0neX design system — cloned from tukeria.com (neo-brutalist)
+  Palette + tokens extracted via getComputedStyle on the live site.
+*/
+
+@theme {
+  /* Core surface */
+  --color-cream: #fafaf5;
+  --color-ink: #1a1a1a;
+  --color-paper: #ffffff;
+
+  /* Accents (from tukeria) */
+  --color-mustard: #faae2a;
+  --color-mustard-dark: #e59a1f;
+  --color-sky: #8bd3dd;
+  --color-sky-soft: #d6eff2;
+
+  /* Semantic status */
+  --color-ok: #6fcf7f;
+  --color-warn: #faae2a;
+  --color-danger: #f2836b;
+  --color-idle: #b8b8ad;
+
+  /* Fonts */
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --font-brand: 'Comfortaa', ui-sans-serif, system-ui, sans-serif;
+
+  /* Neo-brutalist shadow */
+  --shadow-hard: 4px 4px 0 0 #1a1a1a;
+  --shadow-hard-sm: 2px 2px 0 0 #1a1a1a;
+  --shadow-hard-lg: 6px 6px 0 0 #1a1a1a;
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  body {
+    margin: 0;
+    background-color: var(--color-cream);
+    color: var(--color-ink);
+    font-family: var(--font-mono);
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+  * {
+    border-color: var(--color-ink);
+  }
+}
+
+@layer utilities {
+  /* Neo-brutalist card/button primitives */
+  .border-ink {
+    border-color: var(--color-ink);
+  }
+  .shadow-hard {
+    box-shadow: var(--shadow-hard);
+  }
+  .shadow-hard-sm {
+    box-shadow: var(--shadow-hard-sm);
+  }
+  .shadow-hard-lg {
+    box-shadow: var(--shadow-hard-lg);
+  }
+  /* Press interaction: element sinks into its shadow */
+  .press {
+    transition:
+      transform 0.1s ease,
+      box-shadow 0.1s ease;
+  }
+  .press:hover {
+    transform: translate(-1px, -1px);
+    box-shadow: var(--shadow-hard-lg);
+  }
+  .press:active {
+    transform: translate(4px, 4px);
+    box-shadow: none;
+  }
+  .font-brand {
+    font-family: var(--font-brand);
+  }
+  @keyframes marquee {
+    from {
+      transform: translateX(0);
+    }
+    to {
+      transform: translateX(-100%);
+    }
+  }
+  /* Faint grid background like tukeria hero */
+  .bg-grid {
+    background-image:
+      linear-gradient(to right, rgba(26, 26, 26, 0.04) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(26, 26, 26, 0.04) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+}
+
+/* Scrollbar — thin, inky */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-cream);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-ink);
+  border: 2px solid var(--color-cream);
+  border-radius: 0;
+}
