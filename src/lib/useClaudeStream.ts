@@ -23,6 +23,10 @@ function buildWsUrl(): string {
   }
 }
 
+interface SessionMsg {
+  type: 'session'
+  sessionId: string
+}
 interface ChunkMsg {
   type: 'chunk'
   text: string
@@ -31,26 +35,54 @@ interface ChunkMsg {
 interface DoneMsg {
   type: 'done'
   code: number | null
+  sessionId?: string
 }
 interface ErrorMsg {
   type: 'error'
   text: string
 }
-type ServerMsg = ChunkMsg | DoneMsg | ErrorMsg
+type ServerMsg = SessionMsg | ChunkMsg | DoneMsg | ErrorMsg
+
+/** Opsi sesi buat satu run. */
+export interface RunOptions {
+  // UUID sesi (stabil per-pane). Kosong = bridge yang bikinin.
+  sessionId?: string
+  // true = lanjutin konteks sesi (`--resume`); false/undefined = bikin baru.
+  resume?: boolean
+}
 
 /**
- * Konek ke bridge Claude Code, kirim prompt, dan kumpulin chunk yang masuk
- * jadi array baris output. Tiap panggilan run() bikin koneksi WS baru dan
- * nutup yang lama. Koneksi dibersihin saat unmount.
+ * Callback per-run. Dipisah dari state hook biar tiap pemanggil (mis. tiap
+ * pane) bisa nampung output-nya sendiri tanpa hook ikut nyimpen.
+ */
+export interface RunHandlers {
+  // sessionId yang beneran dipakai bridge (echo balik) — simpen buat resume.
+  onSession?: (sessionId: string) => void
+  // Satu potong output. `text` bisa multi-baris; `level` 'error' = dari stderr.
+  onChunk?: (text: string, level?: 'error') => void
+  // Run selesai normal (proses claude exit / dibatalkan).
+  onDone?: (code: number | null) => void
+  // Error dari bridge (validasi, spawn gagal, timeout, koneksi putus).
+  onError?: (text: string) => void
+}
+
+/**
+ * Konek ke bridge Claude Code buat SATU run, stream output-nya lewat callback,
+ * lalu tutup socket saat selesai. Model per-run (bukan socket persisten) bikin
+ * pane yang lagi idle nggak nahan slot koneksi bridge (MAX_CLIENTS).
+ *
+ * Satu instance hook = satu run aktif. Panggil run() lagi bakal nutup run
+ * sebelumnya. `status` di-expose buat nyetir UI (badge, tombol Stop).
  */
 export function useClaudeStream() {
-  const [output, setOutput] = useState<string[]>([])
   const [status, setStatus] = useState<ClaudeStatus>('idle')
   const wsRef = useRef<WebSocket | null>(null)
+  const handlersRef = useRef<RunHandlers>({})
 
   const cleanup = useCallback(() => {
     const ws = wsRef.current
     if (ws) {
+      // Null-in handler dulu biar onclose nggak firing pas kita nutup sengaja.
       ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null
       try {
         ws.close()
@@ -62,12 +94,12 @@ export function useClaudeStream() {
   }, [])
 
   const run = useCallback(
-    (prompt: string) => {
+    (prompt: string, opts: RunOptions = {}, handlers: RunHandlers = {}) => {
       const trimmed = prompt.trim()
       if (!trimmed) return
 
       cleanup()
-      setOutput([])
+      handlersRef.current = handlers
       setStatus('connecting')
 
       let ws: WebSocket
@@ -75,48 +107,60 @@ export function useClaudeStream() {
         ws = new WebSocket(buildWsUrl())
       } catch {
         setStatus('error')
-        setOutput(['Gagal bikin koneksi ke bridge Claude Code'])
+        handlers.onError?.('Gagal bikin koneksi ke bridge Claude Code')
         return
       }
       wsRef.current = ws
 
       ws.onopen = () => {
         setStatus('running')
-        ws.send(JSON.stringify({ type: 'run', prompt: trimmed }))
+        ws.send(
+          JSON.stringify({
+            type: 'run',
+            prompt: trimmed,
+            sessionId: opts.sessionId,
+            resume: opts.resume === true,
+          }),
+        )
       }
 
       ws.onmessage = (ev) => {
+        const h = handlersRef.current
         let msg: ServerMsg
         try {
           msg = JSON.parse(ev.data) as ServerMsg
         } catch {
-          setOutput((prev) => [...prev, String(ev.data)])
+          // Bukan JSON — perlakukan sebagai chunk mentah.
+          h.onChunk?.(String(ev.data))
           return
         }
 
-        if (msg.type === 'chunk') {
-          const prefix = msg.level === 'error' ? '[stderr] ' : ''
-          // Pecah teks multi-baris jadi baris terpisah biar rapi di panel.
-          const lines = msg.text.split('\n').map((l) => prefix + l)
-          setOutput((prev) => [...prev, ...lines])
+        if (msg.type === 'session') {
+          h.onSession?.(msg.sessionId)
+        } else if (msg.type === 'chunk') {
+          h.onChunk?.(msg.text, msg.level)
         } else if (msg.type === 'done') {
           setStatus('done')
+          h.onDone?.(msg.code)
+          cleanup() // run kelar — lepas slot bridge.
         } else if (msg.type === 'error') {
-          setOutput((prev) => [...prev, `[error] ${msg.text}`])
           setStatus('error')
+          h.onError?.(msg.text)
+          // Error selalu ngakhirin attempt run ini (validasi gagal, spawn
+          // gagal, atau timeout yang lagi di-kill) — lepas socket.
+          cleanup()
         }
       }
 
       ws.onerror = () => {
         setStatus('error')
-        setOutput((prev) => [
-          ...prev,
-          '[error] Nggak bisa nyambung ke bridge — jalankan `pnpm claude-bridge` dulu',
-        ])
+        handlersRef.current.onError?.(
+          'Nggak bisa nyambung ke bridge — jalankan `pnpm claude-bridge` dulu',
+        )
       }
 
       ws.onclose = () => {
-        // Kalau nutup pas masih running (belum dapet done), tandai error.
+        // Nutup pas masih connecting/running (belum dapet done) = anggap error.
         setStatus((s) => (s === 'running' || s === 'connecting' ? 'error' : s))
       }
     },
@@ -124,9 +168,9 @@ export function useClaudeStream() {
   )
 
   /**
-   * Batalin run yang lagi jalan. Kirim { type: "cancel" } ke bridge; bridge
-   * bakal kill proses dan balikin { done }, yang nge-set status jadi 'done'.
-   * Kalau socket udah nggak kebuka, cukup rapihin state lokal.
+   * Batalin run yang lagi jalan. Kirim { type: "cancel" }; bridge kill proses
+   * dan balikin { done } (yang nge-set status 'done' + nutup socket). Kalau
+   * socket udah nggak kebuka, cukup rapihin status lokal.
    */
   const stop = useCallback(() => {
     const ws = wsRef.current
@@ -139,5 +183,5 @@ export function useClaudeStream() {
 
   useEffect(() => cleanup, [cleanup])
 
-  return { run, stop, output, status, cleanup }
+  return { run, stop, status, cleanup }
 }
