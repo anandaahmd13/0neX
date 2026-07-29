@@ -66,6 +66,7 @@ test('region selects the host and discovery sends the selected profile ARN', asy
   assert.equal(calls.length, 2)
   assert.equal(calls[0].url, 'https://codewhisperer.eu-central-1.amazonaws.com')
   assert.equal(calls[0].init.headers['x-amz-target'], PROFILE_TARGET)
+  assert.equal('tokentype' in calls[0].init.headers, false)
   assert.equal(calls[1].init.headers['x-amz-target'], MODEL_TARGET)
   assert.equal(calls[1].init.headers.authorization, `Bearer ${SECRET}`)
   assert.equal(calls[1].init.headers.tokentype, 'API_KEY')

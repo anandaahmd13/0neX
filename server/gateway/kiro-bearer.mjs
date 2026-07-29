@@ -85,7 +85,6 @@ export function createKiroBearerValidator({
           'content-type': 'application/x-amz-json-1.0',
           'x-amz-target': PROFILE_TARGET,
           authorization: `Bearer ${secret}`,
-          tokentype: 'API_KEY',
           accept: 'application/json',
         },
         body: JSON.stringify({ maxResults: 10 }),
