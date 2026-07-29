@@ -4,14 +4,14 @@
 
 Tampilan menggunakan gaya **neo-brutalist** dengan React, TypeScript, dan Tailwind CSS.
 
-> Status: **v0.3** — OpenAI-compatible gateway, encrypted provider connections, usage telemetry, serta playground Claude dan Kiro CLI. Data workflow/agent utama masih dipersist di browser.
+> Status: **v0.3** — OpenAI-compatible gateway, encrypted provider connections, usage telemetry, serta Playground Claude CLI dan Kiro HTTPS. Data workflow/agent utama masih dipersist di browser.
 
 ## Fitur
 
 - **Personal AI Gateway** — endpoint `POST /v1/chat/completions` dan `GET /v1/models` yang kompatibel dengan SDK OpenAI.
-- **Provider Connections** — kelola provider OpenAI-compatible dan Kiro CLI lokal; API key terenkripsi AES-256-GCM di server.
+- **Provider Connections** — kelola provider OpenAI-compatible dan Kiro HTTPS; API key terenkripsi AES-256-GCM di server.
 - **Usage Overview** — request, model, connection, status, latency, token usage, time series, dan request terbaru dari telemetry aktual.
-- **CLI Playground** — percakapan multi-sesi lewat Claude Code atau Kiro CLI lokal dengan streaming, cancel, resume context, dan pencatatan otomatis ke Runs.
+- **AI Playground** — percakapan multi-sesi lewat Claude Code CLI atau Kiro HTTPS dengan streaming, cancel, dan pencatatan otomatis ke Runs.
 - **Dashboard** — ringkasan request, token, agent aktif, success rate, chart, dan run terbaru.
 - **Agents** — profil agent dengan provider, model, system prompt, tool policy, tools, dan metrik.
 - **Workflows** — canvas node-based untuk merangkai trigger, agent, tool, dan output.
@@ -38,13 +38,13 @@ pnpm gateway                 # terminal 1: HTTP + WS di 127.0.0.1:8788
 pnpm dev                     # terminal 2: UI di localhost:5199
 ```
 
-Buka halaman **AI Gateway → Connections**, pilih **OpenAI-compatible HTTP** atau **Kiro CLI Headless**, lalu jalankan **Test API key**. Connection Kiro meminta API key Kiro dan menyimpannya terenkripsi di host gateway.
+Buka halaman **AI Gateway → Connections**, pilih **OpenAI-compatible HTTP** atau **Kiro HTTPS**, lalu jalankan **Test API key**. Connection Kiro memvalidasi API key ke CodeWhisperer lewat HTTPS dan menyimpannya terenkripsi di host gateway.
 
-Untuk Kiro, binary `kiro-cli` hanya perlu terpasang di mesin/server yang menjalankan gateway—bukan di setiap device yang memakai gateway. Host menjalankan `kiro-cli chat --no-interactive` dengan API key dalam `HOME` terisolasi. Device lain cukup memakai URL `/v1` dan `GATEWAY_API_KEY` milik gateway. Provider Kiro Playground memakai `KIRO_API_KEY` dari `.env`; Connection Kiro memakai key terenkripsi milik connection.
+Kiro tidak membutuhkan binary atau environment key global. Inference melakukan HTTPS langsung ke `runtime.<region>.kiro.dev/generateAssistantResponse` dengan region, profile ARN, dan credential milik connection yang dipilih. Di **AI Playground**, pilih connection Kiro tersimpan; browser hanya mengirim ID connection dan tidak pernah menerima API key.
 
 ### Batas kompatibilitas Kiro Connection
 
-Facade OpenAI untuk Kiro mendukung chat teks, satu choice, model `auto`, non-streaming, dan format SSE buffered. Kiro headless bersifat stateless: tidak ada resume session, pemilihan model arbitrary, atau token usage. Request tool calling, multimodal, audio, `response_format`, legacy completions, dan embeddings ditolak eksplisit. `stream: true` tetap menghasilkan SSE yang kompatibel, tetapi isi jawaban baru dikirim setelah proses headless selesai—bukan token streaming realtime.
+Facade OpenAI untuk Kiro mendukung chat teks, satu choice, model `auto`, respons non-stream, dan SSE streaming realtime dari AWS EventStream. Kiro tetap stateless: tidak ada resume session atau pemilihan model arbitrary. Request tool calling, multimodal, audio, `response_format`, legacy completions, dan embeddings ditolak eksplisit. Token usage dicatat bila runtime mengirim event metrics.
 
 ## Memakai endpoint Gateway
 
@@ -96,11 +96,11 @@ Gunakan `stream: true` seperti API OpenAI biasa untuk response SSE. Token hanya 
 
 ```text
 OpenAI SDK / app ── HTTPS ──> /v1/* ──> connection router ──> HTTP upstream
-                                  │                  └──> Kiro CLI Headless
+                                  │                  └──> Kiro HTTPS runtime
                                   └──> usage metadata JSONL
 
 Private dashboard ───────────> /admin/* ──> encrypted connection store
-CLI Playground ── WebSocket ─> provider registry ──> Claude Code / Kiro Headless
+AI Playground ──── WebSocket ─> provider registry ──> Claude CLI / Kiro HTTPS
 ```
 
 - [`server/gateway-server.mjs`](server/gateway-server.mjs) melayani HTTP dan WebSocket pada host/port yang sama, termasuk auth, CORS, body/output limits, timeout, dan routing.
@@ -109,8 +109,8 @@ CLI Playground ── WebSocket ─> provider registry ──> Claude Code / Kir
 - [`server/gateway/usage-store.mjs`](server/gateway/usage-store.mjs) menyimpan metadata request append-only. Prompt, completion, dan provider API key tidak disimpan.
 - [`server/gateway/openai-compatible.mjs`](server/gateway/openai-compatible.mjs) menangani model routing, safe upstream errors, dan ekstraksi usage SSE.
 - [`server/gateway/providers/claude-cli.mjs`](server/gateway/providers/claude-cli.mjs) menangani lifecycle Claude CLI lokal.
-- [`server/gateway/kiro-runner.mjs`](server/gateway/kiro-runner.mjs) dan [`server/gateway/kiro-transport.mjs`](server/gateway/kiro-transport.mjs) menangani proses Kiro CLI, ACP JSON-RPC, auth isolation, streaming, dan cancellation.
-- [`server/gateway/providers/kiro-cli.mjs`](server/gateway/providers/kiro-cli.mjs) menghubungkan shared Kiro runner ke Playground.
+- [`server/gateway/kiro-http.mjs`](server/gateway/kiro-http.mjs) membangun request `GenerateAssistantResponse`, memanggil runtime regional, dan mem-parse AWS EventStream secara incremental.
+- [`server/gateway/providers/kiro-cli.mjs`](server/gateway/providers/kiro-cli.mjs) mempertahankan provider ID lama demi kompatibilitas, tetapi menjalankan Kiro HTTPS memakai connection terenkripsi yang dipilih di Playground.
 
 Data server default berada di `.data/gateway/` dan diabaikan Git. Jangan mengubah `GATEWAY_MASTER_KEY` setelah connection dibuat; key baru tidak bisa mendekripsi secret lama.
 
