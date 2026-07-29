@@ -15,6 +15,72 @@ export function parseGatewayModel(value) {
   return { connectionId, upstreamModel }
 }
 
+/**
+ * Resolusi model request menjadi daftar kandidat { connectionId, upstreamModel }
+ * yang siap dicoba berurutan (failover).
+ *
+ * Urutan:
+ *   1. Ekspansi alias (aliases[model]) bila ada.
+ *   2. Kalau hasil berformat "connection/model" → kandidat tunggal eksplisit,
+ *      plus kandidat lain (connection berbeda) yang juga mengekspos upstreamModel
+ *      sama, sebagai cadangan failover.
+ *   3. Kalau hasil "bare-model" (tanpa "/") → semua connection aktif yang
+ *      mengekspos model itu, diurutkan: connection yang models-nya eksplisit
+ *      mencantumkan model didahulukan.
+ *
+ * @param {string} model            Nilai body.model dari client.
+ * @param {object} opts
+ * @param {Record<string,string>} opts.aliases   Peta alias → target.
+ * @param {Array<{id,enabled,models}>} opts.connections  Proyeksi publik connection.
+ * @returns {{ resolvedModel: string, candidates: Array<{connectionId, upstreamModel}> }}
+ */
+export function resolveModelCandidates(model, { aliases = {}, connections = [] } = {}) {
+  if (typeof model !== 'string' || !model.trim()) throw new Error('model wajib berupa string')
+  const resolved = aliases[model.trim()] ?? model.trim()
+  const enabled = connections.filter((c) => c.enabled !== false)
+  const separator = resolved.indexOf('/')
+
+  // Kasus bare-model: tidak ada connection prefix.
+  // (Anggap bare bila tidak ada "/" ATAU prefix sebelum "/" bukan connection yang dikenal.)
+  const maybeConnectionId = separator > 0 ? resolved.slice(0, separator) : ''
+  const knownConnection = enabled.some((c) => c.id === maybeConnectionId)
+
+  if (separator <= 0 || !knownConnection) {
+    // Bare model → cari semua connection yang mengekspos model ini.
+    const bare = resolved
+    const exposing = enabled.filter((c) => Array.isArray(c.models) && c.models.includes(bare))
+    // Connection tanpa daftar model (allow-all) juga jadi kandidat, di urutan belakang.
+    const allowAll = enabled.filter((c) => !Array.isArray(c.models) || c.models.length === 0)
+    const ordered = [...exposing, ...allowAll]
+    if (!ordered.length) {
+      throw Object.assign(new Error(`Tidak ada connection yang mengekspos model: ${bare}`), {
+        status: 404,
+        code: 'model_not_available',
+      })
+    }
+    const seen = new Set()
+    const candidates = []
+    for (const c of ordered) {
+      if (seen.has(c.id)) continue
+      seen.add(c.id)
+      candidates.push({ connectionId: c.id, upstreamModel: bare })
+    }
+    return { resolvedModel: bare, candidates }
+  }
+
+  // Eksplisit connection/model.
+  const { connectionId, upstreamModel } = parseGatewayModel(resolved)
+  const candidates = [{ connectionId, upstreamModel }]
+  // Failover: connection lain yang juga mengekspos upstreamModel sama.
+  for (const c of enabled) {
+    if (c.id === connectionId) continue
+    if (Array.isArray(c.models) && c.models.includes(upstreamModel)) {
+      candidates.push({ connectionId: c.id, upstreamModel })
+    }
+  }
+  return { resolvedModel: resolved, candidates }
+}
+
 export function upstreamUrl(baseUrl, resource) {
   return `${baseUrl.replace(/\/+$/, '')}/${resource.replace(/^\/+/, '')}`
 }

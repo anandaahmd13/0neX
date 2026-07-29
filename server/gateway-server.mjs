@@ -7,6 +7,7 @@ import { ConnectionStore } from './gateway/connection-store.mjs'
 import {
   createSseUsageParser,
   parseGatewayModel,
+  resolveModelCandidates,
   safeUpstreamError,
   upstreamHeaders,
   upstreamUrl,
@@ -18,6 +19,7 @@ import { createSessionManager, parseCookies, serializeSessionCookie } from './ga
 import { assertPublicHost } from './gateway/net-guard.mjs'
 import { RateLimiter } from './gateway/rate-limiter.mjs'
 import { PricingTable } from './gateway/pricing.mjs'
+import { loadAliases } from './gateway/aliases.mjs'
 
 try {
   registerProvider(claudeCliProvider)
@@ -215,6 +217,14 @@ export function createGatewayServer(options = {}) {
       .then((loaded) => { Object.assign(pricingTable.prices, loaded.prices) })
       .catch(() => {})
   }
+
+  // Peta alias model → target (mendukung failover lintas connection).
+  const aliases = options.aliases ? { ...options.aliases } : {}
+  if (!options.aliases) {
+    loadAliases({ dataDir, aliasFile: env.GATEWAY_ALIASES_FILE, envValue: env.GATEWAY_ALIASES })
+      .then((loaded) => { Object.assign(aliases, loaded) })
+      .catch(() => {})
+  }
   const usageStore = options.usageStore ?? new UsageStore({ dataDir, pricingTable })
   const fetchImpl = options.fetchImpl ?? fetch
 
@@ -257,65 +267,59 @@ export function createGatewayServer(options = {}) {
     return sessions.verify(cookies[sessions.cookieName]) !== null
   }
 
-  async function proxyChat(request, response, body, headers) {
-    const requestId = `req_${randomUUID()}`
-    const startedAt = Date.now()
-    let parsedModel
-    let connection
-    let usage = null
-    let status = 500
-    let errorCategory = null
-    let upstreamTimer = null
+  // Status yang layak di-failover ke connection kandidat berikutnya.
+  function isFailoverStatus(status) {
+    return status === 429 || status === 408 || (status >= 500 && status <= 599)
+  }
 
+  // Satu percobaan fetch ke satu connection. Melempar { retryable } agar
+  // pemanggil bisa memutuskan lanjut failover atau tidak.
+  async function attemptUpstream({ resource, connection, upstreamModel, body, response, headers, requestId }) {
+    await guardUpstream(connection.baseUrl)
+    const controller = new AbortController()
+    const upstreamTimer = setTimeout(() => controller.abort(), limits.upstreamTimeoutMs)
     try {
-      parsedModel = parseGatewayModel(body.model)
-      connection = await connectionStore.getWithSecret(parsedModel.connectionId)
-      if (!connection || !connection.enabled) {
-        throw Object.assign(new Error(`Connection tidak tersedia: ${parsedModel.connectionId}`), { status: 404, code: 'connection_not_found' })
-      }
-      if (connection.models.length && !connection.models.includes(parsedModel.upstreamModel)) {
-        throw Object.assign(new Error(`Model tidak diizinkan pada connection ${connection.id}`), { status: 400, code: 'model_not_allowed' })
-      }
-
-      await guardUpstream(connection.baseUrl)
-      const controller = new AbortController()
-      upstreamTimer = setTimeout(() => controller.abort(), limits.upstreamTimeoutMs)
-      const upstream = await fetchImpl(upstreamUrl(connection.baseUrl, 'chat/completions'), {
+      const upstream = await fetchImpl(upstreamUrl(connection.baseUrl, resource), {
         method: 'POST',
         headers: upstreamHeaders(connection.apiKey),
-        body: JSON.stringify({ ...body, model: parsedModel.upstreamModel }),
+        body: JSON.stringify({ ...body, model: upstreamModel }),
         signal: controller.signal,
       })
-      status = upstream.status
+      const status = upstream.status
 
       if (!upstream.ok) {
         const { payload } = await readUpstreamJson(upstream, limits.maxOutputBytes)
-        errorCategory = categoryForStatus(upstream.status)
-        sendJson(response, upstream.status, safeUpstreamError(upstream.status, payload), headers)
-        return
+        return {
+          done: false,
+          status,
+          usage: null,
+          errorCategory: categoryForStatus(status),
+          retryable: isFailoverStatus(status),
+          errorPayload: safeUpstreamError(status, payload),
+        }
       }
 
       const isStream = body.stream === true || upstream.headers.get('content-type')?.includes('text/event-stream')
       if (!isStream) {
         const { buffer, payload } = await readUpstreamJson(upstream, limits.maxOutputBytes)
-        usage = payload?.usage ?? null
-        response.writeHead(upstream.status, {
+        response.writeHead(status, {
           ...headers,
           'content-type': upstream.headers.get('content-type') ?? 'application/json; charset=utf-8',
           'content-length': buffer.length,
           'x-request-id': requestId,
         })
         response.end(buffer)
-        return
+        return { done: true, status, usage: payload?.usage ?? null, errorCategory: null }
       }
 
-      response.writeHead(upstream.status, {
+      response.writeHead(status, {
         ...headers,
         'content-type': 'text/event-stream; charset=utf-8',
         'cache-control': 'no-cache',
         connection: 'keep-alive',
         'x-request-id': requestId,
       })
+      let usage = null
       const parser = createSseUsageParser((nextUsage) => { usage = nextUsage })
       let outputBytes = 0
       for await (const chunk of upstream.body) {
@@ -326,19 +330,94 @@ export function createGatewayServer(options = {}) {
       }
       parser.finish()
       response.end()
+      return { done: true, status, usage, errorCategory: null }
+    } finally {
+      clearTimeout(upstreamTimer)
+    }
+  }
+
+  // Proxy generik untuk resource OpenAI-compatible (chat/completions,
+  // completions, embeddings). Melakukan resolusi model+alias dan failover
+  // ke connection kandidat berikutnya saat kena 429/5xx.
+  async function proxyResource(request, response, body, headers, resource) {
+    const requestId = `req_${randomUUID()}`
+    const startedAt = Date.now()
+    let usage = null
+    let status = 500
+    let errorCategory = null
+    let lastConnectionId = null
+    let lastUpstreamModel = null
+
+    try {
+      const connections = await connectionStore.list()
+      const { candidates } = resolveModelCandidates(body.model, { aliases, connections })
+
+      let lastError = null
+      for (let i = 0; i < candidates.length; i += 1) {
+        const candidate = candidates[i]
+        const connection = await connectionStore.getWithSecret(candidate.connectionId)
+        if (!connection || !connection.enabled) continue
+        if (connection.models.length && !connection.models.includes(candidate.upstreamModel)) continue
+
+        lastConnectionId = candidate.connectionId
+        lastUpstreamModel = candidate.upstreamModel
+        const hasMore = i < candidates.length - 1
+
+        let result
+        try {
+          result = await attemptUpstream({
+            resource,
+            connection,
+            upstreamModel: candidate.upstreamModel,
+            body,
+            response,
+            headers,
+            requestId,
+          })
+        } catch (error) {
+          // Error jaringan/timeout: coba kandidat berikutnya kalau belum kirim header.
+          status = error.name === 'AbortError' ? 504 : 502
+          errorCategory = error.name === 'AbortError' ? 'upstream_timeout' : 'gateway_failure'
+          lastError = error
+          if (hasMore && !response.headersSent) continue
+          throw error
+        }
+
+        status = result.status
+        errorCategory = result.errorCategory
+        usage = result.usage
+
+        if (result.done) return
+        // Upstream mengembalikan error status.
+        if (result.retryable && hasMore && !response.headersSent) {
+          lastError = result.errorPayload
+          continue
+        }
+        // Tidak retryable atau kandidat habis → teruskan error ke client.
+        sendJson(response, result.status, result.errorPayload, headers)
+        return
+      }
+
+      // Semua kandidat gagal/terlewati.
+      if (!response.headersSent) {
+        if (lastError && typeof lastError === 'object' && 'error' in lastError) {
+          sendJson(response, status || 502, lastError, headers)
+        } else {
+          apiError(response, status || 502, 'Semua connection kandidat gagal', 'all_candidates_failed', headers)
+        }
+      }
     } catch (error) {
       status = Number(error.status) || (error.name === 'AbortError' ? 504 : 502)
       errorCategory = error.name === 'AbortError' ? 'upstream_timeout' : error.code ?? 'gateway_failure'
       if (!response.headersSent) apiError(response, status, error.message, error.code ?? errorCategory, headers)
       else response.destroy()
     } finally {
-      if (upstreamTimer) clearTimeout(upstreamTimer)
-      if (parsedModel) {
+      if (lastConnectionId) {
         try {
           await usageStore.append({
             requestId,
-            connectionId: parsedModel.connectionId,
-            model: parsedModel.upstreamModel,
+            connectionId: lastConnectionId,
+            model: lastUpstreamModel,
             stream: body.stream === true,
             status,
             success: status >= 200 && status < 300,
@@ -382,39 +461,80 @@ export function createGatewayServer(options = {}) {
         }
         if (request.method === 'GET' && url.pathname === '/v1/models') {
           const connections = (await connectionStore.list()).filter((item) => item.enabled)
-          sendJson(response, 200, {
-            object: 'list',
-            data: connections.flatMap((connection) => connection.models.map((model) => ({
-              id: `${connection.id}/${model}`,
-              object: 'model',
-              created: Math.floor(Date.parse(connection.createdAt) / 1000),
-              owned_by: connection.id,
-            }))),
-          }, headers)
+          const data = connections.flatMap((connection) => connection.models.map((model) => ({
+            id: `${connection.id}/${model}`,
+            object: 'model',
+            created: Math.floor(Date.parse(connection.createdAt) / 1000),
+            owned_by: connection.id,
+          })))
+          // Alias juga muncul sebagai model virtual yang bisa dipanggil client.
+          for (const alias of Object.keys(aliases)) {
+            data.push({ id: alias, object: 'model', created: 0, owned_by: 'alias' })
+          }
+          sendJson(response, 200, { object: 'list', data }, headers)
           return
         }
-        if (request.method === 'POST' && url.pathname === '/v1/chat/completions') {
-          const body = await readJson(request, limits.maxBodyBytes)
-          // Rate limit per (API key + connection). Connection di-parse dari model;
-          // kalau model invalid, biarkan proxyChat yang mengembalikan error format.
-          if (rateLimiter) {
-            let connectionId = 'unknown'
-            try {
-              connectionId = parseGatewayModel(body.model).connectionId
-            } catch {
-              // model invalid → tetap rate limit pakai key generik agar tidak jadi bypass.
+        // GET /v1/models/{id} — retrieve satu model (id = connection/model atau alias).
+        const modelMatch = url.pathname.match(/^\/v1\/models\/(.+)$/)
+        if (request.method === 'GET' && modelMatch) {
+          const id = decodeURIComponent(modelMatch[1])
+          if (aliases[id]) {
+            sendJson(response, 200, { id, object: 'model', created: 0, owned_by: 'alias' }, headers)
+            return
+          }
+          try {
+            const { connectionId, upstreamModel } = parseGatewayModel(id)
+            const connection = await connectionStore.get(connectionId)
+            if (connection && connection.enabled &&
+              (!connection.models.length || connection.models.includes(upstreamModel))) {
+              sendJson(response, 200, {
+                id,
+                object: 'model',
+                created: Math.floor(Date.parse(connection.createdAt) / 1000),
+                owned_by: connection.id,
+              }, headers)
+              return
             }
-            const { allowed, retryAfterMs } = rateLimiter.take(`v1:${connectionId}`)
+          } catch {
+            // format id salah → jatuh ke 404 di bawah
+          }
+          apiError(response, 404, `Model tidak ditemukan: ${id}`, 'model_not_found', headers)
+          return
+        }
+
+        // Resource proxy OpenAI-compatible dengan rate limit + failover + alias.
+        const resourceRoutes = {
+          '/v1/chat/completions': 'chat/completions',
+          '/v1/completions': 'completions',
+          '/v1/embeddings': 'embeddings',
+        }
+        const resource = resourceRoutes[url.pathname]
+        if (request.method === 'POST' && resource) {
+          const body = await readJson(request, limits.maxBodyBytes)
+          // Rate limit per (API key + connection kandidat pertama). Resolusi model
+          // dipakai untuk menentukan connection; kalau gagal, pakai key generik.
+          if (rateLimiter) {
+            let rateKey = 'unknown'
+            try {
+              const { candidates } = resolveModelCandidates(body.model, {
+                aliases,
+                connections: await connectionStore.list(),
+              })
+              rateKey = candidates[0]?.connectionId ?? 'unknown'
+            } catch {
+              // model invalid/tak tersedia → tetap rate limit agar bukan jalur bypass.
+            }
+            const { allowed, retryAfterMs } = rateLimiter.take(`v1:${rateKey}`)
             if (!allowed) {
               const retryAfter = Math.ceil(retryAfterMs / 1000)
-              apiError(response, 429, `Rate limit terlampaui untuk ${connectionId}, coba lagi dalam ${retryAfter}s`, 'rate_limited', {
+              apiError(response, 429, `Rate limit terlampaui untuk ${rateKey}, coba lagi dalam ${retryAfter}s`, 'rate_limited', {
                 ...headers,
                 'retry-after': String(retryAfter),
               })
               return
             }
           }
-          await proxyChat(request, response, body, headers)
+          await proxyResource(request, response, body, headers, resource)
           return
         }
         apiError(response, 404, 'Endpoint tidak ditemukan', 'not_found', headers)
