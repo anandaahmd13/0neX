@@ -124,7 +124,11 @@ function normalizeStoredConnection(connection) {
 
 function publicConnection(connection) {
   const { encryptedApiKey: _encryptedApiKey, ...safe } = normalizeStoredConnection(connection)
-  return { ...safe, hasApiKey: Boolean(connection.encryptedApiKey) }
+  return {
+    ...safe,
+    hasApiKey: Boolean(connection.encryptedApiKey),
+    ...(connection.kind === 'kiro-cli' ? { credentialType: 'bearer' } : {}),
+  }
 }
 
 function usesSecret(connection) {
@@ -208,7 +212,7 @@ export class ConnectionStore {
     }
   }
 
-  create(input) {
+  create(input, { validatedAt } = {}) {
     return this.mutate(() => {
       const normalized = validateConnectionInput(input, {
         allowInsecureLocalhost: this.allowInsecureLocalhost,
@@ -229,6 +233,7 @@ export class ConnectionStore {
         ...(usesSecret(normalized) && apiKey
           ? { encryptedApiKey: encryptSecret(apiKey, this.masterKey) }
           : {}),
+        ...(normalized.kind === 'kiro-cli' && validatedAt ? { validatedAt } : {}),
         createdAt: now,
         updatedAt: now,
       }
@@ -237,7 +242,7 @@ export class ConnectionStore {
     })
   }
 
-  update(id, input) {
+  update(id, input, { validatedAt } = {}) {
     return this.mutate(() => {
       const index = this.connections.findIndex((item) => item.id === id)
       if (index === -1) throw new Error(`Connection tidak ditemukan: ${id}`)
@@ -267,10 +272,14 @@ export class ConnectionStore {
         ...current,
         ...normalized,
         encryptedApiKey,
+        ...(normalized.kind === 'kiro-cli' && validatedAt ? { validatedAt } : {}),
         updatedAt: new Date().toISOString(),
       }
       if (normalized.kind === 'kiro-cli') delete connection.baseUrl
-      else delete connection.authMode
+      else {
+        delete connection.authMode
+        delete connection.validatedAt
+      }
       if (!encryptedApiKey) delete connection.encryptedApiKey
       this.connections[index] = connection
       return publicConnection(connection)

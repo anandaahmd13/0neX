@@ -8,6 +8,8 @@ const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_KILL_GRACE_MS = 3_000
 const DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 const CLIENT_INFO = { name: '0nex-gateway', title: '0neX Gateway', version: '1.0.0' }
+const AUTH_REJECTION_PATTERN = /(?:access\s*denied|unauthori[sz]ed|forbidden|auth(?:entication)?\s+failed|invalid|expired|revoked).{0,80}(?:api[_ -]?key|bearer|credential|token)|(?:api[_ -]?key|bearer|credential|token).{0,80}(?:access\s*denied|unauthori[sz]ed|forbidden|auth(?:entication)?\s+failed|invalid|expired|revoked)/i
+const VALIDATION_PROMPT = 'Reply with OK only. Do not use tools.'
 
 export class KiroRunnerError extends Error {
   constructor(message, { code = 'KIRO_RUNNER_ERROR', cause } = {}) {
@@ -149,6 +151,10 @@ export function createKiroRunner(options = {}) {
   const spawnFn = options.spawn ?? nodeSpawn
   const inheritedEnv = { ...(options.env ?? process.env) }
   const executable = options.executable ?? inheritedEnv.KIRO_CLI_COMMAND ?? 'kiro-cli'
+  const executableArgs = Array.isArray(options.executableArgs)
+    ? options.executableArgs.map((value) => String(value))
+    : []
+  const commandArgs = (args) => [...executableArgs, ...args]
   const dataDir = resolve(options.dataDir ?? inheritedEnv.GATEWAY_DATA_DIR ?? '.data/gateway')
   const timeoutMs = positiveNumber(
     options.timeoutMs ?? inheritedEnv.GATEWAY_RUN_TIMEOUT_MS ?? inheritedEnv.KIRO_RUN_TIMEOUT_MS,
@@ -224,7 +230,7 @@ export function createKiroRunner(options = {}) {
       }
 
       try {
-        child = spawnFn(executable, args, {
+        child = spawnFn(executable, commandArgs(args), {
           cwd: cwd ? resolve(cwd) : undefined,
           env,
           stdio: ['ignore', 'pipe', 'pipe'],
@@ -311,6 +317,38 @@ export function createKiroRunner(options = {}) {
     return parseKiroModelList(parseJsonOutput(stdout, 'model listing'))
   }
 
+  async function validateApiKey({ apiKey, cwd } = {}) {
+    const secret = typeof apiKey === 'string' ? apiKey.trim() : ''
+    if (!secret) {
+      throw new KiroRunnerError('Kiro API key wajib diisi.', {
+        code: 'KIRO_API_KEY_REQUIRED',
+      })
+    }
+
+    const controller = startHeadless({
+      prompt: VALIDATION_PROMPT,
+      auth: { type: 'api-key', secret },
+      cwd,
+    })
+    const result = await controller.done
+    if (result.reason === 'completed') {
+      return { authenticated: true, credentialType: 'bearer' }
+    }
+
+    const error = result.error instanceof Error
+      ? result.error
+      : new KiroRunnerError('Validasi Kiro/CodeWhisperer gagal.', {
+          code: 'KIRO_COMMAND_FAILED',
+        })
+    if (AUTH_REJECTION_PATTERN.test(error.message)) {
+      throw new KiroRunnerError('Kiro/CodeWhisperer API key ditolak oleh AWS.', {
+        code: 'KIRO_AUTH_REJECTED',
+        cause: error,
+      })
+    }
+    throw error
+  }
+
   function startHeadless(request, handlers = {}) {
     const onChunk = handlers.onChunk ?? (() => {})
     const onDone = handlers.onDone ?? (() => {})
@@ -384,11 +422,11 @@ export function createKiroRunner(options = {}) {
         const env = await environmentFor(request.auth)
         if (terminal) return
 
-        child = spawnFn(executable, [
+        child = spawnFn(executable, commandArgs([
           'chat',
           '--no-interactive',
           'Jawab permintaan pada standard input. Jangan gunakan tool.',
-        ], {
+        ]), {
           cwd,
           env,
           stdio: ['pipe', 'pipe', 'pipe'],
@@ -623,7 +661,7 @@ export function createKiroRunner(options = {}) {
         if (stopped) return
 
         try {
-          child = spawnFn(executable, ['acp'], {
+          child = spawnFn(executable, commandArgs(['acp']), {
             cwd,
             env,
             stdio: ['pipe', 'pipe', 'pipe'],
@@ -776,7 +814,7 @@ export function createKiroRunner(options = {}) {
     }
   }
 
-  return { checkAuth, whoami, listModels, startHeadless, start }
+  return { checkAuth, whoami, listModels, validateApiKey, startHeadless, start }
 }
 
 export const kiroRunner = createKiroRunner()

@@ -4,7 +4,7 @@ import { createServer } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
 import { WebSocketServer } from 'ws'
-import { ConnectionStore } from './gateway/connection-store.mjs'
+import { ConnectionStore, validateConnectionInput } from './gateway/connection-store.mjs'
 import {
   createSseUsageParser,
   parseGatewayModel,
@@ -291,6 +291,13 @@ function mapKiroError(error) {
       retryable: true,
     })
   }
+  if (code === 'KIRO_AUTH_REJECTED') {
+    return Object.assign(new Error('Kiro/CodeWhisperer API key ditolak oleh AWS'), {
+      status: 401,
+      code: 'kiro_auth_failed',
+      retryable: false,
+    })
+  }
   if (code === 'KIRO_API_KEY_REQUIRED' || code === 'KIRO_INVALID_AUTH') {
     return Object.assign(new Error('Konfigurasi autentikasi Kiro tidak valid'), {
       status: 500,
@@ -409,6 +416,23 @@ export function createGatewayServer(options = {}) {
 
   function verifyOrigin(origin) {
     return !origin || allowedOrigins.has(origin)
+  }
+
+  async function validateKiroBearer({ id, apiKey }) {
+    if (typeof apiKey !== 'string' || !apiKey.trim()) {
+      throw Object.assign(new Error('Kiro/CodeWhisperer API key wajib diisi'), {
+        status: 400,
+        code: 'kiro_api_key_required',
+      })
+    }
+    const cwd = join(dataDir, 'kiro', 'connection-tests', id)
+    await mkdir(cwd, { recursive: true, mode: 0o700 })
+    try {
+      await kiroRunner.validateApiKey({ apiKey, cwd })
+      return new Date().toISOString()
+    } catch (error) {
+      throw mapKiroError(error)
+    }
   }
 
   // Admin surface menerima dua jalur auth:
@@ -946,13 +970,30 @@ export function createGatewayServer(options = {}) {
           return
         }
         if (request.method === 'POST' && url.pathname === '/admin/connections') {
-          sendJson(response, 201, { data: await connectionStore.create(await readJson(request, limits.maxBodyBytes)) }, headers)
+          const input = await readJson(request, limits.maxBodyBytes)
+          const normalized = validateConnectionInput(input, { allowInsecureLocalhost })
+          const validatedAt = normalized.kind === 'kiro-cli'
+            ? await validateKiroBearer({ id: normalized.id, apiKey: input.apiKey })
+            : undefined
+          sendJson(response, 201, {
+            data: await connectionStore.create(input, { validatedAt }),
+          }, headers)
           return
         }
         const connectionMatch = url.pathname.match(/^\/admin\/connections\/([a-z0-9-]+)$/)
         if (connectionMatch && request.method === 'PATCH') {
+          const current = await connectionStore.getWithSecret(connectionMatch[1])
+          if (!current) throw Object.assign(new Error('Connection tidak ditemukan'), { status: 404 })
+          const input = await readJson(request, limits.maxBodyBytes)
+          const normalized = validateConnectionInput({ ...current, ...input, id: current.id }, {
+            allowInsecureLocalhost,
+          })
+          const candidateKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : ''
+          const validatedAt = normalized.kind === 'kiro-cli' && candidateKey
+            ? await validateKiroBearer({ id: current.id, apiKey: candidateKey })
+            : undefined
           sendJson(response, 200, {
-            data: await connectionStore.update(connectionMatch[1], await readJson(request, limits.maxBodyBytes)),
+            data: await connectionStore.update(connectionMatch[1], input, { validatedAt }),
           }, headers)
           return
         }
@@ -966,26 +1007,19 @@ export function createGatewayServer(options = {}) {
           if (!connection) throw Object.assign(new Error('Connection tidak ditemukan'), { status: 404 })
 
           if (connection.kind === 'kiro-cli') {
-            const cwd = join(dataDir, 'kiro', 'connection-tests', connection.id)
-            await mkdir(cwd, { recursive: true, mode: 0o700 })
-            const auth = kiroAuth(connection)
-            let authenticated
-            let models
-            try {
-              const result = await kiroRunner.checkAuth({ auth, cwd })
-              authenticated = result?.authenticated === true
-              if (!authenticated) {
-                throw Object.assign(new Error('Autentikasi Kiro gagal'), {
-                  status: 401,
-                  code: 'kiro_auth_failed',
-                })
-              }
-              models = ['auto']
-            } catch (error) {
-              if (error.status === 401) throw error
-              throw mapKiroError(error)
-            }
-            sendJson(response, 200, { data: { ok: true, models } }, headers)
+            const validatedAt = await validateKiroBearer({
+              id: connection.id,
+              apiKey: connection.apiKey,
+            })
+            await connectionStore.update(connection.id, {}, { validatedAt })
+            sendJson(response, 200, {
+              data: {
+                ok: true,
+                models: ['auto'],
+                credentialType: 'bearer',
+                validatedAt,
+              },
+            }, headers)
             return
           }
 
