@@ -61,7 +61,7 @@ test('runtime URL follows the saved Kiro region', () => {
   assert.throws(() => kiroRuntimeUrl('ap-southeast-1'), /region/i)
 })
 
-test('request payload keeps history, latest user turn, profile, and system prompt', () => {
+test('request payload keeps history and folds system prompt into the latest user turn', () => {
   const payload = buildKiroRequest({
     profileArn: 'arn:aws:codewhisperer:us-east-1:1:profile/OK',
     model: 'auto',
@@ -75,9 +75,12 @@ test('request payload keeps history, latest user turn, profile, and system promp
   })
 
   assert.equal(payload.profileArn, 'arn:aws:codewhisperer:us-east-1:1:profile/OK')
-  assert.equal(payload.systemPrompt, '[system]\nBe concise.')
+  assert.equal('systemPrompt' in payload, false)
   assert.equal(payload.conversationState.conversationId, 'conversation-1')
-  assert.equal(payload.conversationState.currentMessage.userInputMessage.content, 'last')
+  assert.equal(
+    payload.conversationState.currentMessage.userInputMessage.content,
+    '[system]\nBe concise.\n\nlast',
+  )
   assert.deepEqual(payload.conversationState.history, [
     { userInputMessage: { content: 'first', modelId: 'auto', origin: 'AI_EDITOR' } },
     { assistantResponseMessage: { content: 'answer' } },

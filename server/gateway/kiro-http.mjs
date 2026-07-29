@@ -102,6 +102,10 @@ export function buildKiroRequest({ messages, systemPrompt = '', profileArn, mode
     }
   }
 
+  if (systemPrompt) {
+    currentMessage.userInputMessage.content = `${systemPrompt}\n\n${currentMessage.userInputMessage.content}`
+  }
+
   const payload = {
     conversationState: {
       chatTriggerType: 'MANUAL',
@@ -111,7 +115,6 @@ export function buildKiroRequest({ messages, systemPrompt = '', profileArn, mode
     },
   }
   if (profileArn) payload.profileArn = profileArn
-  if (systemPrompt) payload.systemPrompt = systemPrompt
   return payload
 }
 
