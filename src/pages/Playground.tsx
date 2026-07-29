@@ -54,6 +54,7 @@ interface PaneCardProps {
   onTitle: (id: string, title: string) => void
   onAgent: (id: string, agentId: string) => void
   onConnection: (id: string, connectionId: string) => void
+  onModel: (id: string, modelId: string) => void
 }
 
 function PaneCard({
@@ -70,6 +71,7 @@ function PaneCard({
   onTitle,
   onAgent,
   onConnection,
+  onModel,
 }: PaneCardProps) {
   const [prompt, setPrompt] = useState('')
   const { run, stop, status } = useGatewayStream()
@@ -78,6 +80,10 @@ function PaneCard({
   const busy = status === 'connecting' || status === 'running'
   const persistentSession = agent.providerId !== 'kiro-cli'
   const meta = statusMeta[status]
+  const selectedConnection = kiroConnections.find(
+    (connection) => connection.id === pane.connectionId,
+  )
+  const availableModels = selectedConnection?.models ?? []
 
   useEffect(() => {
     if (terminalRef.current) terminalRef.current.scrollTop = terminalRef.current.scrollHeight
@@ -88,6 +94,13 @@ function PaneCard({
     if (!task || busy) return
     if (agent.providerId === 'kiro-cli' && !pane.connectionId) {
       onAppend(pane.id, ['[error] Pilih connection Kiro aktif sebelum mengirim prompt.'])
+      return
+    }
+    if (
+      agent.providerId === 'kiro-cli'
+      && (!pane.modelId || !availableModels.includes(pane.modelId))
+    ) {
+      onAppend(pane.id, ['[error] Pilih model Kiro aktif sebelum mengirim prompt.'])
       return
     }
 
@@ -110,7 +123,7 @@ function PaneCard({
           ts: nowTime(),
           level: 'info',
           agent: agent.name,
-          message: `Memulai ${agent.providerId} dengan model ${agent.model || 'Auto'}`,
+          message: `Memulai ${agent.providerId} dengan model ${agent.providerId === 'kiro-cli' ? pane.modelId : agent.model || 'Auto'}`,
         },
       ],
     }
@@ -125,7 +138,7 @@ function PaneCard({
         connectionId: agent.providerId === 'kiro-cli' ? pane.connectionId : undefined,
         agent: {
           id: agent.id,
-          model: agent.model,
+          model: agent.providerId === 'kiro-cli' ? pane.modelId : agent.model,
           systemPrompt: agent.systemPrompt,
           toolPolicy: agent.toolPolicy,
         },
@@ -245,28 +258,49 @@ function PaneCard({
         </div>
 
         {agent.providerId === 'kiro-cli' && (
-          <div className="space-y-1">
-            <label htmlFor={`kiro-connection-${pane.id}`} className="text-[10px] font-bold uppercase tracking-wider text-ink/60">
-              Connection Kiro
-            </label>
-            <select
-              id={`kiro-connection-${pane.id}`}
-              value={pane.connectionId}
-              onChange={(event) => onConnection(pane.id, event.target.value)}
-              disabled={busy || kiroConnections.length === 0}
-              className="w-full rounded-lg border-2 border-ink bg-cream px-2 py-1.5 text-xs font-bold outline-none disabled:opacity-60"
-            >
-              <option value="">Pilih connection tersimpan</option>
-              {kiroConnections.map((connection) => (
-                <option key={connection.id} value={connection.id}>
-                  {connection.name} · {connection.region ?? 'us-east-1'}
-                </option>
-              ))}
-            </select>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="space-y-1">
+              <label htmlFor={`kiro-connection-${pane.id}`} className="text-[10px] font-bold uppercase tracking-wider text-ink/60">
+                Connection Kiro
+              </label>
+              <select
+                id={`kiro-connection-${pane.id}`}
+                value={pane.connectionId}
+                onChange={(event) => onConnection(pane.id, event.target.value)}
+                disabled={busy || kiroConnections.length === 0}
+                className="w-full rounded-lg border-2 border-ink bg-cream px-2 py-1.5 text-xs font-bold outline-none disabled:opacity-60"
+              >
+                <option value="">Pilih connection tersimpan</option>
+                {kiroConnections.map((connection) => (
+                  <option key={connection.id} value={connection.id}>
+                    {connection.name} · {connection.region ?? 'us-east-1'}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="space-y-1">
+              <label htmlFor={`kiro-model-${pane.id}`} className="text-[10px] font-bold uppercase tracking-wider text-ink/60">
+                Model Kiro
+              </label>
+              <select
+                id={`kiro-model-${pane.id}`}
+                value={pane.modelId}
+                onChange={(event) => onModel(pane.id, event.target.value)}
+                disabled={busy || !selectedConnection || availableModels.length === 0}
+                className="w-full rounded-lg border-2 border-ink bg-cream px-2 py-1.5 text-xs font-bold outline-none disabled:opacity-60"
+              >
+                <option value="">Pilih model aktif</option>
+                {availableModels.map((model) => (
+                  <option key={model} value={model}>{model}</option>
+                ))}
+              </select>
+            </div>
             {connectionsError ? (
-              <p className="text-xs font-bold text-danger">{connectionsError}</p>
+              <p className="text-xs font-bold text-danger sm:col-span-2">{connectionsError}</p>
             ) : kiroConnections.length === 0 ? (
-              <p className="text-xs text-ink/60">Tambahkan dan aktifkan connection Kiro di AI Gateway dulu.</p>
+              <p className="text-xs text-ink/60 sm:col-span-2">Tambahkan dan aktifkan connection Kiro di AI Gateway dulu.</p>
+            ) : selectedConnection && availableModels.length === 0 ? (
+              <p className="text-xs font-bold text-danger sm:col-span-2">Connection ini belum memiliki model aktif.</p>
             ) : null}
           </div>
         )}
@@ -274,7 +308,7 @@ function PaneCard({
         <details className="rounded-lg border-2 border-dashed border-ink/30 bg-cream px-3 py-2 text-xs">
           <summary className="cursor-pointer font-bold">Konfigurasi agent</summary>
           <div className="mt-2 space-y-1 text-ink/60">
-            <p>Model: {agent.model || 'Auto'}</p>
+            <p>Model: {agent.providerId === 'kiro-cli' ? pane.modelId || 'Belum dipilih' : agent.model || 'Auto'}</p>
             <p>System prompt: {agent.systemPrompt}</p>
           </div>
         </details>
@@ -328,7 +362,16 @@ function PaneCard({
               Stop
             </Button>
           ) : (
-            <Button variant="primary" size="sm" onClick={handleRun} disabled={!prompt.trim()}>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={handleRun}
+              disabled={
+                !prompt.trim()
+                || (agent.providerId === 'kiro-cli'
+                  && (!pane.connectionId || !pane.modelId || !availableModels.includes(pane.modelId)))
+              }
+            >
               <SendIcon width={14} height={14} />
               Kirim
             </Button>
@@ -351,6 +394,7 @@ export function Playground() {
     resetPane,
     setAgent,
     setConnection,
+    setModel,
   } = usePanes()
   const [searchParams, setSearchParams] = useSearchParams()
   const [kiroConnections, setKiroConnections] = useState<GatewayConnection[]>([])
@@ -379,14 +423,29 @@ export function Playground() {
   }, [])
 
   useEffect(() => {
-    if (kiroConnections.length !== 1) return
     for (const pane of panes) {
       const agent = agents.find((candidate) => candidate.id === pane.agentId)
-      if (agent?.providerId === 'kiro-cli' && !pane.connectionId) {
+      if (agent?.providerId !== 'kiro-cli') continue
+
+      if (!pane.connectionId && kiroConnections.length === 1) {
         setConnection(pane.id, kiroConnections[0].id)
+        continue
+      }
+
+      const connection = kiroConnections.find((candidate) => candidate.id === pane.connectionId)
+      if (!connection) continue
+      if (connection.models.length === 0) {
+        if (pane.modelId) setModel(pane.id, '')
+        continue
+      }
+      if (!pane.modelId || !connection.models.includes(pane.modelId)) {
+        setModel(
+          pane.id,
+          connection.models.includes('auto') ? 'auto' : connection.models[0],
+        )
       }
     }
-  }, [kiroConnections, panes, setConnection])
+  }, [kiroConnections, panes, setConnection, setModel])
 
   useEffect(() => {
     if (consumedAgent.current) return
@@ -450,6 +509,7 @@ export function Playground() {
                 onTitle={setTitle}
                 onAgent={setAgent}
                 onConnection={setConnection}
+                onModel={setModel}
               />
             )
           })}

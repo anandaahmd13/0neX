@@ -50,7 +50,7 @@ const emptyKiroForm: ConnectionInput = {
   kind: 'kiro-cli',
   apiKey: '',
   region: 'us-east-1',
-  models: ['auto'],
+  models: [],
   enabled: true,
 }
 
@@ -315,6 +315,7 @@ function ConnectionsPanel({
   const [kiroError, setKiroError] = useState('')
   const [saving, setSaving] = useState(false)
   const [testingId, setTestingId] = useState<string | null>(null)
+  const [busyModel, setBusyModel] = useState<string | null>(null)
 
   function openCreate() {
     setEditingId(null)
@@ -339,7 +340,7 @@ function ConnectionsPanel({
         kind: 'kiro-cli',
         apiKey: '',
         region: connection.region ?? 'us-east-1',
-        models: ['auto'],
+        models: connection.models,
         enabled: connection.enabled,
       })
       setKiroError('')
@@ -415,7 +416,6 @@ function ConnectionsPanel({
           name: kiroForm.name,
           kind: 'kiro-cli',
           region: kiroForm.region,
-          models: ['auto'],
           enabled: kiroForm.enabled,
         }
         if (kiroForm.apiKey?.trim()) updatePayload.apiKey = kiroForm.apiKey
@@ -459,7 +459,7 @@ function ConnectionsPanel({
       const result = await gatewayApi.testConnection(connection.id)
       push(
         connection.kind === 'kiro-cli'
-          ? 'AWS validated · stored bearer credential is ready'
+          ? `Discovery refreshed · ${result.models.length} model tersedia, ${result.activeModels?.length ?? connection.models.length} aktif`
           : `Connection sehat · ${result.models.length} model ditemukan`,
         'success',
       )
@@ -469,6 +469,46 @@ function ConnectionsPanel({
       push(error instanceof Error ? error.message : 'Connection test gagal', 'error')
     } finally {
       setTestingId(null)
+    }
+  }
+
+  async function setModelActive(connection: GatewayConnection, model: string, active: boolean) {
+    const key = `${connection.id}/${model}`
+    setBusyModel(key)
+    try {
+      const models = active
+        ? [...new Set([...connection.models, model])]
+        : connection.models.filter((candidate) => candidate !== model)
+      await gatewayApi.updateConnection(connection.id, { models })
+      push(active ? `Model ${model} diaktifkan` : `Model ${model} dinonaktifkan`, 'success')
+      await onChanged()
+    } catch (error) {
+      push(error instanceof Error ? error.message : 'Gagal memperbarui model', 'error')
+    } finally {
+      setBusyModel(null)
+    }
+  }
+
+  async function testModel(connection: GatewayConnection, model: string) {
+    const key = `${connection.id}/${model}`
+    setBusyModel(key)
+    try {
+      const result = await gatewayApi.testKiroModel(connection.id, model)
+      push(`Model ${model} berhasil · ${result.output.trim() || 'tanpa output'}`, 'success')
+    } catch (error) {
+      push(error instanceof Error ? error.message : `Test model ${model} gagal`, 'error')
+    } finally {
+      setBusyModel(null)
+    }
+  }
+
+  async function copyModelId(connection: GatewayConnection, model: string) {
+    const fullId = `${connection.id}/${model}`
+    try {
+      await navigator.clipboard.writeText(fullId)
+      push(`${fullId} disalin`, 'success')
+    } catch {
+      push('Browser tidak mengizinkan akses clipboard', 'error')
     }
   }
 
@@ -503,7 +543,7 @@ function ConnectionsPanel({
                   <code className="text-sm font-bold">{connection.id}</code>
                   <div className="mt-1 break-all text-xs text-ink/60">
                     {connection.kind === 'kiro-cli'
-                      ? 'Kiro/CodeWhisperer · bearer credential · model Auto'
+                      ? `Kiro/CodeWhisperer · bearer credential · ${connection.models.length} aktif dari ${connection.availableModels?.length ?? connection.models.length} tersedia`
                       : connection.baseUrl}
                   </div>
                 </div>
@@ -537,11 +577,60 @@ function ConnectionsPanel({
                     <div className="font-mono text-xs break-all">{connection.profileArn}</div>
                   </div>
                 )}
-                {connection.models.length > 0 && (
+                {connection.kind === 'kiro-cli' ? (
+                  <div className="rounded-lg border-2 border-dashed border-ink/30 bg-cream p-2">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold uppercase tracking-wider">Available Models</span>
+                      <span className="text-[10px] font-bold text-ink/50">
+                        {connection.models.length} active / {(connection.availableModels ?? connection.models).length} available
+                      </span>
+                    </div>
+                    <div className="max-h-64 space-y-2 overflow-y-auto">
+                      {(connection.availableModels ?? connection.models).map((model) => {
+                        const active = connection.models.includes(model)
+                        const key = `${connection.id}/${model}`
+                        return (
+                          <div key={model} className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-ink/20 bg-paper p-2">
+                            <div className="min-w-0">
+                              <code className="block truncate text-xs font-bold">{key}</code>
+                              <span className={cn('text-[10px] font-bold uppercase', active ? 'text-ok' : 'text-ink/40')}>
+                                {active ? 'Active' : 'Inactive'}
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                disabled={busyModel === key}
+                                onClick={() => void testModel(connection, model)}
+                              >
+                                {busyModel === key ? 'Testing...' : 'Test'}
+                              </Button>
+                              <Button variant="ghost" size="sm" onClick={() => void copyModelId(connection, model)}>
+                                Copy
+                              </Button>
+                              <Button
+                                variant={active ? 'danger' : 'secondary'}
+                                size="sm"
+                                disabled={busyModel === key}
+                                onClick={() => void setModelActive(connection, model, !active)}
+                              >
+                                {active ? '× Delete' : 'Add'}
+                              </Button>
+                            </div>
+                          </div>
+                        )
+                      })}
+                      {(connection.availableModels ?? connection.models).length === 0 && (
+                        <p className="py-3 text-center text-xs text-ink/50">Katalog kosong. Refresh discovery untuk mencoba lagi.</p>
+                      )}
+                    </div>
+                  </div>
+                ) : connection.models.length > 0 ? (
                   <div className="max-h-24 overflow-y-auto rounded-lg border-2 border-dashed border-ink/30 bg-cream p-2 font-mono text-xs">
                     {connection.models.map((model) => <div key={model}>{connection.id}/{model}</div>)}
                   </div>
-                )}
+                ) : null}
                 <div className="flex flex-wrap justify-end gap-2">
                   <Button variant="ghost" size="sm" disabled={testingId === connection.id} onClick={() => void test(connection)}>
                     {testingId === connection.id
@@ -611,7 +700,7 @@ function ConnectionsPanel({
               <h3 id="kiro-modal-title" className="font-brand text-lg font-bold">
                 {kiroEditingId ? 'Edit Kiro credential' : 'Connect Kiro'}
               </h3>
-              <p className="mt-1 text-xs text-ink/60">AWS-validated bearer credential · model Auto</p>
+              <p className="mt-1 text-xs text-ink/60">AWS-validated bearer credential · model discovered automatically</p>
             </div>
             <div className="space-y-4 p-4 sm:p-5">
               <div className="grid gap-4 sm:grid-cols-2">

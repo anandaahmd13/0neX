@@ -5,6 +5,7 @@ export interface Pane {
   sessionId: string
   agentId: string
   connectionId: string
+  modelId: string
   title: string
   transcript: string[]
   turns: number
@@ -29,6 +30,7 @@ function load(): Pane[] {
         ...pane,
         agentId: typeof pane.agentId === 'string' ? pane.agentId : DEFAULT_AGENT_ID,
         connectionId: typeof pane.connectionId === 'string' ? pane.connectionId : '',
+        modelId: typeof pane.modelId === 'string' ? pane.modelId : '',
         transcript: Array.isArray(pane.transcript) ? pane.transcript.slice(-MAX_LINES) : [],
         turns: typeof pane.turns === 'number' ? pane.turns : 0,
       })) as Pane[]
@@ -52,6 +54,7 @@ function makePane(agentId = DEFAULT_AGENT_ID): Pane {
     sessionId: crypto.randomUUID(),
     agentId,
     connectionId: '',
+    modelId: '',
     title: 'Sesi baru',
     transcript: [],
     turns: 0,
@@ -163,6 +166,7 @@ export function usePanes() {
                   ...pane,
                   agentId,
                   connectionId: '',
+                  modelId: '',
                   sessionId: crypto.randomUUID(),
                   transcript: [],
                   turns: 0,
@@ -184,6 +188,28 @@ export function usePanes() {
               ? {
                   ...pane,
                   connectionId,
+                  modelId: '',
+                  sessionId: crypto.randomUUID(),
+                  transcript: [],
+                  turns: 0,
+                  title: 'Sesi baru',
+                }
+              : pane,
+          ),
+        ),
+      ),
+    [persist],
+  )
+
+  const setModel = useCallback(
+    (id: string, modelId: string) =>
+      setPanes((previous) =>
+        persist(
+          previous.map((pane) =>
+            pane.id === id && pane.modelId !== modelId
+              ? {
+                  ...pane,
+                  modelId,
                   sessionId: crypto.randomUUID(),
                   transcript: [],
                   turns: 0,
@@ -207,5 +233,6 @@ export function usePanes() {
     resetPane,
     setAgent,
     setConnection,
+    setModel,
   }
 }

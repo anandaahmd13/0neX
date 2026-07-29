@@ -19,6 +19,8 @@ export interface GatewayConnection {
   email?: string
   validatedAt?: string
   models: string[]
+  /** Katalog terbaru dari discovery Kiro; models adalah subset yang aktif. */
+  availableModels?: string[]
   enabled: boolean
   hasApiKey: boolean
   createdAt: string
@@ -51,8 +53,20 @@ export interface KiroApiKeyImport {
 export interface ConnectionTestResult {
   ok: boolean
   models: string[]
+  activeModels?: string[]
   credentialType?: 'bearer'
   validatedAt?: string
+}
+
+export interface KiroModelTestResult {
+  ok: boolean
+  model: string
+  output: string
+  usage?: {
+    inputTokens: number
+    outputTokens: number
+    totalTokens: number
+  } | null
 }
 
 export type UsageRange = '24h' | '7d' | '30d'
@@ -166,5 +180,10 @@ export const gatewayApi = {
     request<ConnectionTestResult>(`/admin/connections/${encodeURIComponent(id)}/test`, {
       method: 'POST',
     }),
+  testKiroModel: (id: string, model: string) =>
+    request<KiroModelTestResult>(
+      `/admin/connections/${encodeURIComponent(id)}/models/${encodeURIComponent(model)}/test`,
+      { method: 'POST' },
+    ),
   getUsage: (range: UsageRange) => request<GatewayUsageData>(`/admin/usage?range=${range}`),
 }
