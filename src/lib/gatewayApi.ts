@@ -1,7 +1,7 @@
-const HTTP_BASE =
-  (import.meta.env.VITE_GATEWAY_HTTP_URL as string | undefined)?.replace(/\/+$/, '') ??
-  'http://localhost:8788'
-const ADMIN_TOKEN = (import.meta.env.VITE_GATEWAY_ADMIN_TOKEN as string | undefined) ?? ''
+// Dashboard berbicara ke gateway lewat same-origin (dev: Vite proxy meneruskan
+// /admin & /v1 ke gateway; prod: gateway menyajikan bundle di origin yang sama).
+// Autentikasi memakai cookie sesi httpOnly — TIDAK ADA token admin di bundle browser.
+const HTTP_BASE = (import.meta.env.VITE_GATEWAY_HTTP_URL as string | undefined)?.replace(/\/+$/, '') ?? ''
 
 export interface GatewayConnection {
   id: string
@@ -79,8 +79,9 @@ interface ApiEnvelope<T> {
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${HTTP_BASE}${path}`, {
     ...init,
+    // Kirim cookie sesi ke gateway.
+    credentials: 'include',
     headers: {
-      authorization: `Bearer ${ADMIN_TOKEN}`,
       ...(init.body ? { 'content-type': 'application/json' } : {}),
       ...init.headers,
     },
@@ -98,9 +99,16 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return payload.data
 }
 
-export const gatewayHttpBase = HTTP_BASE
+export const gatewayHttpBase = HTTP_BASE || window.location.origin
 
 export const gatewayApi = {
+  login: (password: string) =>
+    request<{ ok: boolean }>('/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    }),
+  logout: () => request<{ ok: boolean }>('/admin/logout', { method: 'POST' }),
+  session: () => request<{ authenticated: boolean }>('/admin/session'),
   listConnections: () => request<GatewayConnection[]>('/admin/connections'),
   createConnection: (input: ConnectionInput) =>
     request<GatewayConnection>('/admin/connections', {
@@ -120,6 +128,5 @@ export const gatewayApi = {
     request<ConnectionTestResult>(`/admin/connections/${encodeURIComponent(id)}/test`, {
       method: 'POST',
     }),
-  getUsage: (range: UsageRange) =>
-    request<GatewayUsageData>(`/admin/usage?range=${range}`),
+  getUsage: (range: UsageRange) => request<GatewayUsageData>(`/admin/usage?range=${range}`),
 }

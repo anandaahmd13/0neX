@@ -50,6 +50,75 @@ test('gateway model parser preserves nested upstream model IDs', () => {
   assert.throws(() => parseGatewayModel('missing-prefix'), /format/)
 })
 
+test('gateway refuses to start without a valid master key', () => {
+  assert.throws(
+    () => createGatewayServer({ port: 0, masterKey: 'short', apiKey: API_KEY, adminToken: ADMIN_TOKEN }),
+    /GATEWAY_MASTER_KEY/,
+  )
+})
+
+test('admin surface rejects requests without an allowed Origin and supports session login', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), '0nex-gateway-auth-test-'))
+  const gateway = createGatewayServer({
+    host: '127.0.0.1',
+    port: 0,
+    dataDir,
+    wsToken: 'gateway-ws-test',
+    apiKey: API_KEY,
+    adminToken: ADMIN_TOKEN,
+    masterKey: MASTER_KEY,
+    dashboardPassword: 'dashboard-secret',
+    allowedOrigins: [ORIGIN],
+    allowInsecureLocalhost: true,
+  })
+  const address = await gateway.listen()
+  t.after(() => gateway.close())
+  const baseUrl = `http://127.0.0.1:${address.port}`
+
+  // Tanpa Origin (curl/SDK) admin ditolak walau bawa admin token.
+  const noOrigin = await fetch(`${baseUrl}/admin/connections`, {
+    headers: { authorization: ['Bea', 'rer '].join('') + ADMIN_TOKEN },
+  })
+  assert.equal(noOrigin.status, 403)
+
+  // Dengan Origin diizinkan + admin token → lolos (jalur skrip/CI).
+  const withToken = await jsonRequest(`${baseUrl}/admin/connections`, ADMIN_TOKEN)
+  assert.equal(withToken.response.status, 200)
+
+  // Login salah password ditolak.
+  const badLogin = await fetch(`${baseUrl}/admin/login`, {
+    method: 'POST',
+    headers: { origin: ORIGIN, 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'salah' }),
+  })
+  assert.equal(badLogin.status, 401)
+
+  // Login benar → set cookie sesi httpOnly.
+  const login = await fetch(`${baseUrl}/admin/login`, {
+    method: 'POST',
+    headers: { origin: ORIGIN, 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'dashboard-secret' }),
+  })
+  assert.equal(login.status, 200)
+  const setCookie = login.headers.get('set-cookie') ?? ''
+  assert.match(setCookie, /gw_session=/)
+  assert.match(setCookie, /HttpOnly/)
+  assert.match(setCookie, /SameSite=Strict/)
+  const cookie = setCookie.split(';')[0]
+
+  // Cookie sesi bisa dipakai akses admin tanpa bearer token.
+  const viaCookie = await fetch(`${baseUrl}/admin/connections`, {
+    headers: { origin: ORIGIN, cookie },
+  })
+  assert.equal(viaCookie.status, 200)
+
+  // Cookie sampah ditolak.
+  const forged = await fetch(`${baseUrl}/admin/connections`, {
+    headers: { origin: ORIGIN, cookie: 'gw_session=payload.tandatanganpalsu' },
+  })
+  assert.equal(forged.status, 401)
+})
+
 test('OpenAI-compatible and admin routes work end-to-end', async (t) => {
   const upstreamRequests = []
   const upstream = createServer(async (request, response) => {

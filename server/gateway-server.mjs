@@ -14,6 +14,7 @@ import {
 import { getProvider, listProviders, registerProvider } from './gateway/provider-registry.mjs'
 import { claudeCliProvider } from './gateway/providers/claude-cli.mjs'
 import { UsageStore } from './gateway/usage-store.mjs'
+import { createSessionManager, parseCookies, serializeSessionCookie } from './gateway/session.mjs'
 
 try {
   registerProvider(claudeCliProvider)
@@ -129,6 +130,8 @@ function corsHeaders(origin, allowedOrigins) {
     'access-control-allow-origin': origin,
     'access-control-allow-headers': 'authorization, content-type',
     'access-control-allow-methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+    // Cookie sesi dashboard butuh credentials diizinkan; origin sudah di-allowlist ketat.
+    'access-control-allow-credentials': 'true',
     vary: 'Origin',
   }
 }
@@ -182,16 +185,40 @@ export function createGatewayServer(options = {}) {
     upstreamTimeoutMs: Number(env.GATEWAY_UPSTREAM_TIMEOUT_MS ?? 120_000),
   }
   const dataDir = resolve(options.dataDir ?? env.GATEWAY_DATA_DIR ?? '.data/gateway')
+  const masterKey = options.masterKey ?? env.GATEWAY_MASTER_KEY
+
+  // Fail fast: master key wajib ada sebelum server melayani request apa pun.
+  // Tanpa ini, gateway boot mulus tapi baru meledak saat menulis connection —
+  // kelihatan sehat padahal separuh mati.
+  if (typeof masterKey !== 'string' || masterKey.length < 16) {
+    throw new Error('GATEWAY_MASTER_KEY wajib diisi minimal 16 karakter sebelum gateway bisa start')
+  }
+
   const connectionStore = options.connectionStore ?? new ConnectionStore({
     dataDir,
-    masterKey: options.masterKey ?? env.GATEWAY_MASTER_KEY,
+    masterKey,
     allowInsecureLocalhost: options.allowInsecureLocalhost ?? env.NODE_ENV !== 'production',
   })
   const usageStore = options.usageStore ?? new UsageStore({ dataDir })
   const fetchImpl = options.fetchImpl ?? fetch
 
+  // Sesi dashboard: cookie httpOnly bertanda tangan HMAC. Rahasianya diturunkan
+  // dari admin token + master key, jadi tidak perlu env var tambahan dan tetap
+  // stabil lintas restart selama kedua nilai itu tidak berubah.
+  const sessions = createSessionManager({ secret: `${adminToken}:${masterKey}` })
+  const dashboardPassword = options.dashboardPassword ?? env.GATEWAY_DASHBOARD_PASSWORD ?? adminToken
+
   function verifyOrigin(origin) {
     return !origin || allowedOrigins.has(origin)
+  }
+
+  // Admin surface menerima dua jalur auth:
+  //  - Bearer admin token  → skrip/CI (server-to-server, tidak lewat browser).
+  //  - Cookie sesi httpOnly → dashboard di browser, tanpa membocorkan token apa pun ke bundle.
+  function isAdminAuthorized(request) {
+    if (safeEqual(bearerToken(request), adminToken)) return true
+    const cookies = parseCookies(request.headers.cookie)
+    return sessions.verify(cookies[sessions.cookieName]) !== null
   }
 
   async function proxyChat(request, response, body, headers) {
@@ -338,8 +365,42 @@ export function createGatewayServer(options = {}) {
       }
 
       if (url.pathname.startsWith('/admin/')) {
-        if (!safeEqual(bearerToken(request), adminToken)) {
-          apiError(response, 401, 'Admin token tidak valid', 'invalid_admin_token', headers)
+        // Admin surface eksklusif browser: tolak request tanpa Origin (curl/SDK),
+        // karena allowlist origin hanya efektif kalau header-nya wajib ada di sini.
+        if (!origin || !allowedOrigins.has(origin)) {
+          apiError(response, 403, 'Admin API hanya menerima request dari origin dashboard yang diizinkan', 'origin_forbidden', headers)
+          return
+        }
+
+        // Login: tukar password dashboard dengan cookie sesi httpOnly.
+        if (request.method === 'POST' && url.pathname === '/admin/login') {
+          const loginBody = await readJson(request, limits.maxBodyBytes)
+          if (!safeEqual(loginBody?.password, dashboardPassword)) {
+            apiError(response, 401, 'Password dashboard salah', 'invalid_credentials', headers)
+            return
+          }
+          const token = sessions.issue('admin')
+          sendJson(response, 200, { data: { ok: true } }, {
+            ...headers,
+            'set-cookie': serializeSessionCookie(sessions.cookieName, token, { ttlMs: sessions.ttlMs }),
+          })
+          return
+        }
+        if (request.method === 'POST' && url.pathname === '/admin/logout') {
+          sendJson(response, 200, { data: { ok: true } }, {
+            ...headers,
+            'set-cookie': serializeSessionCookie(sessions.cookieName, '', { clear: true }),
+          })
+          return
+        }
+        if (request.method === 'GET' && url.pathname === '/admin/session') {
+          const cookies = parseCookies(request.headers.cookie)
+          sendJson(response, 200, { data: { authenticated: sessions.verify(cookies[sessions.cookieName]) !== null } }, headers)
+          return
+        }
+
+        if (!isAdminAuthorized(request)) {
+          apiError(response, 401, 'Sesi admin tidak valid', 'invalid_admin_token', headers)
           return
         }
         if (request.method === 'GET' && url.pathname === '/admin/connections') {

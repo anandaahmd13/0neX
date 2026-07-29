@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { Button } from '../components/ui/Button'
 import { LockIcon } from '../components/icons'
-import { useAuth, DEMO_CREDS } from '../lib/auth'
+import { useAuth } from '../lib/auth'
 
 interface LocationState {
   from?: { pathname: string }
@@ -31,12 +31,6 @@ export function Login() {
     } finally {
       setSubmitting(false)
     }
-  }
-
-  function fillDemo() {
-    setEmail(DEMO_CREDS.email)
-    setPassword(DEMO_CREDS.password)
-    setError(null)
   }
 
   return (
@@ -119,24 +113,14 @@ export function Login() {
             </Button>
           </form>
 
-          {/* Demo helper */}
-          <div className="mt-5 rounded-lg border-2 border-dashed border-ink/40 bg-sky-soft p-3 text-xs">
-            <div className="font-bold">Kredensial demo</div>
-            <div className="mt-1 font-mono text-ink/70">
-              {DEMO_CREDS.email} / {DEMO_CREDS.password}
-            </div>
-            <button
-              type="button"
-              onClick={fillDemo}
-              className="mt-2 rounded-md border-2 border-ink bg-paper px-2 py-1 text-xs font-semibold hover:bg-mustard"
-            >
-              Isi otomatis
-            </button>
+          <div className="mt-5 rounded-lg border-2 border-dashed border-ink/40 bg-sky-soft p-3 text-xs text-ink/70">
+            Password diverifikasi di server gateway (cookie sesi httpOnly). Default
+            memakai <span className="font-mono">GATEWAY_DASHBOARD_PASSWORD</span>.
           </div>
         </div>
 
         <p className="mt-4 text-center text-[11px] text-ink/40">
-          Demo auth — validasi client-side, bukan buat produksi.
+          Sesi divalidasi server — tidak ada token admin di browser.
         </p>
       </div>
     </div>

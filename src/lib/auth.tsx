@@ -6,18 +6,15 @@ import {
   useState,
 } from 'react'
 import type { ReactNode } from 'react'
+import { gatewayApi } from './gatewayApi'
 
 /*
-  ⚠️ DEMO AUTH — client-side only.
-  Ini BUKAN security beneran: kredensial dicek di browser dan "session"
-  cuma flag di localStorage. Nggak ada backend, token server, atau proteksi
-  data apa pun. Buat produksi, autentikasi HARUS divalidasi di server
-  (session cookie httpOnly / JWT yang diverifikasi backend). Ini murni
-  buat gating UI di demo.
+  Auth dashboard didukung server: login menukar password dengan cookie sesi
+  httpOnly yang diterbitkan gateway (HMAC, tidak bisa dibaca/ditempa dari JS).
+  Tidak ada token admin di bundle browser, dan status sesi diverifikasi ke server.
 */
 
 export interface User {
-  email: string
   name: string
 }
 
@@ -28,52 +25,39 @@ interface AuthCtx {
   logout: () => void
 }
 
-const STORAGE_KEY = '0nex.auth'
-
-// Kredensial demo — sengaja di-hardcode buat showcase, bukan rahasia.
-const DEMO_EMAIL = 'admin@0nex.dev'
-const DEMO_PASSWORD = 'orchestrate'
-
 const AuthContext = createContext<AuthCtx | null>(null)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [loading, setLoading] = useState(true)
 
-  // Restore session dari localStorage saat mount.
+  // Cek sesi ke server saat mount (cookie httpOnly tidak terbaca dari JS).
   useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(STORAGE_KEY)
-      if (raw) setUser(JSON.parse(raw) as User)
-    } catch {
-      // abaikan payload rusak
+    let active = true
+    gatewayApi
+      .session()
+      .then((result) => {
+        if (active && result.authenticated) setUser({ name: 'Admin' })
+      })
+      .catch(() => {
+        // gateway belum jalan / belum login — biarkan sebagai unauthenticated
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
     }
-    setLoading(false)
   }, [])
 
-  const login = useCallback(async (email: string, password: string) => {
-    // Simulasi latensi jaringan biar UX-nya kerasa nyata.
-    await new Promise((r) => setTimeout(r, 450))
-    const normalized = email.trim().toLowerCase()
-    if (normalized !== DEMO_EMAIL || password !== DEMO_PASSWORD) {
-      throw new Error('Email atau password salah')
-    }
-    const u: User = { email: normalized, name: 'Admin' }
-    setUser(u)
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(u))
-    } catch {
-      // abaikan
-    }
+  const login = useCallback(async (_email: string, password: string) => {
+    await gatewayApi.login(password)
+    setUser({ name: 'Admin' })
   }, [])
 
   const logout = useCallback(() => {
+    gatewayApi.logout().catch(() => {})
     setUser(null)
-    try {
-      window.localStorage.removeItem(STORAGE_KEY)
-    } catch {
-      // abaikan
-    }
   }, [])
 
   return (
@@ -89,4 +73,6 @@ export function useAuth(): AuthCtx {
   return ctx
 }
 
-export const DEMO_CREDS = { email: DEMO_EMAIL, password: DEMO_PASSWORD }
+// Password dashboard default = GATEWAY_DASHBOARD_PASSWORD (fallback: admin token).
+// Tidak ada kredensial rahasia yang di-hardcode di sini lagi.
+export const DEMO_CREDS = { email: 'admin@0nex.dev', password: '' }
