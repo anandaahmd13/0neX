@@ -193,6 +193,29 @@ test('headless API-key mode keeps prompt out of args and buffers stdout', async 
   assert.equal(JSON.stringify(entries).includes(secret), false)
 })
 
+test('validation and inference inject the selected AWS region only through child env', async () => {
+  const { runner, recordFile } = await setup()
+  const secret = 'ksk_regional_secret'
+
+  await runner.validateApiKey({
+    apiKey: secret,
+    region: 'eu-central-1',
+  })
+  await runHeadless(runner, {
+    prompt: 'regional inference',
+    auth: { type: 'api-key', secret, region: 'eu-central-1' },
+  })
+
+  const entries = await records(recordFile)
+  const spawns = entries.filter((entry) => entry.type === 'spawn')
+  assert.equal(spawns.length, 2)
+  for (const spawn of spawns) {
+    assert.equal(spawn.awsRegion, 'eu-central-1')
+    assert.equal(spawn.awsDefaultRegion, 'eu-central-1')
+    assert.equal(spawn.args.some((arg) => arg.includes('eu-central-1') || arg.includes(secret)), false)
+  }
+})
+
 test('validateApiKey reaches headless AWS flow and rejects invalid bearer credentials', async () => {
   const valid = await setup()
   assert.deepEqual(

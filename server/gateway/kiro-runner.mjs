@@ -10,6 +10,8 @@ const DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 const CLIENT_INFO = { name: '0nex-gateway', title: '0neX Gateway', version: '1.0.0' }
 const AUTH_REJECTION_PATTERN = /(?:access\s*denied|unauthori[sz]ed|forbidden|auth(?:entication)?\s+failed|invalid|expired|revoked).{0,80}(?:api[_ -]?key|bearer|credential|token)|(?:api[_ -]?key|bearer|credential|token).{0,80}(?:access\s*denied|unauthori[sz]ed|forbidden|auth(?:entication)?\s+failed|invalid|expired|revoked)/i
 const VALIDATION_PROMPT = 'Reply with OK only. Do not use tools.'
+const DEFAULT_KIRO_REGION = 'us-east-1'
+const KIRO_REGIONS = new Set([DEFAULT_KIRO_REGION, 'eu-central-1'])
 
 export class KiroRunnerError extends Error {
   constructor(message, { code = 'KIRO_RUNNER_ERROR', cause } = {}) {
@@ -36,6 +38,18 @@ function authType(auth) {
 
 function authSecret(auth) {
   return auth?.secret ?? auth?.apiKey
+}
+
+function authRegion(auth) {
+  const region = typeof auth?.region === 'string' && auth.region.trim()
+    ? auth.region.trim()
+    : DEFAULT_KIRO_REGION
+  if (!KIRO_REGIONS.has(region)) {
+    throw new KiroRunnerError('Kiro region harus us-east-1 atau eu-central-1.', {
+      code: 'KIRO_INVALID_REGION',
+    })
+  }
+  return region
 }
 
 function sanitizeText(value, secrets = []) {
@@ -173,6 +187,9 @@ export function createKiroRunner(options = {}) {
     const type = authType(auth)
     const env = { ...inheritedEnv }
     delete env.KIRO_CLI_COMMAND
+    const region = authRegion(auth)
+    env.AWS_REGION = region
+    env.AWS_DEFAULT_REGION = region
 
     if (type === 'account-session') {
       // Make the requested auth context deterministic if the gateway itself
@@ -317,7 +334,7 @@ export function createKiroRunner(options = {}) {
     return parseKiroModelList(parseJsonOutput(stdout, 'model listing'))
   }
 
-  async function validateApiKey({ apiKey, cwd } = {}) {
+  async function validateApiKey({ apiKey, region = DEFAULT_KIRO_REGION, cwd } = {}) {
     const secret = typeof apiKey === 'string' ? apiKey.trim() : ''
     if (!secret) {
       throw new KiroRunnerError('Kiro API key wajib diisi.', {
@@ -327,7 +344,7 @@ export function createKiroRunner(options = {}) {
 
     const controller = startHeadless({
       prompt: VALIDATION_PROMPT,
-      auth: { type: 'api-key', secret },
+      auth: { type: 'api-key', secret, region },
       cwd,
     })
     const result = await controller.done
@@ -571,7 +588,7 @@ export function createKiroRunner(options = {}) {
       closeProcess()
     }
 
-    const finishError = (error) => {
+    const finishError = (error, { deferClose = false } = {}) => {
       if (terminal) return
       terminal = true
       stopped = true
@@ -585,18 +602,37 @@ export function createKiroRunner(options = {}) {
         sanitizeText(rawError.message, [authSecret(request?.auth)]) || 'Kiro runner gagal.',
         { code: rawError.code, cause: rawError },
       )
+      const payload = {
+        sessionId: activeSessionId,
+        reason: timedOut ? 'timeout' : 'failed',
+        error: safeError,
+      }
       onError(safeError.message, safeError)
-      resolveDone({ sessionId: activeSessionId, reason: timedOut ? 'timeout' : 'failed', error: safeError })
-      closeProcess()
+      if (deferClose) {
+        // A cancellation write is asynchronous. Do not report the run as fully
+        // settled until the child has had one bounded grace window to consume
+        // session/cancel; otherwise callers can observe completion before the
+        // cancellation reached the CLI.
+        const cancellationGraceMs = Math.max(killGraceMs, 50)
+        killTimer = setTimeout(() => {
+          resolveDone(payload)
+          closeProcess()
+        }, cancellationGraceMs)
+      } else {
+        resolveDone(payload)
+        closeProcess()
+      }
     }
 
     const cancelForUnsupportedTool = () => {
       if (terminal) return
-      transport?.notify('session/cancel', { sessionId: activeSessionId })
+      const cancellationSent = Boolean(
+        transport?.notify('session/cancel', { sessionId: activeSessionId }),
+      )
       finishError(new KiroRunnerError(
         'Kiro meminta eksekusi tool, tetapi runner ini berjalan dalam mode inference-only.',
         { code: 'KIRO_TOOLS_UNSUPPORTED' },
-      ))
+      ), { deferClose: cancellationSent })
     }
 
     const handleNotification = (message) => {

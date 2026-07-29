@@ -8,6 +8,9 @@ const ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/
 const MODEL_PATTERN = /^[^\s/][^\s]{0,199}$/
 const CONNECTION_KINDS = new Set(['openai-http', 'kiro-cli'])
 const KIRO_AUTH_MODES = new Set(['account-session', 'api-key'])
+export const DEFAULT_KIRO_REGION = 'us-east-1'
+export const KIRO_REGIONS = Object.freeze([DEFAULT_KIRO_REGION, 'eu-central-1'])
+const KIRO_REGION_SET = new Set(KIRO_REGIONS)
 
 function cleanText(value, label, maxLength = 200) {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} wajib diisi`)
@@ -40,6 +43,16 @@ function normalizeAuthMode(value) {
     throw new Error('authMode Kiro harus account-session atau api-key')
   }
   return authMode
+}
+
+export function normalizeKiroRegion(value) {
+  const region = value === undefined || value === null || value === ''
+    ? DEFAULT_KIRO_REGION
+    : cleanText(value, 'Kiro region', 50)
+  if (!KIRO_REGION_SET.has(region)) {
+    throw new Error(`Kiro region harus ${KIRO_REGIONS.join(' atau ')}`)
+  }
+  return region
 }
 
 export function normalizeBaseUrl(value, { allowInsecureLocalhost = false } = {}) {
@@ -90,7 +103,12 @@ export function validateConnectionInput(input, options = {}) {
     if (authMode !== 'api-key') {
       throw new Error('Connection Kiro baru hanya mendukung authMode api-key')
     }
-    return { ...common, authMode, models: ['auto'] }
+    return {
+      ...common,
+      authMode,
+      region: normalizeKiroRegion(input?.region),
+      models: ['auto'],
+    }
   }
 
   return {
@@ -114,11 +132,12 @@ function normalizeStoredConnection(connection) {
       ...rest,
       kind,
       authMode,
+      region: normalizeKiroRegion(connection.region),
       models: ['auto'],
       ...(authMode === 'api-key' && encryptedApiKey ? { encryptedApiKey } : {}),
     }
   }
-  const { authMode: _authMode, ...rest } = connection
+  const { authMode: _authMode, region: _region, ...rest } = connection
   return { ...rest, kind }
 }
 

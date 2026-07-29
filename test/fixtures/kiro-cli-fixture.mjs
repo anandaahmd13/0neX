@@ -19,6 +19,8 @@ record('spawn', {
   home: process.env.HOME ?? null,
   userProfile: process.env.USERPROFILE ?? null,
   apiKeyPresent: Boolean(process.env.KIRO_API_KEY),
+  awsRegion: process.env.AWS_REGION ?? null,
+  awsDefaultRegion: process.env.AWS_DEFAULT_REGION ?? null,
   apiKeyHash: process.env.KIRO_API_KEY
     ? createHash('sha256').update(process.env.KIRO_API_KEY).digest('hex')
     : null,

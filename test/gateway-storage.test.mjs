@@ -204,12 +204,38 @@ test('Kiro connections require API keys, force Auto model, and redact secrets', 
     models: ['ignored-model'],
   })
   assert.equal(keyed.hasApiKey, true)
+  assert.equal(keyed.region, 'us-east-1')
   assert.deepEqual(keyed.models, ['auto'])
   assert.equal('apiKey' in keyed, false)
   assert.equal('encryptedApiKey' in keyed, false)
   assert.equal('baseUrl' in keyed, false)
   assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, secret)
   assert.equal((await readFile(join(dataDir, 'connections.json'), 'utf8')).includes(secret), false)
+
+  const regional = await store.create({
+    id: 'kiro-eu',
+    name: 'Kiro Europe',
+    kind: 'kiro-cli',
+    authMode: 'api-key',
+    apiKey: 'ksk_europe',
+    region: 'eu-central-1',
+    models: ['auto'],
+  })
+  assert.equal(regional.region, 'eu-central-1')
+  assert.equal((await store.getWithSecret('kiro-eu')).region, 'eu-central-1')
+
+  await assert.rejects(
+    store.create({
+      id: 'kiro-invalid-region',
+      name: 'Kiro Invalid Region',
+      kind: 'kiro-cli',
+      authMode: 'api-key',
+      apiKey: 'ksk_invalid_region',
+      region: 'ap-southeast-1',
+      models: ['auto'],
+    }),
+    /region.*us-east-1.*eu-central-1/i,
+  )
 
   const updated = await store.update('kiro-keyed', {
     name: 'Blank Preserves',
@@ -241,6 +267,30 @@ test('Kiro connections require API keys, force Auto model, and redact secrets', 
     }),
     /kind harus/,
   )
+})
+
+test('legacy Kiro records without region project and decrypt as us-east-1', async () => {
+  const dataDir = await temporaryDirectory()
+  const encryptedApiKey = encryptSecret('ksk_legacy_kiro', MASTER_KEY)
+  await writeFile(join(dataDir, 'connections.json'), `${JSON.stringify({
+    version: 2,
+    connections: [{
+      id: 'kiro-legacy',
+      name: 'Kiro Legacy',
+      kind: 'kiro-cli',
+      authMode: 'api-key',
+      models: ['auto'],
+      enabled: true,
+      encryptedApiKey,
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    }],
+  })}\n`, { mode: 0o600 })
+
+  const store = new ConnectionStore({ dataDir, masterKey: MASTER_KEY })
+  const [connection] = await store.list()
+  assert.equal(connection.region, 'us-east-1')
+  assert.equal((await store.getWithSecret('kiro-legacy')).region, 'us-east-1')
 })
 
 test('switching connection kinds only preserves compatible secrets', async () => {
