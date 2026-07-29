@@ -29,6 +29,23 @@ function normalizeModels(value) {
   return models
 }
 
+function normalizeKiroModels(models, availableModels) {
+  const legacyCatalog = availableModels === undefined
+  const active = normalizeModels(
+    Array.isArray(models) && (!legacyCatalog || models.length) ? models : ['auto'],
+  )
+  const available = normalizeModels(
+    Array.isArray(availableModels)
+      ? availableModels
+      : active.length ? active : ['auto'],
+  )
+  const unavailable = active.filter((model) => !available.includes(model))
+  if (unavailable.length) {
+    throw new Error(`Model Kiro tidak tersedia: ${unavailable.join(', ')}`)
+  }
+  return { models: active, availableModels: available }
+}
+
 function normalizeKind(value) {
   const kind = value ?? 'openai-http'
   if (!CONNECTION_KINDS.has(kind)) {
@@ -124,7 +141,7 @@ export function validateConnectionInput(input, options = {}) {
       ...common,
       authMode,
       region: normalizeKiroRegion(input?.region),
-      models: ['auto'],
+      models: normalizeModels(input?.models ?? ['auto']),
     }
   }
 
@@ -153,7 +170,7 @@ function normalizeStoredConnection(connection) {
       authMode,
       region: normalizeKiroRegion(connection.region),
       ...normalizeKiroIdentity(connection),
-      models: ['auto'],
+      ...normalizeKiroModels(connection.models, connection.availableModels),
       ...(authMode === 'api-key' && encryptedApiKey ? { encryptedApiKey } : {}),
     }
   }
@@ -162,6 +179,7 @@ function normalizeStoredConnection(connection) {
     region: _region,
     profileArn: _profileArn,
     email: _email,
+    availableModels: _availableModels,
     ...rest
   } = connection
   return { ...rest, kind }
@@ -257,7 +275,7 @@ export class ConnectionStore {
     }
   }
 
-  create(input, { validatedAt, identity } = {}) {
+  create(input, { validatedAt, identity, availableModels } = {}) {
     return this.mutate(() => {
       const normalized = validateConnectionInput(input, {
         allowInsecureLocalhost: this.allowInsecureLocalhost,
@@ -273,8 +291,12 @@ export class ConnectionStore {
           : 'API key wajib diisi')
       }
       const now = new Date().toISOString()
+      const kiroModels = normalized.kind === 'kiro-cli'
+        ? normalizeKiroModels(normalized.models, availableModels ?? normalized.models)
+        : {}
       const connection = {
         ...normalized,
+        ...kiroModels,
         ...(usesSecret(normalized) && apiKey
           ? { encryptedApiKey: encryptSecret(apiKey, this.masterKey) }
           : {}),
@@ -288,7 +310,7 @@ export class ConnectionStore {
     })
   }
 
-  update(id, input, { validatedAt, identity } = {}) {
+  update(id, input, { validatedAt, identity, availableModels } = {}) {
     return this.mutate(() => {
       const index = this.connections.findIndex((item) => item.id === id)
       if (index === -1) throw new Error(`Connection tidak ditemukan: ${id}`)
@@ -314,20 +336,40 @@ export class ConnectionStore {
         }
       }
 
+      let kiroModels = {}
+      if (normalized.kind === 'kiro-cli') {
+        const catalog = availableModels ?? current.availableModels ?? normalized.models
+        const active = availableModels !== undefined && input?.models === undefined
+          ? (current.kind === 'kiro-cli' ? current.models : catalog)
+            .filter((model) => catalog.includes(model))
+          : normalized.models
+        kiroModels = normalizeKiroModels(active, catalog)
+      }
+
+      const refreshedIdentity = normalized.kind === 'kiro-cli' && identity !== undefined
+        ? normalizeKiroIdentity(identity)
+        : null
       const connection = {
         ...current,
         ...normalized,
+        ...kiroModels,
         encryptedApiKey,
         ...(normalized.kind === 'kiro-cli' && validatedAt ? { validatedAt } : {}),
-        ...(normalized.kind === 'kiro-cli' ? normalizeKiroIdentity(identity) : {}),
+        ...(refreshedIdentity ?? {}),
         updatedAt: new Date().toISOString(),
       }
-      if (normalized.kind === 'kiro-cli') delete connection.baseUrl
-      else {
+      if (normalized.kind === 'kiro-cli') {
+        delete connection.baseUrl
+        if (refreshedIdentity) {
+          if (!refreshedIdentity.profileArn) delete connection.profileArn
+          if (!refreshedIdentity.email) delete connection.email
+        }
+      } else {
         delete connection.authMode
         delete connection.validatedAt
         delete connection.profileArn
         delete connection.email
+        delete connection.availableModels
       }
       if (!encryptedApiKey) delete connection.encryptedApiKey
       this.connections[index] = connection

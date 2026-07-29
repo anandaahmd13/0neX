@@ -68,11 +68,18 @@ export function createKiroCliProvider({
           })
         }
 
+        const model = request.model || 'auto'
+        if (!model || !connection.models.includes(model)) {
+          throw Object.assign(new Error(`Model Kiro tidak aktif: ${model || '(belum dipilih)'}`), {
+            code: 'KIRO_MODEL_NOT_ACTIVE',
+          })
+        }
+
         const result = await client.generate({
           apiKey: connection.apiKey,
           region: connection.region,
           profileArn: connection.profileArn,
-          model: 'auto',
+          model,
           conversationId: request.sessionId,
           systemPrompt: request.systemPrompt,
           messages: [{ role: 'user', text: request.prompt }],

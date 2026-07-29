@@ -11,6 +11,8 @@ import { DEFAULT_KIRO_REGION, normalizeKiroRegion } from './connection-store.mjs
  */
 
 const PROFILE_TARGET = 'AmazonCodeWhispererService.ListAvailableProfiles'
+const MODEL_TARGET = 'AmazonCodeWhispererService.ListAvailableModels'
+const MODEL_ID_PATTERN = /^[^\s/][^\s]{0,199}$/
 const MAX_ERROR_LENGTH = 300
 
 export class KiroBearerError extends Error {
@@ -83,6 +85,7 @@ export function createKiroBearerValidator({
           'content-type': 'application/x-amz-json-1.0',
           'x-amz-target': PROFILE_TARGET,
           authorization: `Bearer ${secret}`,
+          tokentype: 'API_KEY',
           accept: 'application/json',
         },
         body: JSON.stringify({ maxResults: 10 }),
@@ -118,6 +121,66 @@ export function createKiroBearerValidator({
     return Array.isArray(payload?.profiles) ? payload.profiles : []
   }
 
+  async function listModels({ secret, region, profileArn }) {
+    const endpoint = kiroProfileHost(region)
+    await assertHost(new URL(endpoint).hostname)
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    let response
+    try {
+      response = await fetchImpl(endpoint, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-amz-json-1.0',
+          'x-amz-target': MODEL_TARGET,
+          authorization: `Bearer ${secret}`,
+          tokentype: 'API_KEY',
+          accept: 'application/json',
+        },
+        body: JSON.stringify({
+          origin: 'AI_EDITOR',
+          ...(profileArn ? { profileArn } : {}),
+        }),
+        signal: controller.signal,
+      })
+    } catch (cause) {
+      const aborted = cause?.name === 'AbortError'
+      throw new KiroBearerError(
+        aborted
+          ? 'Discovery model Kiro melewati batas waktu.'
+          : `Gagal mengambil model Kiro: ${redact(cause?.message, secret)}`,
+        { code: aborted ? 'KIRO_BEARER_TIMEOUT' : 'KIRO_BEARER_UNREACHABLE', status: 504, cause },
+      )
+    } finally {
+      clearTimeout(timer)
+    }
+
+    if (!response.ok) {
+      const rejected = response.status === 401 || response.status === 403
+      throw new KiroBearerError(
+        rejected
+          ? 'Kiro API key ditolak saat mengambil model.'
+          : `CodeWhisperer gagal mengembalikan model (HTTP ${response.status}).`,
+        {
+          code: rejected ? 'KIRO_BEARER_REJECTED' : 'KIRO_BEARER_HTTP_ERROR',
+          status: rejected ? 401 : 502,
+        },
+      )
+    }
+
+    const payload = await response.json().catch(() => null)
+    if (!Array.isArray(payload?.models)) {
+      throw new KiroBearerError('CodeWhisperer mengembalikan katalog model yang tidak valid.', {
+        code: 'KIRO_BEARER_INVALID_RESPONSE',
+        status: 502,
+      })
+    }
+    return [...new Set(payload.models
+      .map((model) => model?.modelId ?? model?.id)
+      .filter((id) => typeof id === 'string' && MODEL_ID_PATTERN.test(id)))]
+  }
+
   async function validateApiKey({ apiKey, region } = {}) {
     const secret = typeof apiKey === 'string' ? apiKey.trim() : ''
     if (!secret) {
@@ -143,11 +206,17 @@ export function createKiroBearerValidator({
     // profile eksplisit dari ListAvailableProfiles. Dalam kasus itu profileArn
     // sengaja dibiarkan null agar runtime memakai profile default milik token.
     const profileArn = selectProfileArn(profiles, resolvedRegion)
+    const models = await listModels({
+      secret,
+      region: resolvedRegion,
+      profileArn,
+    })
 
     return {
       region: resolvedRegion,
       profileArn,
       email: extractEmailFromBearer(secret),
+      models,
       validatedAt: new Date().toISOString(),
     }
   }

@@ -543,10 +543,10 @@ export function createGatewayServer(options = {}) {
         'kiro_api_key_required',
       )
     }
-    if (upstreamModel !== 'auto') {
+    if (!connection.models.includes(upstreamModel)) {
       throw invalidKiroRequest(
-        'Kiro memakai model Auto; model lain tidak bisa dipilih lewat API key',
-        'kiro_model_unsupported',
+        `Model Kiro tidak aktif: ${upstreamModel}`,
+        'kiro_model_not_active',
       )
     }
     const { messages, systemPrompt } = parseKiroChatRequest(body, limits)
@@ -596,7 +596,7 @@ export function createGatewayServer(options = {}) {
         apiKey: connection.apiKey,
         region: connection.region,
         profileArn: connection.profileArn,
-        model: 'auto',
+        model: upstreamModel,
         messages,
         systemPrompt,
         signal: abortController.signal,
@@ -692,7 +692,19 @@ export function createGatewayServer(options = {}) {
 
     try {
       const connections = await connectionStore.list()
-      const { candidates } = resolveModelCandidates(body.model, { aliases, connections })
+      const { resolvedModel, candidates } = resolveModelCandidates(body.model, { aliases, connections })
+      const separator = resolvedModel.indexOf('/')
+      const explicitConnectionId = separator > 0 ? resolvedModel.slice(0, separator) : ''
+      const explicit = connections.find((connection) => connection.id === explicitConnectionId)
+      if (
+        explicit?.kind === 'kiro-cli'
+        && !explicit.models.includes(candidates[0].upstreamModel)
+      ) {
+        throw invalidKiroRequest(
+          `Model Kiro tidak aktif: ${candidates[0].upstreamModel}`,
+          'kiro_model_not_active',
+        )
+      }
 
       let lastError = null
       for (let i = 0; i < candidates.length; i += 1) {
@@ -700,8 +712,7 @@ export function createGatewayServer(options = {}) {
         const connection = await connectionStore.getWithSecret(candidate.connectionId)
         if (!connection || !connection.enabled) continue
         if (
-          connection.kind !== 'kiro-cli'
-          && connection.models.length
+          connection.models.length
           && !connection.models.includes(candidate.upstreamModel)
         ) continue
 
@@ -985,11 +996,12 @@ export function createGatewayServer(options = {}) {
               authMode: 'api-key',
               apiKey,
               region: identity.region,
-              models: ['auto'],
+              models: identity.models,
               enabled: input?.enabled !== false,
             }, {
               validatedAt: identity.validatedAt,
               identity: { profileArn: identity.profileArn, email: identity.email },
+              availableModels: identity.models,
             }),
           }, headers)
           return
@@ -1003,10 +1015,14 @@ export function createGatewayServer(options = {}) {
                 region: normalized.region,
               })
             : undefined
+          const createInput = identity
+            ? { ...input, models: identity.models }
+            : input
           sendJson(response, 201, {
-            data: await connectionStore.create(input, {
+            data: await connectionStore.create(createInput, {
               validatedAt: identity?.validatedAt,
               identity,
+              availableModels: identity?.models,
             }),
           }, headers)
           return
@@ -1034,12 +1050,53 @@ export function createGatewayServer(options = {}) {
             data: await connectionStore.update(connectionMatch[1], input, {
               validatedAt: identity?.validatedAt,
               identity,
+              availableModels: identity?.models,
             }),
           }, headers)
           return
         }
         if (connectionMatch && request.method === 'DELETE') {
           sendJson(response, 200, { data: await connectionStore.delete(connectionMatch[1]) }, headers)
+          return
+        }
+        const modelTestMatch = url.pathname.match(
+          /^\/admin\/connections\/([a-z0-9-]+)\/models\/([^/]+)\/test$/,
+        )
+        if (modelTestMatch && request.method === 'POST') {
+          const connection = await connectionStore.getWithSecret(modelTestMatch[1])
+          if (!connection) throw Object.assign(new Error('Connection tidak ditemukan'), { status: 404 })
+          if (connection.kind !== 'kiro-cli') {
+            throw Object.assign(new Error('Test model individual hanya tersedia untuk Kiro'), {
+              status: 400,
+              code: 'kiro_model_test_only',
+            })
+          }
+          const model = decodeURIComponent(modelTestMatch[2])
+          if (!connection.availableModels.includes(model)) {
+            throw Object.assign(new Error(`Model Kiro tidak tersedia: ${model}`), {
+              status: 404,
+              code: 'model_not_available',
+            })
+          }
+
+          const chunks = []
+          const result = await kiroHttpClient.generate({
+            apiKey: connection.apiKey,
+            region: connection.region,
+            profileArn: connection.profileArn,
+            model,
+            messages: [{ role: 'user', text: 'Reply with OK only.' }],
+            systemPrompt: 'Return exactly OK and nothing else.',
+            onChunk(text) { chunks.push(text) },
+          })
+          sendJson(response, 200, {
+            data: {
+              ok: true,
+              model: `${connection.id}/${model}`,
+              output: chunks.join(''),
+              usage: result.usage,
+            },
+          }, headers)
           return
         }
         const testMatch = url.pathname.match(/^\/admin\/connections\/([a-z0-9-]+)\/test$/)
@@ -1052,14 +1109,16 @@ export function createGatewayServer(options = {}) {
               apiKey: connection.apiKey,
               region: connection.region,
             })
-            await connectionStore.update(connection.id, {}, {
+            const refreshed = await connectionStore.update(connection.id, {}, {
               validatedAt: identity.validatedAt,
               identity,
+              availableModels: identity.models,
             })
             sendJson(response, 200, {
               data: {
                 ok: true,
-                models: ['auto'],
+                models: identity.models,
+                activeModels: refreshed.models,
                 credentialType: 'bearer',
                 validatedAt: identity.validatedAt,
               },
