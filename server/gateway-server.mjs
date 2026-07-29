@@ -19,6 +19,7 @@ import { createKiroCliProvider, kiroCliProvider } from './gateway/providers/kiro
 import { UsageStore } from './gateway/usage-store.mjs'
 import { createSessionManager, parseCookies, serializeSessionCookie } from './gateway/session.mjs'
 import { assertPublicHost } from './gateway/net-guard.mjs'
+import { createKiroBearerValidator } from './gateway/kiro-bearer.mjs'
 import { RateLimiter } from './gateway/rate-limiter.mjs'
 import { PricingTable } from './gateway/pricing.mjs'
 import { loadAliases } from './gateway/aliases.mjs'
@@ -312,6 +313,28 @@ function mapKiroError(error) {
   })
 }
 
+/**
+ * Petakan error validator bearer HTTPS ke status admin API. Pesan validator
+ * sudah teredaksi, jadi aman diteruskan; yang tidak dikenali dijadikan 502
+ * generik supaya detail upstream tidak bocor.
+ */
+function mapKiroBearerError(error) {
+  // Pesan ditulis di sini, bukan diambil dari error upstream. Teks upstream bisa
+  // memuat kembali API key yang dikirim, jadi tidak pernah dipantulkan ke client.
+  const known = {
+    KIRO_BEARER_KEY_REQUIRED: [400, 'kiro_api_key_required', 'Kiro API key wajib diisi'],
+    KIRO_BEARER_INVALID_REGION: [400, 'kiro_invalid_region', 'Region Kiro tidak didukung'],
+    KIRO_BEARER_REJECTED: [401, 'kiro_auth_failed', 'Kiro API key ditolak CodeWhisperer. Periksa key dan region-nya'],
+    KIRO_BEARER_NO_PROFILE: [422, 'kiro_no_profile', 'Kiro API key tidak punya profile CodeWhisperer yang bisa dipakai'],
+    KIRO_BEARER_TIMEOUT: [504, 'kiro_timeout', 'Validasi Kiro API key melewati batas waktu'],
+    KIRO_BEARER_UNREACHABLE: [504, 'kiro_unreachable', 'Gagal menghubungi CodeWhisperer'],
+    KIRO_BEARER_HTTP_ERROR: [502, 'kiro_failed', 'CodeWhisperer menolak permintaan validasi'],
+  }
+  const [status, code, message] = known[error?.code]
+    ?? [error?.status ?? 502, 'kiro_failed', 'Validasi Kiro API key gagal']
+  return Object.assign(new Error(message), { status, code, retryable: status >= 500 })
+}
+
 function sseData(response, payload) {
   response.write(`data: ${JSON.stringify(payload)}\n\n`)
 }
@@ -348,6 +371,10 @@ export function createGatewayServer(options = {}) {
   const dataDir = resolve(options.dataDir ?? env.GATEWAY_DATA_DIR ?? '.data/gateway')
   const masterKey = options.masterKey ?? env.GATEWAY_MASTER_KEY
   const kiroRunner = options.kiroRunner ?? createKiroRunner({ env, dataDir })
+  // Validasi bearer lewat HTTPS langsung ke CodeWhisperer. Jalur ini tidak
+  // butuh `kiro-cli` terpasang, jadi import API key tetap jalan di host yang
+  // hanya punya akses jaringan.
+  const kiroBearerValidator = options.kiroBearerValidator ?? createKiroBearerValidator()
   const providers = options.providers ?? [
     claudeCliProvider,
     createKiroCliProvider({ runner: kiroRunner, env }),
@@ -967,6 +994,50 @@ export function createGatewayServer(options = {}) {
         }
         if (request.method === 'GET' && url.pathname === '/admin/connections') {
           sendJson(response, 200, { data: await connectionStore.list() }, headers)
+          return
+        }
+        // Import bearer credential Kiro tanpa `kiro-cli`: validasi lewat HTTPS
+        // ke CodeWhisperer, lalu simpan connection kalau (dan hanya kalau)
+        // validasi lolos.
+        if (request.method === 'POST' && url.pathname === '/admin/connections/kiro/api-key') {
+          const input = await readJson(request, limits.maxBodyBytes)
+          const apiKey = typeof input?.apiKey === 'string' ? input.apiKey.trim() : ''
+          if (!apiKey) {
+            apiError(response, 400, 'Kiro API key wajib diisi', 'kiro_api_key_required', headers)
+            return
+          }
+
+          let identity
+          try {
+            identity = await kiroBearerValidator.validateApiKey({
+              apiKey,
+              region: input?.region,
+            })
+          } catch (error) {
+            throw mapKiroBearerError(error)
+          }
+
+          const id = typeof input?.id === 'string' && input.id.trim()
+            ? input.id.trim().toLowerCase()
+            : `kiro-${randomBytes(4).toString('hex')}`
+
+          sendJson(response, 201, {
+            data: await connectionStore.create({
+              id,
+              name: typeof input?.name === 'string' && input.name.trim()
+                ? input.name
+                : identity.email ?? 'Kiro API Key',
+              kind: 'kiro-cli',
+              authMode: 'api-key',
+              apiKey,
+              region: identity.region,
+              models: ['auto'],
+              enabled: input?.enabled !== false,
+            }, {
+              validatedAt: identity.validatedAt,
+              identity: { profileArn: identity.profileArn, email: identity.email },
+            }),
+          }, headers)
           return
         }
         if (request.method === 'POST' && url.pathname === '/admin/connections') {

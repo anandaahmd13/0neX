@@ -258,6 +258,38 @@ test('Kiro connections require API keys, force Auto model, and redact secrets', 
   assert.equal(keyedAgain.hasApiKey, true)
   assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, 'ksk_replacement')
 
+  // Identitas hasil validasi bearer (profile ARN + email) bukan secret, jadi
+  // boleh tersimpan apa adanya dan tampil di projection publik.
+  const identified = await store.update('kiro-keyed', { apiKey: 'ksk_identity_probe' }, {
+    validatedAt: '2026-07-29T00:00:00.000Z',
+    identity: {
+      profileArn: 'arn:aws:codewhisperer:us-east-1:111122223333:profile/AAAA',
+      email: 'owner@example.com',
+    },
+  })
+  assert.equal(identified.profileArn, 'arn:aws:codewhisperer:us-east-1:111122223333:profile/AAAA')
+  assert.equal(identified.email, 'owner@example.com')
+  assert.equal(identified.validatedAt, '2026-07-29T00:00:00.000Z')
+
+  // Update lain tidak boleh menghapus identitas yang sudah tervalidasi.
+  const renamed = await store.update('kiro-keyed', { name: 'Kiro Identity Kept' })
+  assert.equal(renamed.profileArn, 'arn:aws:codewhisperer:us-east-1:111122223333:profile/AAAA')
+  assert.equal(renamed.email, 'owner@example.com')
+
+  // Identitas milik kiro-cli saja; connection HTTP tidak boleh membawanya.
+  const httpConnection = await store.create({
+    id: 'http-no-identity',
+    name: 'HTTP No Identity',
+    kind: 'openai-http',
+    baseUrl: 'https://api.example.com/v1',
+    apiKey: 'sk-http-secret',
+    models: ['gpt-4o'],
+  }, {
+    identity: { profileArn: 'arn:aws:codewhisperer:us-east-1:1:profile/NOPE', email: 'x@y.z' },
+  })
+  assert.equal('profileArn' in httpConnection, false)
+  assert.equal('email' in httpConnection, false)
+
   await assert.rejects(
     store.create({
       id: 'wrong-kind',

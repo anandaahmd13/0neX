@@ -45,6 +45,23 @@ function normalizeAuthMode(value) {
   return authMode
 }
 
+/**
+ * Identitas hasil validasi bearer: profile ARN CodeWhisperer + email dari klaim
+ * JWT. Keduanya bukan secret, jadi boleh disimpan apa adanya dan dikirim ke
+ * browser. Nilai kosong/tidak valid dibuang, bukan dilempar sebagai error.
+ */
+function normalizeKiroIdentity(identity) {
+  if (!identity || typeof identity !== 'object') return {}
+  const result = {}
+  if (typeof identity.profileArn === 'string' && identity.profileArn.trim()) {
+    result.profileArn = cleanText(identity.profileArn, 'Profile ARN', 2048)
+  }
+  if (typeof identity.email === 'string' && identity.email.trim()) {
+    result.email = cleanText(identity.email, 'Email', 320)
+  }
+  return result
+}
+
 export function normalizeKiroRegion(value) {
   const region = value === undefined || value === null || value === ''
     ? DEFAULT_KIRO_REGION
@@ -123,6 +140,8 @@ function normalizeStoredConnection(connection) {
     const {
       baseUrl: _baseUrl,
       encryptedApiKey,
+      profileArn: _profileArn,
+      email: _email,
       ...rest
     } = connection
     const authMode = normalizeAuthMode(
@@ -133,11 +152,18 @@ function normalizeStoredConnection(connection) {
       kind,
       authMode,
       region: normalizeKiroRegion(connection.region),
+      ...normalizeKiroIdentity(connection),
       models: ['auto'],
       ...(authMode === 'api-key' && encryptedApiKey ? { encryptedApiKey } : {}),
     }
   }
-  const { authMode: _authMode, region: _region, ...rest } = connection
+  const {
+    authMode: _authMode,
+    region: _region,
+    profileArn: _profileArn,
+    email: _email,
+    ...rest
+  } = connection
   return { ...rest, kind }
 }
 
@@ -231,7 +257,7 @@ export class ConnectionStore {
     }
   }
 
-  create(input, { validatedAt } = {}) {
+  create(input, { validatedAt, identity } = {}) {
     return this.mutate(() => {
       const normalized = validateConnectionInput(input, {
         allowInsecureLocalhost: this.allowInsecureLocalhost,
@@ -253,6 +279,7 @@ export class ConnectionStore {
           ? { encryptedApiKey: encryptSecret(apiKey, this.masterKey) }
           : {}),
         ...(normalized.kind === 'kiro-cli' && validatedAt ? { validatedAt } : {}),
+        ...(normalized.kind === 'kiro-cli' ? normalizeKiroIdentity(identity) : {}),
         createdAt: now,
         updatedAt: now,
       }
@@ -261,7 +288,7 @@ export class ConnectionStore {
     })
   }
 
-  update(id, input, { validatedAt } = {}) {
+  update(id, input, { validatedAt, identity } = {}) {
     return this.mutate(() => {
       const index = this.connections.findIndex((item) => item.id === id)
       if (index === -1) throw new Error(`Connection tidak ditemukan: ${id}`)
@@ -292,12 +319,15 @@ export class ConnectionStore {
         ...normalized,
         encryptedApiKey,
         ...(normalized.kind === 'kiro-cli' && validatedAt ? { validatedAt } : {}),
+        ...(normalized.kind === 'kiro-cli' ? normalizeKiroIdentity(identity) : {}),
         updatedAt: new Date().toISOString(),
       }
       if (normalized.kind === 'kiro-cli') delete connection.baseUrl
       else {
         delete connection.authMode
         delete connection.validatedAt
+        delete connection.profileArn
+        delete connection.email
       }
       if (!encryptedApiKey) delete connection.encryptedApiKey
       this.connections[index] = connection
