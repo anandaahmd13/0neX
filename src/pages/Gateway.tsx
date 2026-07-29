@@ -309,6 +309,7 @@ function ConnectionsPanel({
   }
 
   function openEdit(connection: GatewayConnection, discoveredModels?: string[]) {
+    const models = connection.kind === 'kiro-cli' ? ['auto'] : (discoveredModels ?? connection.models)
     setEditingId(connection.id)
     setForm({
       id: connection.id,
@@ -317,10 +318,10 @@ function ConnectionsPanel({
       baseUrl: connection.baseUrl,
       authMode: connection.kind === 'kiro-cli' ? 'api-key' : connection.authMode,
       apiKey: '',
-      models: discoveredModels ?? connection.models,
+      models,
       enabled: connection.enabled,
     })
-    setModelsText(modelsToText(discoveredModels ?? connection.models))
+    setModelsText(modelsToText(models))
     setFormOpen(true)
   }
 
@@ -333,21 +334,22 @@ function ConnectionsPanel({
 
   function changeKind(kind: ConnectionInput['kind']) {
     setForm((current) => kind === 'kiro-cli'
-      ? { ...current, kind, baseUrl: undefined, authMode: 'api-key', apiKey: '' }
+      ? { ...current, kind, baseUrl: undefined, authMode: 'api-key', apiKey: '', models: ['auto'] }
       : {
           ...current,
           kind,
           baseUrl: current.baseUrl || 'https://api.openai.com/v1',
           authMode: undefined,
           apiKey: '',
+          models: [],
         })
-    setModelsText('')
+    setModelsText(kind === 'kiro-cli' ? 'auto' : '')
   }
 
   async function submit() {
     const payload: ConnectionInput = {
       ...form,
-      models: textToModels(modelsText),
+      models: form.kind === 'kiro-cli' ? ['auto'] : textToModels(modelsText),
       baseUrl: form.kind === 'openai-http' ? form.baseUrl : undefined,
       authMode: form.kind === 'kiro-cli' ? 'api-key' : undefined,
     }
@@ -390,7 +392,12 @@ function ConnectionsPanel({
     setTestingId(connection.id)
     try {
       const result = await gatewayApi.testConnection(connection.id)
-      push(`Connection sehat · ${result.models.length} model ditemukan`, 'success')
+      push(
+        connection.kind === 'kiro-cli'
+          ? 'Kiro API key valid · model Auto siap'
+          : `Connection sehat · ${result.models.length} model ditemukan`,
+        'success',
+      )
       if (result.models.length) openEdit(connection, result.models)
     } catch (error) {
       push(error instanceof Error ? error.message : 'Connection test gagal', 'error')
@@ -427,7 +434,7 @@ function ConnectionsPanel({
                   <code className="text-sm font-bold">{connection.id}</code>
                   <div className="mt-1 break-all text-xs text-ink/60">
                     {connection.kind === 'kiro-cli'
-                      ? `Kiro CLI · ${connection.authMode === 'api-key' ? 'API key' : 'akun lokal (legacy)'}`
+                      ? 'Kiro CLI Headless · API key · model Auto'
                       : connection.baseUrl}
                   </div>
                 </div>
@@ -443,7 +450,9 @@ function ConnectionsPanel({
                 )}
                 <div className="flex flex-wrap justify-end gap-2">
                   <Button variant="ghost" size="sm" disabled={testingId === connection.id} onClick={() => void test(connection)}>
-                    {testingId === connection.id ? 'Testing...' : 'Test & discover'}
+                    {testingId === connection.id
+                      ? 'Testing...'
+                      : connection.kind === 'kiro-cli' ? 'Test API key' : 'Test & discover'}
                   </Button>
                   <Button variant="secondary" size="sm" onClick={() => openEdit(connection)}>Edit</Button>
                   <Button variant="danger" size="sm" onClick={() => void remove(connection)}><TrashIcon width={14} height={14} />Hapus</Button>
@@ -468,7 +477,7 @@ function ConnectionsPanel({
                   onChange={(event) => changeKind(event.target.value as ConnectionInput['kind'])}
                 >
                   <option value="openai-http">OpenAI-compatible HTTP</option>
-                  <option value="kiro-cli">Kiro CLI lokal</option>
+                  <option value="kiro-cli">Kiro CLI Headless (host gateway)</option>
                 </select>
               </label>
               {form.kind === 'kiro-cli' && (
@@ -498,10 +507,18 @@ function ConnectionsPanel({
               <span>{form.kind === 'kiro-cli' ? 'Kiro API key' : 'API key'} {editingId && <span className="font-normal text-ink/50">— kosongkan untuk mempertahankan key lama</span>}</span>
               <input type="password" autoComplete="new-password" className={fieldClass} value={form.apiKey ?? ''} placeholder={form.kind === 'kiro-cli' ? 'ksk_...' : 'sk-...'} onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} />
             </label>
-            <label className="block space-y-1 text-xs font-bold">
-              <span>Model upstream — satu per baris</span>
-              <textarea className={fieldClass} rows={5} value={modelsText} placeholder={form.kind === 'kiro-cli' ? 'auto' : 'gpt-4.1\ngpt-4.1-mini'} onChange={(event) => setModelsText(event.target.value)} />
-            </label>
+            {form.kind === 'kiro-cli' ? (
+              <div className="space-y-1 text-xs font-bold">
+                <span>Model</span>
+                <div className={`${fieldClass} bg-sky-soft font-mono`}>auto</div>
+                <p className="font-normal text-ink/55">Kiro headless memilih model Auto; model lain tidak bisa dipilih lewat API key.</p>
+              </div>
+            ) : (
+              <label className="block space-y-1 text-xs font-bold">
+                <span>Model upstream — satu per baris</span>
+                <textarea className={fieldClass} rows={5} value={modelsText} placeholder="gpt-4.1\ngpt-4.1-mini" onChange={(event) => setModelsText(event.target.value)} />
+              </label>
+            )}
             <label className="flex items-center gap-2 text-sm font-bold">
               <input type="checkbox" checked={form.enabled} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />
               Connection aktif

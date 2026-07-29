@@ -23,45 +23,26 @@ function mapCompletion(result = {}) {
   }
 }
 
-function toolStatus(update) {
-  const title = typeof update?.title === 'string' && update.title.trim()
-    ? update.title.trim()
-    : 'Tool Kiro'
-  const status = typeof update?.status === 'string' && update.status.trim()
-    ? ` (${update.status.trim()})`
-    : ''
-  return `${title}${status} ditolak: Playground belum punya UI izin tool; tidak ada tool yang di-auto-approve.`
-}
-
 export function createKiroCliProvider({ runner = kiroRunner, env = process.env } = {}) {
   return {
     id: 'kiro-cli',
-    label: 'Kiro CLI',
+    label: 'Kiro CLI Headless',
     capabilities: {
-      streaming: true,
-      sessions: true,
+      streaming: false,
+      sessions: false,
       cancellation: true,
       tools: false,
     },
 
     start(request, handlers) {
       let terminal = false
-      const controller = runner.start({
-        ...request,
+      const controller = runner.startHeadless({
+        prompt: request.prompt,
+        systemPrompt: request.systemPrompt,
         auth: configuredAuth(env),
-        // Tanpa UI permission interaktif, semua policy tetap deny-by-default.
-        // `none` eksplisit inference-only; read-only/standard tidak boleh berubah
-        // menjadi trust-all atau approval diam-diam.
-        allowTools: false,
       }, {
-        onSession(sessionId) {
-          if (!terminal) handlers.onSession?.(sessionId)
-        },
         onChunk(text) {
           if (!terminal) handlers.onChunk(text)
-        },
-        onToolCall(update) {
-          if (!terminal) handlers.onChunk(toolStatus(update), 'error')
         },
         onError(message, error) {
           if (terminal) return

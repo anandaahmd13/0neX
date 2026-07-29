@@ -86,7 +86,11 @@ export function validateConnectionInput(input, options = {}) {
   }
 
   if (kind === 'kiro-cli') {
-    return { ...common, authMode: normalizeAuthMode(input?.authMode) }
+    const authMode = normalizeAuthMode(input?.authMode)
+    if (authMode !== 'api-key') {
+      throw new Error('Connection Kiro baru hanya mendukung authMode api-key')
+    }
+    return { ...common, authMode, models: ['auto'] }
   }
 
   return {
@@ -110,6 +114,7 @@ function normalizeStoredConnection(connection) {
       ...rest,
       kind,
       authMode,
+      models: ['auto'],
       ...(authMode === 'api-key' && encryptedApiKey ? { encryptedApiKey } : {}),
     }
   }

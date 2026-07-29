@@ -15,6 +15,7 @@ function record(type, data = {}) {
 record('spawn', {
   pid: process.pid,
   args,
+  cwd: process.cwd(),
   home: process.env.HOME ?? null,
   userProfile: process.env.USERPROFILE ?? null,
   apiKeyPresent: Boolean(process.env.KIRO_API_KEY),
@@ -40,6 +41,8 @@ else if (args[0] === 'whoami') {
       user: 'fixture-user',
     })}\n`)
   }
+} else if (args[0] === 'chat' && args.includes('--no-interactive')) {
+  runHeadless()
 } else if (args[0] === 'chat' && args.includes('--list-models')) {
   if (mode === 'malformed-command') process.stdout.write('not-json\n')
   else if (mode === 'oversized-command' || mode === 'oversized-command-hang') {
@@ -64,6 +67,33 @@ else if (args[0] === 'whoami') {
 } else {
   process.stderr.write(`unsupported fixture args: ${JSON.stringify(args)}\n`)
   process.exitCode = 2
+}
+
+function runHeadless() {
+  let input = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', (chunk) => { input += chunk })
+  process.stdin.on('end', () => {
+    record('headless-input', { input })
+    if (mode === 'cancel' || mode === 'headless-ignore-term') {
+      process.on('SIGTERM', () => {
+        record('signal', { signal: 'SIGTERM' })
+        if (mode === 'cancel') process.exit(0)
+      })
+      hang()
+      return
+    }
+    if (mode === 'headless-fail') {
+      process.stderr.write(`headless auth failed for KIRO_API_KEY=${process.env.KIRO_API_KEY ?? 'missing'}\n`)
+      process.exitCode = 7
+      return
+    }
+    if (mode === 'headless-oversized') {
+      process.stdout.write('x'.repeat(5_000))
+      return
+    }
+    process.stdout.write('hello from fixture\n')
+  })
 }
 
 function send(message) {

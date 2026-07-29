@@ -119,11 +119,11 @@ export const agents: Agent[] = [
   {
     id: 'agt_kiro',
     name: 'Kiro Assistant',
-    role: 'Local CLI assistant',
+    role: 'Headless gateway assistant',
     model: '',
     status: 'active',
     description:
-      'Asisten lokal lewat Kiro CLI dengan model Auto dan izin tool yang selalu ditolak sampai UI permission tersedia.',
+      'Asisten stateless lewat Kiro CLI Headless di host gateway dengan model Auto dan output buffered.',
     providerId: 'kiro-cli',
     systemPrompt: 'Berikan jawaban yang ringkas, akurat, dan dapat ditindaklanjuti.',
     toolPolicy: 'none',

@@ -38,13 +38,13 @@ pnpm gateway                 # terminal 1: HTTP + WS di 127.0.0.1:8788
 pnpm dev                     # terminal 2: UI di localhost:5199
 ```
 
-Buka halaman **AI Gateway → Connections**, pilih **OpenAI-compatible HTTP** atau **Kiro CLI lokal**, lalu jalankan **Test & discover**. Connection Kiro meminta API key Kiro dan menyimpannya terenkripsi di server.
+Buka halaman **AI Gateway → Connections**, pilih **OpenAI-compatible HTTP** atau **Kiro CLI Headless**, lalu jalankan **Test API key**. Connection Kiro meminta API key Kiro dan menyimpannya terenkripsi di host gateway.
 
-Claude Code CLI dan Kiro CLI hanya diperlukan untuk provider Playground masing-masing. Perintah `claude`/`kiro-cli` harus tersedia di `PATH`. Provider Kiro memakai `KIRO_API_KEY` dari `.env`; key diteruskan hanya ke child process dalam HOME terisolasi dan tidak masuk bundle browser. Script lama `pnpm claude-bridge` tetap berfungsi sebagai alias kompatibilitas.
+Untuk Kiro, binary `kiro-cli` hanya perlu terpasang di mesin/server yang menjalankan gateway—bukan di setiap device yang memakai gateway. Host menjalankan `kiro-cli chat --no-interactive` dengan API key dalam `HOME` terisolasi. Device lain cukup memakai URL `/v1` dan `GATEWAY_API_KEY` milik gateway. Provider Kiro Playground memakai `KIRO_API_KEY` dari `.env`; Connection Kiro memakai key terenkripsi milik connection.
 
 ### Batas kompatibilitas Kiro Connection
 
-Facade OpenAI untuk Kiro mendukung chat teks, satu choice, non-streaming/SSE, model discovery, dan `/v1/models`. Request tool calling, multimodal, audio, `response_format`, legacy completions, dan embeddings ditolak eksplisit karena tidak punya kontrak ACP yang ekuivalen. Traffic `/v1` selalu inference-only: MCP kosong dan permission tool ditolak.
+Facade OpenAI untuk Kiro mendukung chat teks, satu choice, model `auto`, non-streaming, dan format SSE buffered. Kiro headless bersifat stateless: tidak ada resume session, pemilihan model arbitrary, atau token usage. Request tool calling, multimodal, audio, `response_format`, legacy completions, dan embeddings ditolak eksplisit. `stream: true` tetap menghasilkan SSE yang kompatibel, tetapi isi jawaban baru dikirim setelah proses headless selesai—bukan token streaming realtime.
 
 ## Memakai endpoint Gateway
 
@@ -96,11 +96,11 @@ Gunakan `stream: true` seperti API OpenAI biasa untuk response SSE. Token hanya 
 
 ```text
 OpenAI SDK / app ── HTTPS ──> /v1/* ──> connection router ──> HTTP upstream
-                                  │                  └──> Kiro CLI (ACP)
+                                  │                  └──> Kiro CLI Headless
                                   └──> usage metadata JSONL
 
 Private dashboard ───────────> /admin/* ──> encrypted connection store
-CLI Playground ── WebSocket ─> provider registry ──> Claude Code / Kiro CLI
+CLI Playground ── WebSocket ─> provider registry ──> Claude Code / Kiro Headless
 ```
 
 - [`server/gateway-server.mjs`](server/gateway-server.mjs) melayani HTTP dan WebSocket pada host/port yang sama, termasuk auth, CORS, body/output limits, timeout, dan routing.

@@ -157,30 +157,21 @@ test('connection store migrates legacy records and defaults new input to openai-
   assert.equal('authMode' in created, false)
 })
 
-test('Kiro connection modes validate, encrypt, redact, and clear incompatible secrets', async () => {
+test('Kiro connections require API keys, force Auto model, and redact secrets', async () => {
   const dataDir = await temporaryDirectory()
   const store = new ConnectionStore({ dataDir, masterKey: MASTER_KEY })
 
-  const account = await store.create({
-    id: 'kiro-account',
-    name: 'Kiro Account',
-    kind: 'kiro-cli',
-    authMode: 'account-session',
-    apiKey: 'must-not-be-stored-for-account-mode',
-    models: ['kiro-auto'],
-  })
-  assert.deepEqual({
-    kind: account.kind,
-    authMode: account.authMode,
-    hasApiKey: account.hasApiKey,
-    hasBaseUrl: 'baseUrl' in account,
-  }, {
-    kind: 'kiro-cli',
-    authMode: 'account-session',
-    hasApiKey: false,
-    hasBaseUrl: false,
-  })
-  assert.equal((await store.getWithSecret('kiro-account')).apiKey, undefined)
+  await assert.rejects(
+    store.create({
+      id: 'kiro-account',
+      name: 'Kiro Account',
+      kind: 'kiro-cli',
+      authMode: 'account-session',
+      apiKey: 'must-not-be-stored-for-account-mode',
+      models: ['kiro-auto'],
+    }),
+    /hanya mendukung authMode api-key/,
+  )
 
   await assert.rejects(
     store.create({
@@ -210,25 +201,29 @@ test('Kiro connection modes validate, encrypt, redact, and clear incompatible se
     kind: 'kiro-cli',
     authMode: 'api-key',
     apiKey: secret,
-    models: ['vendor/model:v1@2026'],
+    models: ['ignored-model'],
   })
   assert.equal(keyed.hasApiKey, true)
+  assert.deepEqual(keyed.models, ['auto'])
   assert.equal('apiKey' in keyed, false)
   assert.equal('encryptedApiKey' in keyed, false)
   assert.equal('baseUrl' in keyed, false)
   assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, secret)
   assert.equal((await readFile(join(dataDir, 'connections.json'), 'utf8')).includes(secret), false)
 
-  await store.update('kiro-keyed', { name: 'Blank Preserves', apiKey: '   ' })
+  const updated = await store.update('kiro-keyed', {
+    name: 'Blank Preserves',
+    apiKey: '   ',
+    models: ['ignored-model'],
+  })
+  assert.deepEqual(updated.models, ['auto'])
   assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, secret)
 
-  const accountSwitched = await store.update('kiro-keyed', { authMode: 'account-session' })
-  assert.equal(accountSwitched.hasApiKey, false)
-  assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, undefined)
   await assert.rejects(
-    store.update('kiro-keyed', { authMode: 'api-key' }),
-    /API key wajib diisi saat beralih/,
+    store.update('kiro-keyed', { authMode: 'account-session' }),
+    /hanya mendukung authMode api-key/,
   )
+  assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, secret)
 
   const keyedAgain = await store.update('kiro-keyed', {
     authMode: 'api-key',
@@ -236,8 +231,6 @@ test('Kiro connection modes validate, encrypt, redact, and clear incompatible se
   })
   assert.equal(keyedAgain.hasApiKey, true)
   assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, 'ksk_replacement')
-  const clearedAgain = await store.update('kiro-keyed', { authMode: 'account-session' })
-  assert.equal(clearedAgain.hasApiKey, false)
 
   await assert.rejects(
     store.create({
@@ -261,13 +254,24 @@ test('switching connection kinds only preserves compatible secrets', async () =>
     models: ['model-a'],
   })
 
-  const account = await store.update('switchable', {
+  await assert.rejects(
+    store.update('switchable', {
+      kind: 'kiro-cli',
+      authMode: 'api-key',
+      models: ['ignored-model'],
+    }),
+    /API key wajib diisi saat beralih/,
+  )
+
+  const kiro = await store.update('switchable', {
     kind: 'kiro-cli',
-    authMode: 'account-session',
-    models: ['kiro-auto'],
+    authMode: 'api-key',
+    apiKey: 'ksk-fresh-kiro',
+    models: ['ignored-model'],
   })
-  assert.equal(account.hasApiKey, false)
-  assert.equal('baseUrl' in account, false)
+  assert.equal(kiro.hasApiKey, true)
+  assert.equal('baseUrl' in kiro, false)
+  assert.deepEqual(kiro.models, ['auto'])
 
   await assert.rejects(
     store.update('switchable', {

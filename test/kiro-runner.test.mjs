@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { access, mkdtemp, readFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -26,7 +26,7 @@ async function setup(mode = 'normal', overrides = {}) {
     executable: overrides.executable ?? FIXTURE,
     env,
     dataDir,
-    timeoutMs: overrides.timeoutMs ?? 1_000,
+    timeoutMs: overrides.timeoutMs ?? 2_000,
     killGraceMs: overrides.killGraceMs ?? 30,
     maxOutputBytes: overrides.maxOutputBytes ?? 100_000,
   })
@@ -55,6 +55,28 @@ async function runStart(runner, request) {
   })
   const result = await controller.done
   return { controller, chunks, errors, completed, sessions, result }
+}
+
+async function runHeadless(runner, request) {
+  const chunks = []
+  const errors = []
+  const completed = []
+  const controller = runner.startHeadless(request, {
+    onChunk: (chunk) => chunks.push(chunk),
+    onDone: (result) => completed.push(result),
+    onError: (message, error) => errors.push({ message, error }),
+  })
+  const result = await controller.done
+  return { controller, chunks, errors, completed, result }
+}
+
+async function waitFor(predicate, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10))
+  }
+  throw new Error('Timeout menunggu kondisi fixture')
 }
 
 test('parseKiroModelList only returns explicit IDs from known containers', () => {
@@ -125,6 +147,80 @@ test('authentication failures redact API-key secrets', async () => {
   assert.equal(result.authenticated, false)
   assert.equal(result.error.includes(secret), false)
   assert.match(result.error, /\[redacted\]/)
+})
+
+test('headless API-key mode keeps prompt out of args and buffers stdout', async () => {
+  const { runner, recordFile, dataDir } = await setup()
+  const secret = 'ksk_headless_secret'
+  const prompt = 'sensitive prompt from stdin'
+  const execution = await runHeadless(runner, {
+    prompt,
+    systemPrompt: 'answer briefly',
+    auth: { type: 'api-key', secret },
+  })
+
+  assert.deepEqual(execution.chunks, ['hello from fixture'])
+  assert.equal(execution.errors.length, 0)
+  assert.equal(execution.completed.length, 1)
+  assert.equal(execution.result.reason, 'completed')
+  assert.equal(execution.result.sessionId, null)
+
+  const entries = await records(recordFile)
+  const spawn = entries.find((entry) => entry.type === 'spawn')
+  const input = entries.find((entry) => entry.type === 'headless-input')
+  assert.deepEqual(spawn.args, [
+    'chat',
+    '--no-interactive',
+    'Jawab permintaan pada standard input. Jangan gunakan tool.',
+  ])
+  assert.equal(spawn.args.some((arg) => arg.includes(prompt) || arg.includes(secret)), false)
+  assert.equal(spawn.apiKeyPresent, true)
+  assert.equal(spawn.home.startsWith(join(dataDir, 'kiro', 'api-key') + '/'), true)
+  assert.equal(await realpath(spawn.cwd), await realpath(join(dataDir, 'kiro', 'headless')))
+  assert.equal(input.input, '<system-instructions>\nanswer briefly\n</system-instructions>\n\nsensitive prompt from stdin')
+  assert.equal(JSON.stringify(entries).includes(secret), false)
+})
+
+test('headless mode requires an API key and redacts command failures', async () => {
+  const missing = await setup()
+  const missingRun = await runHeadless(missing.runner, {
+    prompt: 'hello',
+    auth: { type: 'account-session' },
+  })
+  assert.equal(missingRun.result.reason, 'failed')
+  assert.equal(missingRun.result.error.code, 'KIRO_API_KEY_REQUIRED')
+
+  const failing = await setup('headless-fail')
+  const secret = 'ksk_headless_failure_secret'
+  const failedRun = await runHeadless(failing.runner, {
+    prompt: 'hello',
+    auth: { type: 'api-key', secret },
+  })
+  assert.equal(failedRun.result.reason, 'failed')
+  assert.equal(failedRun.result.error.code, 'KIRO_COMMAND_FAILED')
+  assert.equal(failedRun.errors[0].message.includes(secret), false)
+  assert.match(failedRun.errors[0].message, /\[redacted\]/)
+})
+
+test('headless cancel terminates a child running on the gateway host', async () => {
+  const { runner, recordFile } = await setup('cancel', { killGraceMs: 20 })
+  const controller = runner.startHeadless({
+    prompt: 'wait',
+    auth: { type: 'api-key', secret: 'ksk_cancel' },
+  })
+  await waitFor(async () => {
+    try {
+      return (await records(recordFile)).some((entry) => entry.type === 'headless-input')
+    } catch {
+      return false
+    }
+  })
+  controller.cancel()
+  const result = await controller.done
+  assert.equal(result.reason, 'cancelled')
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
+  const entries = await records(recordFile)
+  assert.equal(entries.some((entry) => entry.type === 'signal' && entry.signal === 'SIGTERM'), true)
 })
 
 test('new session initializes ACP, sets model, streams fragmented chunks, and completes', async () => {

@@ -68,6 +68,7 @@ function PaneCard({
   const { addRun, appendLog, updateRun } = useRuns()
   const terminalRef = useRef<HTMLDivElement>(null)
   const busy = status === 'connecting' || status === 'running'
+  const persistentSession = agent.providerId !== 'kiro-cli'
   const meta = statusMeta[status]
 
   useEffect(() => {
@@ -116,10 +117,12 @@ function PaneCard({
           toolPolicy: agent.toolPolicy,
         },
         sessionId: pane.sessionId,
-        resume: pane.turns > 0,
+        resume: persistentSession && pane.turns > 0,
       },
       {
-        onSession: (sessionId) => onSession(pane.id, sessionId),
+        onSession: (sessionId) => {
+          if (persistentSession) onSession(pane.id, sessionId)
+        },
         onChunk: (text, level) => {
           const prefix = level === 'error' ? '[stderr] ' : ''
           const lines = text.split('\n').map((line) => prefix + line)
@@ -190,11 +193,11 @@ function PaneCard({
             <button
               onClick={() => onReset(pane.id)}
               disabled={busy}
-              title="Reset konteks"
+              title={persistentSession ? 'Reset konteks' : 'Bersihkan output'}
               className="press flex cursor-pointer items-center gap-1 rounded-md border-2 border-ink bg-cream px-1.5 py-1 text-[10px] font-bold uppercase tracking-wider disabled:cursor-not-allowed disabled:opacity-50"
             >
               <TrashIcon width={12} height={12} />
-              Reset
+              {persistentSession ? 'Reset' : 'Bersihkan'}
             </button>
             {canClose && (
               <button

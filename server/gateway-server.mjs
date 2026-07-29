@@ -490,6 +490,18 @@ export function createGatewayServer(options = {}) {
   }
 
   async function attemptKiro({ connection, upstreamModel, body, request, response, headers, requestId }) {
+    if (connection.authMode !== 'api-key') {
+      throw invalidKiroRequest(
+        'Kiro headless hanya mendukung autentikasi API key',
+        'kiro_api_key_required',
+      )
+    }
+    if (upstreamModel !== 'auto') {
+      throw invalidKiroRequest(
+        'Kiro headless memakai model Auto; model lain tidak bisa dipilih lewat API key',
+        'kiro_model_unsupported',
+      )
+    }
     const { prompt, systemPrompt } = parseKiroChatRequest(body, limits)
     const cwd = join(dataDir, 'kiro', 'inference', connection.id)
     await mkdir(cwd, { recursive: true, mode: 0o700 })
@@ -536,6 +548,10 @@ export function createGatewayServer(options = {}) {
     request.once('aborted', disconnect)
     response.once('close', disconnect)
 
+    // Headless CLI bersifat buffered. Untuk request SSE, kirim header segera
+    // supaya client bisa membatalkan proses meski belum ada output model.
+    if (body.stream === true) startStream()
+
     const outcome = await new Promise((resolveOutcome) => {
       const settle = (value) => {
         if (finished) return
@@ -545,12 +561,10 @@ export function createGatewayServer(options = {}) {
       }
 
       try {
-        controller = kiroRunner.start({
+        controller = kiroRunner.startHeadless({
           prompt,
           systemPrompt,
-          model: upstreamModel,
           auth: kiroAuth(connection),
-          allowTools: false,
           cwd,
         }, {
           onChunk(text) {
@@ -680,7 +694,11 @@ export function createGatewayServer(options = {}) {
         const candidate = candidates[i]
         const connection = await connectionStore.getWithSecret(candidate.connectionId)
         if (!connection || !connection.enabled) continue
-        if (connection.models.length && !connection.models.includes(candidate.upstreamModel)) continue
+        if (
+          connection.kind !== 'kiro-cli'
+          && connection.models.length
+          && !connection.models.includes(candidate.upstreamModel)
+        ) continue
 
         lastConnectionId = candidate.connectionId
         lastUpstreamModel = candidate.upstreamModel
@@ -962,7 +980,7 @@ export function createGatewayServer(options = {}) {
                   code: 'kiro_auth_failed',
                 })
               }
-              models = await kiroRunner.listModels({ auth, cwd })
+              models = ['auto']
             } catch (error) {
               if (error.status === 401) throw error
               throw mapKiroError(error)

@@ -311,6 +311,173 @@ export function createKiroRunner(options = {}) {
     return parseKiroModelList(parseJsonOutput(stdout, 'model listing'))
   }
 
+  function startHeadless(request, handlers = {}) {
+    const onChunk = handlers.onChunk ?? (() => {})
+    const onDone = handlers.onDone ?? (() => {})
+    const onError = handlers.onError ?? (() => {})
+    let child = null
+    let terminal = false
+    let cancelled = false
+    let timedOut = false
+    let stdout = ''
+    let stderr = ''
+    let outputBytes = 0
+    let runTimer = null
+    let killTimer = null
+    let resolveDone
+    const done = new Promise((resolvePromise) => { resolveDone = resolvePromise })
+
+    const clearRunTimer = () => {
+      if (runTimer) clearTimeout(runTimer)
+      runTimer = null
+    }
+
+    const terminateWithFallback = () => {
+      if (!child || child.exitCode !== null || child.signalCode !== null) return
+      terminateChild(child, 'SIGTERM')
+      killTimer = setTimeout(() => terminateChild(child, 'SIGKILL'), killGraceMs)
+      killTimer.unref?.()
+    }
+
+    const finish = (reason, error = null) => {
+      if (terminal) return
+      terminal = true
+      clearRunTimer()
+      const safeError = error
+        ? new KiroRunnerError(
+            sanitizeText(error.message, [authSecret(request?.auth)]) || 'Kiro headless gagal.',
+            { code: error.code, cause: error },
+          )
+        : null
+      const payload = {
+        sessionId: null,
+        reason,
+        stopReason: reason === 'completed' ? 'end_turn' : null,
+        ...(safeError ? { error: safeError } : {}),
+      }
+      if (reason === 'completed') {
+        const text = stdout.trim()
+        if (text) onChunk(text)
+        onDone(payload)
+      } else if (reason === 'cancelled' || reason === 'disposed') {
+        onDone(payload)
+      } else {
+        onError(safeError?.message ?? 'Kiro headless gagal.', safeError)
+      }
+      resolveDone(payload)
+    }
+
+    const launch = async () => {
+      try {
+        if (!request || typeof request !== 'object' || typeof request.prompt !== 'string' || !request.prompt.trim()) {
+          throw new KiroRunnerError('Kiro headless membutuhkan prompt.', { code: 'KIRO_INVALID_REQUEST' })
+        }
+        if (authType(request.auth) !== 'api-key') {
+          throw new KiroRunnerError('Kiro headless membutuhkan API key.', {
+            code: 'KIRO_API_KEY_REQUIRED',
+          })
+        }
+        const cwd = resolve(
+          request.cwd ?? options.headlessCwd ?? join(dataDir, 'kiro', 'headless'),
+        )
+        await mkdir(cwd, { recursive: true, mode: 0o700 })
+        const env = await environmentFor(request.auth)
+        if (terminal) return
+
+        child = spawnFn(executable, [
+          'chat',
+          '--no-interactive',
+          'Jawab permintaan pada standard input. Jangan gunakan tool.',
+        ], {
+          cwd,
+          env,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          shell: false,
+          windowsHide: true,
+        })
+        child.stdout.setEncoding('utf8')
+        child.stderr.setEncoding('utf8')
+        child.stdin.on('error', (error) => {
+          if (!terminal) finish('failed', new KiroRunnerError('Kiro headless stdin tertutup.', {
+            code: 'KIRO_HEADLESS_STDIN_CLOSED',
+            cause: error,
+          }))
+        })
+        child.once('error', (error) => {
+          if (!terminal) finish('failed', mapSpawnError(error, executable))
+        })
+
+        const consume = (target, chunk) => {
+          outputBytes += Buffer.byteLength(chunk)
+          if (outputBytes > maxOutputBytes) {
+            terminateWithFallback()
+            finish('failed', new KiroRunnerError(`Kiro CLI output melebihi batas ${maxOutputBytes} byte.`, {
+              code: 'KIRO_MAX_OUTPUT',
+            }))
+            return target
+          }
+          return target + chunk
+        }
+        child.stdout.on('data', (chunk) => { stdout = consume(stdout, chunk) })
+        child.stderr.on('data', (chunk) => { stderr = consume(stderr, chunk) })
+        child.once('close', (code) => {
+          if (terminal) return
+          if (cancelled) {
+            finish('cancelled')
+            return
+          }
+          if (timedOut) {
+            finish('timeout', new KiroRunnerError(`Kiro headless timeout setelah ${timeoutMs}ms.`, {
+              code: 'KIRO_TIMEOUT',
+            }))
+            return
+          }
+          if (code !== 0) {
+            const detail = sanitizeText(stderr, [authSecret(request.auth)])
+            finish('failed', new KiroRunnerError(
+              `Kiro headless gagal${detail ? `: ${detail}` : ` (exit ${code})`}.`,
+              { code: 'KIRO_COMMAND_FAILED' },
+            ))
+            return
+          }
+          finish('completed')
+        })
+
+        runTimer = setTimeout(() => {
+          if (terminal) return
+          timedOut = true
+          terminateWithFallback()
+        }, timeoutMs)
+        runTimer.unref?.()
+
+        child.stdin.end(composePrompt(request.prompt, request.systemPrompt))
+      } catch (error) {
+        if (!terminal) {
+          finish('failed', error instanceof KiroRunnerError
+            ? error
+            : mapSpawnError(error, executable))
+        }
+      }
+    }
+
+    queueMicrotask(launch)
+
+    return {
+      done,
+      cancel() {
+        if (terminal) return
+        cancelled = true
+        terminateWithFallback()
+        finish('cancelled')
+      },
+      dispose() {
+        if (terminal) return
+        terminateWithFallback()
+        finish('disposed')
+      },
+    }
+  }
+
   function start(request, handlers = {}) {
     const onChunk = handlers.onChunk ?? (() => {})
     const onSession = handlers.onSession ?? (() => {})
@@ -609,7 +776,7 @@ export function createKiroRunner(options = {}) {
     }
   }
 
-  return { checkAuth, whoami, listModels, start }
+  return { checkAuth, whoami, listModels, startHeadless, start }
 }
 
 export const kiroRunner = createKiroRunner()
