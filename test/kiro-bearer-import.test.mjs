@@ -10,7 +10,12 @@ const ORIGIN = 'http://localhost:5199'
 const ADMIN = 'gateway-admin-test'
 
 /** Validator palsu: merekam pemanggilan, tanpa jaringan dan tanpa CLI. */
-function recordingValidator({ fail = null, profileArn = null, email = null } = {}) {
+function recordingValidator({
+  fail = null,
+  profileArn = null,
+  email = null,
+  models = ['auto', 'claude-sonnet-5'],
+} = {}) {
   const calls = []
   return {
     calls,
@@ -21,6 +26,7 @@ function recordingValidator({ fail = null, profileArn = null, email = null } = {
         region: region ?? 'us-east-1',
         profileArn: profileArn ?? `arn:aws:codewhisperer:${region ?? 'us-east-1'}:1:profile/OK`,
         email,
+        models,
         validatedAt: '2026-07-29T10:00:00.000Z',
       }
     },
@@ -84,7 +90,8 @@ test('importing a Kiro API key validates over HTTPS and stores the connection', 
   assert.equal(payload.data.profileArn, 'arn:aws:codewhisperer:eu-central-1:111122223333:profile/BBBB')
   assert.equal(payload.data.email, 'owner@example.com')
   assert.equal(payload.data.validatedAt, '2026-07-29T10:00:00.000Z')
-  assert.deepEqual(payload.data.models, ['auto'])
+  assert.deepEqual(payload.data.models, ['auto', 'claude-sonnet-5'])
+  assert.deepEqual(payload.data.availableModels, ['auto', 'claude-sonnet-5'])
 
   // Key dikirim ke validator apa adanya, tapi tidak pernah dipantulkan balik.
   assert.deepEqual(validator.calls, [{ apiKey: secret, region: 'eu-central-1' }])
@@ -104,6 +111,7 @@ test('import accepts an authenticated key without an explicit profile ARN', asyn
       region: region ?? 'us-east-1',
       profileArn: null,
       email: null,
+      models: ['auto', 'claude-sonnet-5'],
       validatedAt: '2026-07-29T10:00:00.000Z',
     }
   }

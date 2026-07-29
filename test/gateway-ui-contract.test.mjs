@@ -4,6 +4,8 @@ import test from 'node:test'
 
 const sourcePath = new URL('../src/pages/Gateway.tsx', import.meta.url)
 const apiPath = new URL('../src/lib/gatewayApi.ts', import.meta.url)
+const playgroundPath = new URL('../src/pages/Playground.tsx', import.meta.url)
+const panesPath = new URL('../src/lib/usePanes.ts', import.meta.url)
 
 test('Connect Kiro modal exposes accessible regional bearer fields and safe responsive layout', async () => {
   const [source, api] = await Promise.all([
@@ -54,4 +56,38 @@ test('Connect Kiro modal exposes accessible regional bearer fields and safe resp
   assert.match(source, /CodeWhisperer profile/)
   assert.match(source, /connection\.profileArn/)
   assert.match(source, /break-all/)
+})
+
+test('Kiro model discovery controls and Playground selection use active connection models', async () => {
+  const [gateway, api, playground, panes] = await Promise.all([
+    readFile(sourcePath, 'utf8'),
+    readFile(apiPath, 'utf8'),
+    readFile(playgroundPath, 'utf8'),
+    readFile(panesPath, 'utf8'),
+  ])
+
+  assert.match(api, /availableModels\?: string\[\]/)
+  assert.match(api, /activeModels\?: string\[\]/)
+  assert.match(api, /testKiroModel/)
+  assert.match(api, /models\/\$\{encodeURIComponent\(model\)\}\/test/)
+
+  assert.match(gateway, /Available Models/)
+  assert.match(gateway, /\? 'Testing\.\.\.' : 'Test'/)
+  assert.match(gateway, />\s*Copy\s*</)
+  assert.match(gateway, /'× Delete'/)
+  assert.match(gateway, /'Add'/)
+  assert.match(gateway, /navigator\.clipboard\.writeText/)
+  assert.match(gateway, /gatewayApi\.updateConnection\(connection\.id, \{ models \}\)/)
+  assert.doesNotMatch(gateway, /models: \['auto'\]/)
+
+  assert.match(panes, /modelId: string/)
+  assert.match(panes, /modelId: typeof pane\.modelId === 'string' \? pane\.modelId : ''/)
+  assert.match(panes, /const setModel = useCallback/)
+  assert.match(panes, /connectionId,\n\s+modelId: ''/)
+
+  assert.match(playground, /id=\{`kiro-model-\$\{pane\.id\}`\}/)
+  assert.match(playground, /selectedConnection\?\.models/)
+  assert.match(playground, /connection\.models\.includes\('auto'\) \? 'auto' : connection\.models\[0\]/)
+  assert.match(playground, /model: agent\.providerId === 'kiro-cli' \? pane\.modelId : agent\.model/)
+  assert.match(playground, /!availableModels\.includes\(pane\.modelId\)/)
 })

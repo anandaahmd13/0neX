@@ -157,7 +157,7 @@ test('connection store migrates legacy records and defaults new input to openai-
   assert.equal('authMode' in created, false)
 })
 
-test('Kiro connections require API keys, force Auto model, and redact secrets', async () => {
+test('Kiro connections persist active and available models and redact secrets', async () => {
   const dataDir = await temporaryDirectory()
   const store = new ConnectionStore({ dataDir, masterKey: MASTER_KEY })
 
@@ -205,7 +205,8 @@ test('Kiro connections require API keys, force Auto model, and redact secrets', 
   })
   assert.equal(keyed.hasApiKey, true)
   assert.equal(keyed.region, 'us-east-1')
-  assert.deepEqual(keyed.models, ['auto'])
+  assert.deepEqual(keyed.models, ['ignored-model'])
+  assert.deepEqual(keyed.availableModels, ['ignored-model'])
   assert.equal('apiKey' in keyed, false)
   assert.equal('encryptedApiKey' in keyed, false)
   assert.equal('baseUrl' in keyed, false)
@@ -242,7 +243,7 @@ test('Kiro connections require API keys, force Auto model, and redact secrets', 
     apiKey: '   ',
     models: ['ignored-model'],
   })
-  assert.deepEqual(updated.models, ['auto'])
+  assert.deepEqual(updated.models, ['ignored-model'])
   assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, secret)
 
   await assert.rejects(
@@ -270,6 +271,22 @@ test('Kiro connections require API keys, force Auto model, and redact secrets', 
   assert.equal(identified.profileArn, 'arn:aws:codewhisperer:us-east-1:111122223333:profile/AAAA')
   assert.equal(identified.email, 'owner@example.com')
   assert.equal(identified.validatedAt, '2026-07-29T00:00:00.000Z')
+
+  const clearedIdentity = await store.update('kiro-keyed', { apiKey: 'ksk_without_identity' }, {
+    validatedAt: '2026-07-29T01:00:00.000Z',
+    identity: { profileArn: null, email: null },
+  })
+  assert.equal('profileArn' in clearedIdentity, false)
+  assert.equal('email' in clearedIdentity, false)
+
+  const restoredIdentity = await store.update('kiro-keyed', {}, {
+    validatedAt: '2026-07-29T02:00:00.000Z',
+    identity: {
+      profileArn: 'arn:aws:codewhisperer:us-east-1:111122223333:profile/AAAA',
+      email: 'owner@example.com',
+    },
+  })
+  assert.equal(restoredIdentity.profileArn, 'arn:aws:codewhisperer:us-east-1:111122223333:profile/AAAA')
 
   // Update lain tidak boleh menghapus identitas yang sudah tervalidasi.
   const renamed = await store.update('kiro-keyed', { name: 'Kiro Identity Kept' })
@@ -299,6 +316,29 @@ test('Kiro connections require API keys, force Auto model, and redact secrets', 
     }),
     /kind harus/,
   )
+})
+
+test('legacy empty Kiro model records fall back to Auto until discovery refreshes them', async () => {
+  const dataDir = await temporaryDirectory()
+  await writeFile(join(dataDir, 'connections.json'), `${JSON.stringify({
+    version: 2,
+    connections: [{
+      id: 'kiro-empty-legacy',
+      name: 'Kiro Empty Legacy',
+      kind: 'kiro-cli',
+      authMode: 'api-key',
+      models: [],
+      enabled: true,
+      encryptedApiKey: encryptSecret('ksk_empty_legacy', MASTER_KEY),
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    }],
+  })}\n`, { mode: 0o600 })
+
+  const store = new ConnectionStore({ dataDir, masterKey: MASTER_KEY })
+  const [connection] = await store.list()
+  assert.deepEqual(connection.models, ['auto'])
+  assert.deepEqual(connection.availableModels, ['auto'])
 })
 
 test('legacy Kiro records without region project and decrypt as us-east-1', async () => {
@@ -353,7 +393,8 @@ test('switching connection kinds only preserves compatible secrets', async () =>
   })
   assert.equal(kiro.hasApiKey, true)
   assert.equal('baseUrl' in kiro, false)
-  assert.deepEqual(kiro.models, ['auto'])
+  assert.deepEqual(kiro.models, ['ignored-model'])
+  assert.deepEqual(kiro.availableModels, ['ignored-model'])
 
   await assert.rejects(
     store.update('switchable', {

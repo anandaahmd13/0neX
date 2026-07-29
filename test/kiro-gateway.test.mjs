@@ -27,8 +27,9 @@ function profileArn(region, apiKey) {
 
 function createFakeKiroBearerValidator() {
   const calls = []
-  return {
+  const validator = {
     calls,
+    models: ['auto', 'claude-sonnet-5'],
     async validateApiKey({ apiKey, region = 'us-east-1' }) {
       calls.push({ apiKey, region })
       if (apiKey.includes('rejected')) {
@@ -39,12 +40,14 @@ function createFakeKiroBearerValidator() {
       }
       return {
         region,
-        profileArn: profileArn(region, apiKey),
-        email: 'kiro-user@example.com',
+        profileArn: apiKey.includes('no-identity') ? null : profileArn(region, apiKey),
+        email: apiKey.includes('no-identity') ? null : 'kiro-user@example.com',
+        models: [...validator.models],
         validatedAt: new Date(1_750_000_000_000 + calls.length * 1_000).toISOString(),
       }
     },
   }
+  return validator
 }
 
 function createFakeKiroHttpClient() {
@@ -325,12 +328,17 @@ test('Kiro /v1 chat returns OpenAI non-stream and stream shapes with usage', asy
   assert.equal(created.profileArn, profileArn('us-east-1', DEFAULT_SECRET))
   assert.equal(created.email, 'kiro-user@example.com')
   assert.equal(typeof created.validatedAt, 'string')
+  assert.deepEqual(created.models, ['auto', 'claude-sonnet-5'])
+  assert.deepEqual(created.availableModels, ['auto', 'claude-sonnet-5'])
   assert.equal('apiKey' in created, false)
   assert.deepEqual(kiroBearerValidator.calls, [{ apiKey: DEFAULT_SECRET, region: 'us-east-1' }])
 
   const models = await jsonRequest(`${baseUrl}/v1/models`, API_TOKEN)
   assert.equal(models.response.status, 200)
-  assert.deepEqual(models.payload.data.map((model) => model.id), ['kiro-main/auto'])
+  assert.deepEqual(models.payload.data.map((model) => model.id), [
+    'kiro-main/auto',
+    'kiro-main/claude-sonnet-5',
+  ])
 
   const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, API_TOKEN, {
     method: 'POST',
@@ -403,6 +411,75 @@ test('Kiro /v1 chat returns OpenAI non-stream and stream shapes with usage', asy
     prompt_tokens_details: { cached_tokens: 2 },
   })
   assert.equal(chunks.slice(0, -1).some((chunk) => 'usage' in chunk), false)
+})
+
+test('Kiro model catalog preserves activation choices and gates explicit inference', async (t) => {
+  const { baseUrl, kiroBearerValidator, kiroHttpClient } = await setupGateway(t)
+  await createKiroConnection(baseUrl)
+
+  const deactivated = await jsonRequest(`${baseUrl}/admin/connections/kiro-main`, ADMIN_TOKEN, {
+    method: 'PATCH',
+    body: JSON.stringify({ models: ['auto'] }),
+  })
+  assert.equal(deactivated.response.status, 200, JSON.stringify(deactivated.payload))
+  assert.deepEqual(deactivated.payload.data.models, ['auto'])
+  assert.deepEqual(deactivated.payload.data.availableModels, ['auto', 'claude-sonnet-5'])
+
+  const inactiveModels = await jsonRequest(`${baseUrl}/v1/models`, API_TOKEN)
+  assert.deepEqual(inactiveModels.payload.data.map((model) => model.id), ['kiro-main/auto'])
+
+  const rejected = await jsonRequest(`${baseUrl}/v1/chat/completions`, API_TOKEN, {
+    method: 'POST',
+    body: JSON.stringify({
+      model: 'kiro-main/claude-sonnet-5',
+      messages: [{ role: 'user', content: 'must not reach upstream' }],
+    }),
+  })
+  assert.equal(rejected.response.status, 400, JSON.stringify(rejected.payload))
+  assert.equal(rejected.payload.error.code, 'kiro_model_not_active')
+  assert.equal(kiroHttpClient.calls.length, 0)
+
+  const liveTest = await jsonRequest(
+    `${baseUrl}/admin/connections/kiro-main/models/claude-sonnet-5/test`,
+    ADMIN_TOKEN,
+    { method: 'POST' },
+  )
+  assert.equal(liveTest.response.status, 200, JSON.stringify(liveTest.payload))
+  assert.equal(liveTest.payload.data.model, 'kiro-main/claude-sonnet-5')
+  assert.equal(kiroHttpClient.calls[0].model, 'claude-sonnet-5')
+
+  kiroBearerValidator.models = ['auto', 'claude-sonnet-5', 'claude-opus-5']
+  const refreshed = await jsonRequest(`${baseUrl}/admin/connections/kiro-main/test`, ADMIN_TOKEN, {
+    method: 'POST',
+  })
+  assert.equal(refreshed.response.status, 200, JSON.stringify(refreshed.payload))
+  assert.deepEqual(refreshed.payload.data.models, ['auto', 'claude-sonnet-5', 'claude-opus-5'])
+  assert.deepEqual(refreshed.payload.data.activeModels, ['auto'])
+
+  const listed = await jsonRequest(`${baseUrl}/admin/connections`, ADMIN_TOKEN)
+  assert.deepEqual(listed.payload.data[0].models, ['auto'])
+  assert.deepEqual(listed.payload.data[0].availableModels, [
+    'auto',
+    'claude-sonnet-5',
+    'claude-opus-5',
+  ])
+
+  const activated = await jsonRequest(`${baseUrl}/admin/connections/kiro-main`, ADMIN_TOKEN, {
+    method: 'PATCH',
+    body: JSON.stringify({ models: ['auto', 'claude-sonnet-5'] }),
+  })
+  assert.equal(activated.response.status, 200, JSON.stringify(activated.payload))
+
+  const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, API_TOKEN, {
+    method: 'POST',
+    body: JSON.stringify({
+      model: 'kiro-main/claude-sonnet-5',
+      messages: [{ role: 'user', content: 'use the selected model' }],
+    }),
+  })
+  assert.equal(completion.response.status, 200, JSON.stringify(completion.payload))
+  assert.equal(completion.payload.model, 'kiro-main/claude-sonnet-5')
+  assert.equal(kiroHttpClient.calls.at(-1).model, 'claude-sonnet-5')
 })
 
 test('Kiro region, profile ARN, and rotated credential flow through validation and inference', async (t) => {
@@ -590,7 +667,8 @@ test('Kiro secret is never exposed by APIs or persisted in plaintext', async (t)
     method: 'POST',
   })
   assert.equal(tested.response.status, 200)
-  assert.deepEqual(tested.payload.data.models, ['auto'])
+  assert.deepEqual(tested.payload.data.models, ['auto', 'claude-sonnet-5'])
+  assert.deepEqual(tested.payload.data.activeModels, ['auto', 'claude-sonnet-5'])
   assert.equal(tested.payload.data.credentialType, 'bearer')
   assert.equal(JSON.stringify(tested.payload).includes(secret), false)
 
