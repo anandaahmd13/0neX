@@ -271,8 +271,8 @@ function parseKiroChatRequest(body, limits) {
 
 function kiroAuth(connection) {
   return connection.authMode === 'api-key'
-    ? { type: 'api-key', secret: connection.apiKey }
-    : { type: 'account-session' }
+    ? { type: 'api-key', secret: connection.apiKey, region: connection.region }
+    : { type: 'account-session', region: connection.region }
 }
 
 function mapKiroError(error) {
@@ -418,7 +418,7 @@ export function createGatewayServer(options = {}) {
     return !origin || allowedOrigins.has(origin)
   }
 
-  async function validateKiroBearer({ id, apiKey }) {
+  async function validateKiroBearer({ id, apiKey, region }) {
     if (typeof apiKey !== 'string' || !apiKey.trim()) {
       throw Object.assign(new Error('Kiro/CodeWhisperer API key wajib diisi'), {
         status: 400,
@@ -428,7 +428,7 @@ export function createGatewayServer(options = {}) {
     const cwd = join(dataDir, 'kiro', 'connection-tests', id)
     await mkdir(cwd, { recursive: true, mode: 0o700 })
     try {
-      await kiroRunner.validateApiKey({ apiKey, cwd })
+      await kiroRunner.validateApiKey({ apiKey, region, cwd })
       return new Date().toISOString()
     } catch (error) {
       throw mapKiroError(error)
@@ -973,7 +973,11 @@ export function createGatewayServer(options = {}) {
           const input = await readJson(request, limits.maxBodyBytes)
           const normalized = validateConnectionInput(input, { allowInsecureLocalhost })
           const validatedAt = normalized.kind === 'kiro-cli'
-            ? await validateKiroBearer({ id: normalized.id, apiKey: input.apiKey })
+            ? await validateKiroBearer({
+                id: normalized.id,
+                apiKey: input.apiKey,
+                region: normalized.region,
+              })
             : undefined
           sendJson(response, 201, {
             data: await connectionStore.create(input, { validatedAt }),
@@ -989,9 +993,17 @@ export function createGatewayServer(options = {}) {
             allowInsecureLocalhost,
           })
           const candidateKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : ''
-          const validatedAt = normalized.kind === 'kiro-cli' && candidateKey
-            ? await validateKiroBearer({ id: current.id, apiKey: candidateKey })
-            : undefined
+          let validatedAt
+          if (normalized.kind === 'kiro-cli') {
+            const regionChanged = current.kind !== 'kiro-cli' || normalized.region !== current.region
+            if (candidateKey || regionChanged) {
+              validatedAt = await validateKiroBearer({
+                id: current.id,
+                apiKey: candidateKey || (current.kind === 'kiro-cli' ? current.apiKey : ''),
+                region: normalized.region,
+              })
+            }
+          }
           sendJson(response, 200, {
             data: await connectionStore.update(connectionMatch[1], input, { validatedAt }),
           }, headers)
@@ -1010,6 +1022,7 @@ export function createGatewayServer(options = {}) {
             const validatedAt = await validateKiroBearer({
               id: connection.id,
               apiKey: connection.apiKey,
+              region: connection.region,
             })
             await connectionStore.update(connection.id, {}, { validatedAt })
             sendJson(response, 200, {

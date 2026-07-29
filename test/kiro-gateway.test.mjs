@@ -88,6 +88,7 @@ async function createKiroConnection(baseUrl, body) {
       kind: 'kiro-cli',
       authMode: 'api-key',
       apiKey: 'ksk_connection_fixture',
+      region: 'us-east-1',
       models: ['auto'],
       enabled: true,
       ...body,
@@ -283,6 +284,7 @@ test('Kiro HTTP connection validates auth and serves buffered OpenAI chat with A
   assert.equal(created.authMode, 'api-key')
   assert.equal(created.hasApiKey, true)
   assert.equal(created.credentialType, 'bearer')
+  assert.equal(created.region, 'us-east-1')
   assert.equal(typeof created.validatedAt, 'string')
   assert.equal('baseUrl' in created, false)
   assert.equal('apiKey' in created, false)
@@ -366,6 +368,47 @@ test('Kiro HTTP connection validates auth and serves buffered OpenAI chat with A
   )
   assert.notEqual(headlessSpawn.cwd, process.cwd())
   assert.equal(records.filter((entry) => entry.type === 'spawn').every((entry) => entry.apiKeyPresent), true)
+  assert.equal(records.filter((entry) => entry.type === 'spawn').every((entry) => entry.awsRegion === 'us-east-1'), true)
+  assert.equal(records.filter((entry) => entry.type === 'spawn').every((entry) => entry.awsDefaultRegion === 'us-east-1'), true)
+})
+
+test('Kiro region changes revalidate stored key atomically and inference uses the saved region', async (t) => {
+  const { baseUrl, recordFile, gatewayDataDir } = await setupGateway(t)
+  await createKiroConnection(baseUrl, { region: 'us-east-1' })
+  const connectionPath = join(gatewayDataDir, 'connections.json')
+
+  const changed = await jsonRequest(`${baseUrl}/admin/connections/kiro-main`, 'gateway-admin-test', {
+    method: 'PATCH',
+    body: JSON.stringify({ region: 'eu-central-1' }),
+  })
+  assert.equal(changed.response.status, 200, JSON.stringify(changed.payload))
+  assert.equal(changed.payload.data.region, 'eu-central-1')
+
+  const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, 'gateway-api-test', {
+    method: 'POST',
+    body: JSON.stringify({
+      model: 'kiro-main/auto',
+      messages: [{ role: 'user', content: 'hello from eu' }],
+    }),
+  })
+  assert.equal(completion.response.status, 200)
+
+  const regionalSpawns = (await fixtureRecords(recordFile)).filter(
+    (entry) => entry.type === 'spawn' && entry.awsRegion === 'eu-central-1',
+  )
+  assert.equal(regionalSpawns.length >= 2, true)
+  assert.equal(regionalSpawns.every((entry) => entry.awsDefaultRegion === 'eu-central-1'), true)
+
+  const beforeInvalid = await readFile(connectionPath, 'utf8')
+  const invalid = await jsonRequest(`${baseUrl}/admin/connections/kiro-main`, 'gateway-admin-test', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      name: 'Must Not Persist',
+      region: 'ap-southeast-1',
+    }),
+  })
+  assert.equal(invalid.response.status, 400)
+  assert.equal(await readFile(connectionPath, 'utf8'), beforeInvalid)
 })
 
 test('Kiro HTTP connection rejects unsupported OpenAI features without invoking runner', async (t) => {
@@ -459,6 +502,7 @@ test('Kiro bearer validation is atomic for rejected creates and rotations', asyn
 
   await createKiroConnection(baseUrl, {
     apiKey: 'ksk_original_valid_secret',
+    region: 'eu-central-1',
   })
   const connectionPath = join(gatewayDataDir, 'connections.json')
   const beforeRotation = await readFile(connectionPath, 'utf8')
@@ -471,6 +515,7 @@ test('Kiro bearer validation is atomic for rejected creates and rotations', asyn
       body: JSON.stringify({
         name: 'Must Not Persist',
         apiKey: 'ksk_rejected_rotation_secret',
+        region: 'us-east-1',
       }),
     },
   )
@@ -481,6 +526,7 @@ test('Kiro bearer validation is atomic for rejected creates and rotations', asyn
   const afterRejectedRotation = await jsonRequest(`${baseUrl}/admin/connections`, 'gateway-admin-test')
   assert.equal(afterRejectedRotation.payload.data.length, 1)
   assert.equal(afterRejectedRotation.payload.data[0].name, 'Kiro Main')
+  assert.equal(afterRejectedRotation.payload.data[0].region, 'eu-central-1')
   assert.equal(afterRejectedRotation.payload.data[0].credentialType, 'bearer')
   assert.equal(typeof afterRejectedRotation.payload.data[0].validatedAt, 'string')
 
@@ -488,6 +534,11 @@ test('Kiro bearer validation is atomic for rejected creates and rotations', asyn
   assert.equal(rawRecords.includes('ksk_rejected_create_secret'), false)
   assert.equal(rawRecords.includes('ksk_rejected_rotation_secret'), false)
   assert.equal(beforeRotation.includes('ksk_original_valid_secret'), false)
+
+  const rotationSpawns = (await fixtureRecords(recordFile)).filter(
+    (entry) => entry.type === 'spawn' && entry.args.includes('--no-interactive'),
+  )
+  assert.equal(rotationSpawns.some((entry) => entry.awsRegion === 'us-east-1'), true)
 })
 
 test('Kiro API-key connection isolates and redacts its secret across admin, runner, and logs', async (t) => {
