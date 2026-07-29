@@ -13,6 +13,10 @@ export interface GatewayConnection {
   baseUrl?: string
   credentialType?: 'bearer'
   region?: KiroRegion
+  /** ARN profile CodeWhisperer hasil validasi bearer. Bukan secret. */
+  profileArn?: string
+  /** Email dari klaim JWT bearer, kalau key-nya memang JWT. Bukan secret. */
+  email?: string
   validatedAt?: string
   models: string[]
   enabled: boolean
@@ -30,6 +34,18 @@ export interface ConnectionInput {
   region?: KiroRegion
   models: string[]
   enabled: boolean
+}
+
+/**
+ * Payload import bearer Kiro. Hanya apiKey yang wajib; id/name diturunkan oleh
+ * gateway dari hasil validasi kalau tidak diisi.
+ */
+export interface KiroApiKeyImport {
+  apiKey: string
+  region?: KiroRegion
+  id?: string
+  name?: string
+  enabled?: boolean
 }
 
 export interface ConnectionTestResult {
@@ -125,6 +141,15 @@ export const gatewayApi = {
   listConnections: () => request<GatewayConnection[]>('/admin/connections'),
   createConnection: (input: ConnectionInput) =>
     request<GatewayConnection>('/admin/connections', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  /**
+   * Import bearer credential Kiro. Gateway memvalidasi key ke CodeWhisperer
+   * lewat HTTPS (tanpa kiro-cli) sebelum menyimpannya terenkripsi.
+   */
+  importKiroApiKey: (input: KiroApiKeyImport) =>
+    request<GatewayConnection>('/admin/connections/kiro/api-key', {
       method: 'POST',
       body: JSON.stringify(input),
     }),

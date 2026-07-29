@@ -421,10 +421,15 @@ function ConnectionsPanel({
         if (kiroForm.apiKey?.trim()) updatePayload.apiKey = kiroForm.apiKey
         await gatewayApi.updateConnection(kiroEditingId, updatePayload)
       } else {
-        await gatewayApi.createConnection({
-          ...kiroForm,
-          kind: 'kiro-cli',
-          models: ['auto'],
+        // Connection Kiro baru dibuat lewat jalur import bearer: gateway
+        // memvalidasi key ke CodeWhisperer via HTTPS (tanpa kiro-cli), lalu
+        // menyimpan profile ARN + email hasil validasi.
+        await gatewayApi.importKiroApiKey({
+          apiKey: kiroForm.apiKey ?? '',
+          region: kiroForm.region,
+          id: kiroForm.id?.trim() || undefined,
+          name: kiroForm.name?.trim() || undefined,
+          enabled: kiroForm.enabled,
         })
       }
       closeKiro()
@@ -522,9 +527,16 @@ function ConnectionsPanel({
                           ? `AWS validated · ${fmtTime(connection.validatedAt)}`
                           : 'AWS validation pending'}
                       </Badge>
+                      {connection.email && <Badge color="neutral">{connection.email}</Badge>}
                     </>
                   )}
                 </div>
+                {connection.kind === 'kiro-cli' && connection.profileArn && (
+                  <div className="overflow-x-auto rounded-lg border-2 border-dashed border-ink/30 bg-cream p-2">
+                    <span className="text-xs opacity-70">CodeWhisperer profile</span>
+                    <div className="font-mono text-xs break-all">{connection.profileArn}</div>
+                  </div>
+                )}
                 {connection.models.length > 0 && (
                   <div className="max-h-24 overflow-y-auto rounded-lg border-2 border-dashed border-ink/30 bg-cream p-2 font-mono text-xs">
                     {connection.models.map((model) => <div key={model}>{connection.id}/{model}</div>)}

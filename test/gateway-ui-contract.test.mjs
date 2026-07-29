@@ -40,4 +40,18 @@ test('Connect Kiro modal exposes accessible regional bearer fields and safe resp
   assert.match(source, /Validating against AWS\.\.\./)
   assert.match(source, /Validate & update/)
   assert.match(source, /AWS validated · bearer credential stored/)
+
+  // Jalur import bearer: connection Kiro baru lewat /admin/connections/kiro/api-key,
+  // bukan createConnection generik.
+  assert.match(api, /export interface KiroApiKeyImport/)
+  assert.match(api, /profileArn\?: string/)
+  assert.match(api, /email\?: string/)
+  assert.match(api, /importKiroApiKey/)
+  assert.match(api, /'\/admin\/connections\/kiro\/api-key'/)
+  assert.match(source, /gatewayApi\.importKiroApiKey\(/)
+
+  // Identitas hasil validasi ditampilkan, dan ARN panjang tidak boleh merusak layout.
+  assert.match(source, /CodeWhisperer profile/)
+  assert.match(source, /connection\.profileArn/)
+  assert.match(source, /break-all/)
 })
