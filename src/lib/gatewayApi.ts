@@ -4,14 +4,14 @@
 const HTTP_BASE = (import.meta.env.VITE_GATEWAY_HTTP_URL as string | undefined)?.replace(/\/+$/, '') ?? ''
 
 export type ConnectionKind = 'openai-http' | 'kiro-cli'
-export type KiroAuthMode = 'account-session' | 'api-key'
 
 export interface GatewayConnection {
   id: string
   name: string
   kind: ConnectionKind
   baseUrl?: string
-  authMode?: KiroAuthMode
+  credentialType?: 'bearer'
+  validatedAt?: string
   models: string[]
   enabled: boolean
   hasApiKey: boolean
@@ -24,7 +24,6 @@ export interface ConnectionInput {
   name: string
   kind: ConnectionKind
   baseUrl?: string
-  authMode?: KiroAuthMode
   apiKey?: string
   models: string[]
   enabled: boolean
@@ -33,6 +32,8 @@ export interface ConnectionInput {
 export interface ConnectionTestResult {
   ok: boolean
   models: string[]
+  credentialType?: 'bearer'
+  validatedAt?: string
 }
 
 export type UsageRange = '24h' | '7d' | '30d'

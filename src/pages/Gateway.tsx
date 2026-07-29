@@ -300,6 +300,8 @@ function ConnectionsPanel({
   const [modelsText, setModelsText] = useState('')
   const [saving, setSaving] = useState(false)
   const [testingId, setTestingId] = useState<string | null>(null)
+  const validatesKiroCredential =
+    form.kind === 'kiro-cli' && (!editingId || Boolean(form.apiKey?.trim()))
 
   function openCreate() {
     setEditingId(null)
@@ -316,7 +318,6 @@ function ConnectionsPanel({
       name: connection.name,
       kind: connection.kind,
       baseUrl: connection.baseUrl,
-      authMode: connection.kind === 'kiro-cli' ? 'api-key' : connection.authMode,
       apiKey: '',
       models,
       enabled: connection.enabled,
@@ -334,12 +335,11 @@ function ConnectionsPanel({
 
   function changeKind(kind: ConnectionInput['kind']) {
     setForm((current) => kind === 'kiro-cli'
-      ? { ...current, kind, baseUrl: undefined, authMode: 'api-key', apiKey: '', models: ['auto'] }
+      ? { ...current, kind, baseUrl: undefined, apiKey: '', models: ['auto'] }
       : {
           ...current,
           kind,
           baseUrl: current.baseUrl || 'https://api.openai.com/v1',
-          authMode: undefined,
           apiKey: '',
           models: [],
         })
@@ -351,24 +351,33 @@ function ConnectionsPanel({
       ...form,
       models: form.kind === 'kiro-cli' ? ['auto'] : textToModels(modelsText),
       baseUrl: form.kind === 'openai-http' ? form.baseUrl : undefined,
-      authMode: form.kind === 'kiro-cli' ? 'api-key' : undefined,
     }
-    const requiresApiKey = payload.kind === 'openai-http' || payload.authMode === 'api-key'
-    if (!editingId && requiresApiKey && !payload.apiKey) {
-      push(payload.kind === 'kiro-cli' ? 'Kiro API key wajib untuk mode API key' : 'API key wajib untuk connection baru', 'error')
+    if (!editingId && !payload.apiKey?.trim()) {
+      push(
+        payload.kind === 'kiro-cli'
+          ? 'Kiro/CodeWhisperer API key wajib untuk bearer credential baru'
+          : 'API key wajib untuk connection baru',
+        'error',
+      )
       return
     }
+    const storesKiroBearer = payload.kind === 'kiro-cli' && Boolean(payload.apiKey?.trim())
     setSaving(true)
     try {
       if (editingId) {
         const updatePayload: Partial<ConnectionInput> = { ...payload }
-        if (!updatePayload.apiKey) delete updatePayload.apiKey
+        if (!updatePayload.apiKey?.trim()) delete updatePayload.apiKey
         await gatewayApi.updateConnection(editingId, updatePayload)
       } else {
         await gatewayApi.createConnection(payload)
       }
       closeForm()
-      push(editingId ? 'Connection diperbarui' : 'Connection ditambahkan', 'success')
+      push(
+        storesKiroBearer
+          ? 'AWS validated · bearer credential stored'
+          : editingId ? 'Connection diperbarui' : 'Connection ditambahkan',
+        'success',
+      )
       await onChanged()
     } catch (error) {
       push(error instanceof Error ? error.message : 'Gagal menyimpan connection', 'error')
@@ -394,11 +403,12 @@ function ConnectionsPanel({
       const result = await gatewayApi.testConnection(connection.id)
       push(
         connection.kind === 'kiro-cli'
-          ? 'Kiro API key valid · model Auto siap'
+          ? 'AWS validated · stored bearer credential is ready'
           : `Connection sehat · ${result.models.length} model ditemukan`,
         'success',
       )
-      if (result.models.length) openEdit(connection, result.models)
+      if (connection.kind === 'kiro-cli') await onChanged()
+      else if (result.models.length) openEdit(connection, result.models)
     } catch (error) {
       push(error instanceof Error ? error.message : 'Connection test gagal', 'error')
     } finally {
@@ -411,7 +421,7 @@ function ConnectionsPanel({
       <div className="flex items-center justify-between gap-3">
         <div>
           <h2 className="font-brand text-xl font-bold">Provider connections</h2>
-          <p className="mt-1 text-xs text-ink/60">API key terenkripsi di server dan tidak pernah dikirim balik ke browser.</p>
+          <p className="mt-1 text-xs text-ink/60">Provider credentials disimpan server-side dan tidak pernah dikirim balik ke browser.</p>
         </div>
         <Button size="sm" onClick={openCreate}><PlusIcon width={15} height={15} />Tambah</Button>
       </div>
@@ -420,7 +430,7 @@ function ConnectionsPanel({
       {loading && connections.length === 0 ? (
         <StateCard message="Membaca provider connections..." />
       ) : connections.length === 0 ? (
-        <Card><CardBody><EmptyText text="Belum ada connection. Tambahkan akun provider OpenAI-compatible pertama lo." /></CardBody></Card>
+        <Card><CardBody><EmptyText text="Belum ada connection. Tambahkan provider credential pertama lo." /></CardBody></Card>
       ) : (
         <div className="grid gap-4 lg:grid-cols-2">
           {connections.map((connection) => (
@@ -434,14 +444,29 @@ function ConnectionsPanel({
                   <code className="text-sm font-bold">{connection.id}</code>
                   <div className="mt-1 break-all text-xs text-ink/60">
                     {connection.kind === 'kiro-cli'
-                      ? 'Kiro CLI Headless · API key · model Auto'
+                      ? 'Kiro/CodeWhisperer · bearer credential · model Auto'
                       : connection.baseUrl}
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Badge color="mustard">{connection.kind === 'kiro-cli' ? 'Kiro CLI' : 'OpenAI HTTP'}</Badge>
+                  <Badge color="mustard">
+                    {connection.kind === 'kiro-cli'
+                      ? connection.credentialType === 'bearer' ? 'Bearer credential' : 'Kiro bearer'
+                      : 'OpenAI HTTP'}
+                  </Badge>
                   <Badge color="sky">{connection.models.length} model</Badge>
-                  <Badge color="neutral">{connection.hasApiKey ? 'key tersimpan' : 'tanpa key'}</Badge>
+                  <Badge color="neutral">
+                    {connection.kind === 'kiro-cli'
+                      ? connection.hasApiKey ? 'bearer credential stored' : 'credential missing'
+                      : connection.hasApiKey ? 'key tersimpan' : 'tanpa key'}
+                  </Badge>
+                  {connection.kind === 'kiro-cli' && (
+                    <Badge color={connection.validatedAt ? 'ok' : 'idle'}>
+                      {connection.validatedAt
+                        ? `AWS validated · ${fmtTime(connection.validatedAt)}`
+                        : 'AWS validation pending'}
+                    </Badge>
+                  )}
                 </div>
                 {connection.models.length > 0 && (
                   <div className="max-h-24 overflow-y-auto rounded-lg border-2 border-dashed border-ink/30 bg-cream p-2 font-mono text-xs">
@@ -452,7 +477,7 @@ function ConnectionsPanel({
                   <Button variant="ghost" size="sm" disabled={testingId === connection.id} onClick={() => void test(connection)}>
                     {testingId === connection.id
                       ? 'Testing...'
-                      : connection.kind === 'kiro-cli' ? 'Test API key' : 'Test & discover'}
+                      : connection.kind === 'kiro-cli' ? 'Validate against AWS' : 'Test & discover'}
                   </Button>
                   <Button variant="secondary" size="sm" onClick={() => openEdit(connection)}>Edit</Button>
                   <Button variant="danger" size="sm" onClick={() => void remove(connection)}><TrashIcon width={14} height={14} />Hapus</Button>
@@ -477,13 +502,13 @@ function ConnectionsPanel({
                   onChange={(event) => changeKind(event.target.value as ConnectionInput['kind'])}
                 >
                   <option value="openai-http">OpenAI-compatible HTTP</option>
-                  <option value="kiro-cli">Kiro CLI Headless (host gateway)</option>
+                  <option value="kiro-cli">Kiro / CodeWhisperer bearer credential</option>
                 </select>
               </label>
               {form.kind === 'kiro-cli' && (
                 <div className="space-y-1 text-xs font-bold">
-                  <span>Autentikasi Kiro</span>
-                  <div className={`${fieldClass} bg-sky-soft`}>API key Kiro</div>
+                  <span>Credential Kiro</span>
+                  <div className={`${fieldClass} bg-sky-soft`}>AWS-validated bearer credential</div>
                 </div>
               )}
             </div>
@@ -504,14 +529,17 @@ function ConnectionsPanel({
               </label>
             )}
             <label className="block space-y-1 text-xs font-bold">
-              <span>{form.kind === 'kiro-cli' ? 'Kiro API key' : 'API key'} {editingId && <span className="font-normal text-ink/50">— kosongkan untuk mempertahankan key lama</span>}</span>
+              <span>{form.kind === 'kiro-cli' ? 'Kiro/CodeWhisperer API key' : 'API key'} {editingId && <span className="font-normal text-ink/50">— leave blank to preserve the stored key</span>}</span>
               <input type="password" autoComplete="new-password" className={fieldClass} value={form.apiKey ?? ''} placeholder={form.kind === 'kiro-cli' ? 'ksk_...' : 'sk-...'} onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} />
+              {form.kind === 'kiro-cli' && (
+                <p className="font-normal text-ink/55">Paste a long-lived Kiro/CodeWhisperer API key. It is validated against AWS and stored directly as a bearer credential.</p>
+              )}
             </label>
             {form.kind === 'kiro-cli' ? (
               <div className="space-y-1 text-xs font-bold">
                 <span>Model</span>
                 <div className={`${fieldClass} bg-sky-soft font-mono`}>auto</div>
-                <p className="font-normal text-ink/55">Kiro headless memilih model Auto; model lain tidak bisa dipilih lewat API key.</p>
+                <p className="font-normal text-ink/55">Kiro/CodeWhisperer memakai model Auto untuk bearer credential ini.</p>
               </div>
             ) : (
               <label className="block space-y-1 text-xs font-bold">
@@ -525,7 +553,11 @@ function ConnectionsPanel({
             </label>
             <div className="flex justify-end gap-2">
               <Button variant="ghost" onClick={closeForm}>Batal</Button>
-              <Button onClick={() => void submit()} disabled={saving}>{saving ? 'Menyimpan...' : 'Simpan connection'}</Button>
+              <Button onClick={() => void submit()} disabled={saving}>
+                {saving
+                  ? validatesKiroCredential ? 'Validating...' : 'Menyimpan...'
+                  : validatesKiroCredential ? 'Validate & save' : 'Save connection'}
+              </Button>
             </div>
           </CardBody>
         </Card>
