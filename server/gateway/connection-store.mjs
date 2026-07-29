@@ -1,6 +1,8 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { isIP } from 'node:net'
 import { decryptSecret, encryptSecret } from './secrets.mjs'
+import { isPrivateAddress } from './net-guard.mjs'
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/
 const MODEL_PATTERN = /^[^\s/][^\s]{0,199}$/
@@ -30,12 +32,21 @@ export function normalizeBaseUrl(value, { allowInsecureLocalhost = false } = {})
     throw new Error('Base URL tidak valid')
   }
 
-  const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '::1'
+  const hostname = url.hostname.replace(/^\[|\]$/g, '')
+  const local =
+    hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1'
   if (url.protocol !== 'https:' && !(allowInsecureLocalhost && local && url.protocol === 'http:')) {
     throw new Error('Base URL harus memakai HTTPS')
   }
   if (url.username || url.password || url.search || url.hash) {
     throw new Error('Base URL tidak boleh berisi credential, query, atau fragment')
+  }
+
+  // Anti-SSRF: kalau host berupa literal IP internal, tolak sekarang juga
+  // (kecuali localhost saat allowInsecureLocalhost aktif untuk dev/test).
+  // Host berupa nama domain diverifikasi via DNS saat fetch (lihat net-guard).
+  if (isIP(hostname) && isPrivateAddress(hostname) && !(allowInsecureLocalhost && local)) {
+    throw new Error(`Base URL mengarah ke alamat jaringan internal: ${hostname}`)
   }
   url.pathname = url.pathname.replace(/\/+$/, '') || '/'
   return url.toString().replace(/\/$/, '')

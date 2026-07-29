@@ -15,6 +15,7 @@ import { getProvider, listProviders, registerProvider } from './gateway/provider
 import { claudeCliProvider } from './gateway/providers/claude-cli.mjs'
 import { UsageStore } from './gateway/usage-store.mjs'
 import { createSessionManager, parseCookies, serializeSessionCookie } from './gateway/session.mjs'
+import { assertPublicHost } from './gateway/net-guard.mjs'
 
 try {
   registerProvider(claudeCliProvider)
@@ -194,13 +195,26 @@ export function createGatewayServer(options = {}) {
     throw new Error('GATEWAY_MASTER_KEY wajib diisi minimal 16 karakter sebelum gateway bisa start')
   }
 
+  const allowInsecureLocalhost = options.allowInsecureLocalhost ?? env.NODE_ENV !== 'production'
   const connectionStore = options.connectionStore ?? new ConnectionStore({
     dataDir,
     masterKey,
-    allowInsecureLocalhost: options.allowInsecureLocalhost ?? env.NODE_ENV !== 'production',
+    allowInsecureLocalhost,
   })
   const usageStore = options.usageStore ?? new UsageStore({ dataDir })
   const fetchImpl = options.fetchImpl ?? fetch
+
+  // Anti-SSRF saat fetch: verifikasi host upstream tidak me-resolve ke jaringan
+  // internal. Menutup celah DNS rebinding yang lolos dari cek literal-IP di
+  // normalizeBaseUrl. Bisa dilewati lewat fetchImpl kustom (test).
+  async function guardUpstream(baseUrl) {
+    if (options.fetchImpl) return
+    try {
+      await assertPublicHost(new URL(baseUrl).hostname, { allowLocalhost: allowInsecureLocalhost })
+    } catch (error) {
+      throw Object.assign(new Error(error.message), { status: 400, code: 'ssrf_blocked' })
+    }
+  }
 
   // Sesi dashboard: cookie httpOnly bertanda tangan HMAC. Rahasianya diturunkan
   // dari admin token + master key, jadi tidak perlu env var tambahan dan tetap
@@ -241,6 +255,7 @@ export function createGatewayServer(options = {}) {
         throw Object.assign(new Error(`Model tidak diizinkan pada connection ${connection.id}`), { status: 400, code: 'model_not_allowed' })
       }
 
+      await guardUpstream(connection.baseUrl)
       const controller = new AbortController()
       upstreamTimer = setTimeout(() => controller.abort(), limits.upstreamTimeoutMs)
       const upstream = await fetchImpl(upstreamUrl(connection.baseUrl, 'chat/completions'), {
@@ -426,6 +441,7 @@ export function createGatewayServer(options = {}) {
         if (testMatch && request.method === 'POST') {
           const connection = await connectionStore.getWithSecret(testMatch[1])
           if (!connection) throw Object.assign(new Error('Connection tidak ditemukan'), { status: 404 })
+          await guardUpstream(connection.baseUrl)
           const controller = new AbortController()
           const timer = setTimeout(() => controller.abort(), limits.upstreamTimeoutMs)
           let upstream

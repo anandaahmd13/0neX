@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
+import { createCipheriv, scryptSync } from 'node:crypto'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { ConnectionStore } from '../server/gateway/connection-store.mjs'
+import { ConnectionStore, normalizeBaseUrl } from '../server/gateway/connection-store.mjs'
 import { decryptSecret, encryptSecret } from '../server/gateway/secrets.mjs'
+import { isPrivateAddress } from '../server/gateway/net-guard.mjs'
 import { UsageStore } from '../server/gateway/usage-store.mjs'
 
 const MASTER_KEY = '0123456789abcdef0123456789abcdef'
@@ -20,6 +22,60 @@ test('secret encryption round-trips without plaintext leakage', () => {
   assert.throws(
     () => decryptSecret(encrypted, 'abcdef0123456789abcdef0123456789'),
     /tidak bisa didekripsi/,
+  )
+})
+
+test('encryptSecret uses per-secret random salt (version 2) and still reads legacy v1', () => {
+  const a = encryptSecret('sk-rahasia', MASTER_KEY)
+  const b = encryptSecret('sk-rahasia', MASTER_KEY)
+  assert.equal(a.version, 2)
+  assert.equal(typeof a.salt, 'string')
+  assert.notEqual(a.salt, b.salt) // salt acak per-secret
+  assert.notEqual(a.iv, b.iv)
+  assert.equal(decryptSecret(a, MASTER_KEY), 'sk-rahasia')
+
+  // Blob legacy v1 (salt global hardcoded) tetap bisa didekripsi (kompat mundur).
+  const LEGACY_SALT = '0nex-personal-ai-gateway-v1'
+  const legacyIv = Buffer.alloc(12, 7)
+  const legacyKey = scryptSync(MASTER_KEY, LEGACY_SALT, 32)
+  const cipher = createCipheriv('aes-256-gcm', legacyKey, legacyIv)
+  const ciphertext = Buffer.concat([cipher.update('sk-legacy', 'utf8'), cipher.final()])
+  const legacyV1 = {
+    version: 1,
+    algorithm: 'aes-256-gcm',
+    iv: legacyIv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+  }
+  assert.equal(decryptSecret(legacyV1, MASTER_KEY), 'sk-legacy')
+})
+
+test('SSRF guard: normalizeBaseUrl rejects internal IP literals', () => {
+  assert.equal(isPrivateAddress('169.254.169.254'), true)
+  assert.equal(isPrivateAddress('10.0.0.5'), true)
+  assert.equal(isPrivateAddress('192.168.1.1'), true)
+  assert.equal(isPrivateAddress('172.16.0.1'), true)
+  assert.equal(isPrivateAddress('100.64.0.1'), true)
+  assert.equal(isPrivateAddress('8.8.8.8'), false)
+
+  for (const url of [
+    'https://169.254.169.254/latest/meta-data',
+    'https://10.0.0.5/v1',
+    'https://192.168.1.1/v1',
+    'https://[::1]/v1',
+  ]) {
+    assert.throws(() => normalizeBaseUrl(url, { allowInsecureLocalhost: false }), /internal|HTTPS/i)
+  }
+
+  // Host publik tetap diterima.
+  assert.equal(
+    normalizeBaseUrl('https://api.openai.com/v1', { allowInsecureLocalhost: false }),
+    'https://api.openai.com/v1',
+  )
+  // Localhost diizinkan hanya saat allowInsecureLocalhost aktif (dev/test).
+  assert.equal(
+    normalizeBaseUrl('http://127.0.0.1:9876/v1', { allowInsecureLocalhost: true }),
+    'http://127.0.0.1:9876/v1',
   )
 })
 
