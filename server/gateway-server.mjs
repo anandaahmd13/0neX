@@ -1,7 +1,8 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { fileURLToPath } from 'node:url'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { WebSocketServer } from 'ws'
 import { ConnectionStore } from './gateway/connection-store.mjs'
 import {
@@ -14,17 +15,21 @@ import {
 } from './gateway/openai-compatible.mjs'
 import { getProvider, listProviders, registerProvider } from './gateway/provider-registry.mjs'
 import { claudeCliProvider } from './gateway/providers/claude-cli.mjs'
+import { createKiroCliProvider, kiroCliProvider } from './gateway/providers/kiro-cli.mjs'
 import { UsageStore } from './gateway/usage-store.mjs'
 import { createSessionManager, parseCookies, serializeSessionCookie } from './gateway/session.mjs'
 import { assertPublicHost } from './gateway/net-guard.mjs'
 import { RateLimiter } from './gateway/rate-limiter.mjs'
 import { PricingTable } from './gateway/pricing.mjs'
 import { loadAliases } from './gateway/aliases.mjs'
+import { createKiroRunner } from './gateway/kiro-runner.mjs'
 
-try {
-  registerProvider(claudeCliProvider)
-} catch (error) {
-  if (!error.message.includes('duplikat')) throw error
+for (const provider of [claudeCliProvider, kiroCliProvider]) {
+  try {
+    registerProvider(provider)
+  } catch (error) {
+    if (!error.message.includes('duplikat')) throw error
+  }
 }
 
 const DEFAULT_ORIGINS = [
@@ -33,7 +38,6 @@ const DEFAULT_ORIGINS = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
 ]
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const SAFE_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,99}$/i
 const TOOL_POLICIES = new Set(['none', 'read-only', 'standard'])
 
@@ -53,7 +57,28 @@ function cleanText(value, maxLength) {
   return value.trim().slice(0, maxLength)
 }
 
-function parseRun(message, limits) {
+function hasUnsafeSessionCharacter(value) {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)
+    if (
+      character === '/' || character === '\\' || /\s/u.test(character)
+      || codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)
+    ) return true
+  }
+  return false
+}
+
+function parseSessionId(value) {
+  if (value === undefined || value === null || value === '') return randomUUID()
+  if (typeof value !== 'string') throw new Error('sessionId harus berupa string')
+  if (value.length > 200) throw new Error('sessionId melebihi batas 200 karakter')
+  if (hasUnsafeSessionCharacter(value)) {
+    throw new Error('sessionId mengandung whitespace, karakter kontrol, atau separator path')
+  }
+  return value
+}
+
+function parseRun(message, limits, providerForId = getProvider) {
   const prompt = cleanText(message.prompt, limits.maxPromptLength + 1)
   if (!prompt) throw new Error('Prompt kosong')
   if (prompt.length > limits.maxPromptLength) {
@@ -61,11 +86,10 @@ function parseRun(message, limits) {
   }
 
   const providerId = cleanText(message.providerId || 'claude-cli', 100)
-  const provider = getProvider(providerId)
+  const provider = providerForId(providerId)
   if (!provider) throw new Error(`Provider tidak tersedia: ${providerId}`)
 
-  const sessionId = cleanText(message.sessionId, 100) || randomUUID()
-  if (!UUID_PATTERN.test(sessionId)) throw new Error('sessionId bukan UUID valid')
+  const sessionId = parseSessionId(message.sessionId)
 
   const agent = message.agent && typeof message.agent === 'object' ? message.agent : {}
   const agentId = cleanText(agent.id || 'personal-assistant', 100)
@@ -164,6 +188,127 @@ function categoryForStatus(status) {
   return status >= 500 ? 'upstream_server' : 'upstream_request'
 }
 
+function invalidKiroRequest(message, code = 'kiro_unsupported_request') {
+  return Object.assign(new Error(message), { status: 400, code, retryable: false })
+}
+
+function textMessageContent(content, index) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) {
+    throw invalidKiroRequest(`messages[${index}].content harus berupa teks`, 'kiro_text_only')
+  }
+  const parts = []
+  for (const part of content) {
+    if (!part || part.type !== 'text' || typeof part.text !== 'string') {
+      throw invalidKiroRequest('Kiro hanya mendukung content part bertipe text; multimodal tidak didukung', 'kiro_text_only')
+    }
+    parts.push(part.text)
+  }
+  return parts.join('')
+}
+
+function roleSeparated(messages) {
+  return messages.map(({ role, text }) => `[${role}]\n${text}`).join('\n\n')
+}
+
+function parseKiroChatRequest(body, limits) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw invalidKiroRequest('Body chat Kiro harus berupa object', 'invalid_request')
+  }
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    throw invalidKiroRequest('messages wajib berupa array non-kosong', 'invalid_messages')
+  }
+  if (body.n !== undefined && body.n !== 1) {
+    throw invalidKiroRequest('Kiro hanya mendukung n=1', 'kiro_single_choice_only')
+  }
+  for (const field of ['tools', 'tool_choice', 'functions', 'function_call', 'parallel_tool_calls']) {
+    if (body[field] !== undefined) {
+      throw invalidKiroRequest(`Kiro inference-only tidak mendukung ${field}`, 'kiro_tools_unsupported')
+    }
+  }
+  if (body.response_format !== undefined) {
+    throw invalidKiroRequest('Kiro tidak mendukung jaminan response_format', 'kiro_response_format_unsupported')
+  }
+  if (body.audio !== undefined) {
+    throw invalidKiroRequest('Kiro tidak mendukung output audio', 'kiro_audio_unsupported')
+  }
+  if (body.modalities !== undefined) {
+    if (!Array.isArray(body.modalities) || body.modalities.some((modality) => modality !== 'text')) {
+      throw invalidKiroRequest('Kiro hanya mendukung modality text', 'kiro_text_only')
+    }
+  }
+
+  const system = []
+  const conversation = []
+  for (let index = 0; index < body.messages.length; index += 1) {
+    const message = body.messages[index]
+    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+      throw invalidKiroRequest(`messages[${index}] harus berupa object`, 'invalid_messages')
+    }
+    const role = message.role
+    if (!['system', 'developer', 'user', 'assistant'].includes(role)) {
+      throw invalidKiroRequest(`Role ${String(role)} tidak didukung Kiro`, 'kiro_role_unsupported')
+    }
+    if (message.tool_calls !== undefined || message.function_call !== undefined) {
+      throw invalidKiroRequest('Kiro inference-only tidak mendukung riwayat tool call', 'kiro_tools_unsupported')
+    }
+    const entry = { role, text: textMessageContent(message.content, index) }
+    if (role === 'system' || role === 'developer') system.push(entry)
+    else conversation.push(entry)
+  }
+
+  const prompt = roleSeparated(conversation)
+  const systemPrompt = roleSeparated(system)
+  if (!prompt.trim()) throw invalidKiroRequest('Chat Kiro membutuhkan pesan user atau assistant berisi teks', 'invalid_messages')
+  if (prompt.length > limits.maxPromptLength) {
+    throw invalidKiroRequest(`Prompt melebihi batas ${limits.maxPromptLength} karakter`, 'prompt_too_long')
+  }
+  if (systemPrompt.length > limits.maxSystemPromptLength) {
+    throw invalidKiroRequest(`System prompt melebihi batas ${limits.maxSystemPromptLength} karakter`, 'system_prompt_too_long')
+  }
+  return { prompt, systemPrompt }
+}
+
+function kiroAuth(connection) {
+  return connection.authMode === 'api-key'
+    ? { type: 'api-key', secret: connection.apiKey }
+    : { type: 'account-session' }
+}
+
+function mapKiroError(error) {
+  const code = error?.code
+  if (code === 'KIRO_TIMEOUT') {
+    return Object.assign(new Error('Kiro CLI melewati batas waktu'), {
+      status: 504,
+      code: 'kiro_timeout',
+      retryable: true,
+    })
+  }
+  if (code === 'KIRO_CLI_NOT_FOUND' || code === 'KIRO_SPAWN_FAILED') {
+    return Object.assign(new Error('Kiro CLI tidak tersedia'), {
+      status: 503,
+      code: 'kiro_unavailable',
+      retryable: true,
+    })
+  }
+  if (code === 'KIRO_API_KEY_REQUIRED' || code === 'KIRO_INVALID_AUTH') {
+    return Object.assign(new Error('Konfigurasi autentikasi Kiro tidak valid'), {
+      status: 500,
+      code: 'kiro_auth_configuration',
+      retryable: false,
+    })
+  }
+  return Object.assign(new Error('Kiro CLI gagal menyelesaikan permintaan'), {
+    status: 502,
+    code: 'kiro_failed',
+    retryable: true,
+  })
+}
+
+function sseData(response, payload) {
+  response.write(`data: ${JSON.stringify(payload)}\n\n`)
+}
+
 export function createGatewayServer(options = {}) {
   const env = options.env ?? process.env
   const host = options.host ?? env.GATEWAY_WS_HOST ?? env.WS_HOST ?? '127.0.0.1'
@@ -195,6 +340,14 @@ export function createGatewayServer(options = {}) {
   }
   const dataDir = resolve(options.dataDir ?? env.GATEWAY_DATA_DIR ?? '.data/gateway')
   const masterKey = options.masterKey ?? env.GATEWAY_MASTER_KEY
+  const kiroRunner = options.kiroRunner ?? createKiroRunner({ env, dataDir })
+  const providers = options.providers ?? [
+    claudeCliProvider,
+    createKiroCliProvider({ runner: kiroRunner, env }),
+  ]
+  const providerMap = new Map(providers.map((provider) => [provider.id, provider]))
+  const providerForId = (id) => providerMap.get(id) ?? null
+  const providerSummaries = providers.map(({ id, label, capabilities }) => ({ id, label, capabilities }))
 
   // Fail fast: master key wajib ada sebelum server melayani request apa pun.
   // Tanpa ini, gateway boot mulus tapi baru meledak saat menulis connection —
@@ -336,6 +489,176 @@ export function createGatewayServer(options = {}) {
     }
   }
 
+  async function attemptKiro({ connection, upstreamModel, body, request, response, headers, requestId }) {
+    const { prompt, systemPrompt } = parseKiroChatRequest(body, limits)
+    const cwd = join(dataDir, 'kiro', 'inference', connection.id)
+    await mkdir(cwd, { recursive: true, mode: 0o700 })
+
+    const completionId = `chatcmpl_${randomUUID()}`
+    const created = Math.floor(Date.now() / 1000)
+    const model = body.model
+    const chunks = []
+    let outputBytes = 0
+    let responseStarted = false
+    let finished = false
+    let disconnected = false
+    let controller
+
+    const startStream = () => {
+      if (responseStarted || disconnected) return
+      responseStarted = true
+      response.writeHead(200, {
+        ...headers,
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+        'x-request-id': requestId,
+      })
+      sseData(response, {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+      })
+    }
+
+    const detach = () => {
+      request.off('aborted', disconnect)
+      response.off('close', disconnect)
+    }
+    const disconnect = () => {
+      if (finished || response.writableEnded) return
+      disconnected = true
+      controller?.cancel?.()
+      controller?.dispose?.()
+    }
+    request.once('aborted', disconnect)
+    response.once('close', disconnect)
+
+    const outcome = await new Promise((resolveOutcome) => {
+      const settle = (value) => {
+        if (finished) return
+        finished = true
+        detach()
+        resolveOutcome(value)
+      }
+
+      try {
+        controller = kiroRunner.start({
+          prompt,
+          systemPrompt,
+          model: upstreamModel,
+          auth: kiroAuth(connection),
+          allowTools: false,
+          cwd,
+        }, {
+          onChunk(text) {
+            if (finished || disconnected) return
+            const chunk = String(text ?? '')
+            outputBytes += Buffer.byteLength(chunk, 'utf8')
+            if (outputBytes > limits.maxOutputBytes) {
+              controller?.cancel?.()
+              settle({ error: Object.assign(new Error('Respons Kiro melebihi batas output'), {
+                status: 502,
+                code: 'kiro_max_output',
+                retryable: !responseStarted,
+              }) })
+              return
+            }
+            if (body.stream === true) {
+              startStream()
+              sseData(response, {
+                id: completionId,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
+              })
+            } else {
+              chunks.push(chunk)
+            }
+          },
+          onDone(result) {
+            if (disconnected) {
+              settle({ disconnected: true, result })
+              return
+            }
+            if (result?.reason === 'timeout') {
+              settle({ error: Object.assign(new Error('Kiro CLI melewati batas waktu'), {
+                status: 504,
+                code: 'kiro_timeout',
+                retryable: !responseStarted,
+              }) })
+              return
+            }
+            if (result?.reason === 'failed') {
+              settle({ error: mapKiroError(result.error) })
+              return
+            }
+            settle({ result })
+          },
+          onError(_message, error) {
+            settle({ error: mapKiroError(error) })
+          },
+        })
+        controller.done.then(
+          (result) => settle(disconnected ? { disconnected: true, result } : { result }),
+          (error) => settle({ error: mapKiroError(error) }),
+        )
+        if (disconnected) disconnect()
+      } catch (error) {
+        settle({ error: mapKiroError(error) })
+      }
+    })
+
+    if (outcome.disconnected || disconnected) {
+      return { done: true, status: 499, usage: null, errorCategory: 'client_disconnected' }
+    }
+    if (outcome.error) {
+      if (!responseStarted) throw outcome.error
+      sseData(response, {
+        error: {
+          message: outcome.error.message,
+          type: 'gateway_error',
+          code: outcome.error.code ?? 'kiro_failed',
+        },
+      })
+      response.end('data: [DONE]\n\n')
+      return {
+        done: true,
+        status: Number(outcome.error.status) || 502,
+        usage: null,
+        errorCategory: outcome.error.code ?? 'kiro_failed',
+      }
+    }
+
+    if (body.stream === true) {
+      startStream()
+      sseData(response, {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      })
+      response.end('data: [DONE]\n\n')
+    } else {
+      sendJson(response, 200, {
+        id: completionId,
+        object: 'chat.completion',
+        created,
+        model,
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: chunks.join('') },
+          finish_reason: 'stop',
+        }],
+      }, { ...headers, 'x-request-id': requestId })
+    }
+    return { done: true, status: 200, usage: null, errorCategory: null }
+  }
+
   // Proxy generik untuk resource OpenAI-compatible (chat/completions,
   // completions, embeddings). Melakukan resolusi model+alias dan failover
   // ke connection kandidat berikutnya saat kena 429/5xx.
@@ -365,21 +688,41 @@ export function createGatewayServer(options = {}) {
 
         let result
         try {
-          result = await attemptUpstream({
-            resource,
-            connection,
-            upstreamModel: candidate.upstreamModel,
-            body,
-            response,
-            headers,
-            requestId,
-          })
+          if (connection.kind === 'kiro-cli') {
+            if (resource !== 'chat/completions') {
+              throw invalidKiroRequest(
+                `Kiro tidak mendukung endpoint /v1/${resource}`,
+                `kiro_${resource.replace('/', '_')}_unsupported`,
+              )
+            }
+            result = await attemptKiro({
+              connection,
+              upstreamModel: candidate.upstreamModel,
+              body,
+              request,
+              response,
+              headers,
+              requestId,
+            })
+          } else {
+            result = await attemptUpstream({
+              resource,
+              connection,
+              upstreamModel: candidate.upstreamModel,
+              body,
+              response,
+              headers,
+              requestId,
+            })
+          }
         } catch (error) {
-          // Error jaringan/timeout: coba kandidat berikutnya kalau belum kirim header.
-          status = error.name === 'AbortError' ? 504 : 502
-          errorCategory = error.name === 'AbortError' ? 'upstream_timeout' : 'gateway_failure'
+          status = Number(error.status) || (error.name === 'AbortError' ? 504 : 502)
+          errorCategory = error.name === 'AbortError'
+            ? 'upstream_timeout'
+            : error.code ?? 'gateway_failure'
           lastError = error
-          if (hasMore && !response.headersSent) continue
+          const retryable = error.retryable ?? (connection.kind !== 'kiro-cli' && isFailoverStatus(status))
+          if (retryable && hasMore && !response.headersSent) continue
           throw error
         }
 
@@ -603,6 +946,31 @@ export function createGatewayServer(options = {}) {
         if (testMatch && request.method === 'POST') {
           const connection = await connectionStore.getWithSecret(testMatch[1])
           if (!connection) throw Object.assign(new Error('Connection tidak ditemukan'), { status: 404 })
+
+          if (connection.kind === 'kiro-cli') {
+            const cwd = join(dataDir, 'kiro', 'connection-tests', connection.id)
+            await mkdir(cwd, { recursive: true, mode: 0o700 })
+            const auth = kiroAuth(connection)
+            let authenticated
+            let models
+            try {
+              const result = await kiroRunner.checkAuth({ auth, cwd })
+              authenticated = result?.authenticated === true
+              if (!authenticated) {
+                throw Object.assign(new Error('Autentikasi Kiro gagal'), {
+                  status: 401,
+                  code: 'kiro_auth_failed',
+                })
+              }
+              models = await kiroRunner.listModels({ auth, cwd })
+            } catch (error) {
+              if (error.status === 401) throw error
+              throw mapKiroError(error)
+            }
+            sendJson(response, 200, { data: { ok: true, models } }, headers)
+            return
+          }
+
           await guardUpstream(connection.baseUrl)
           const controller = new AbortController()
           const timer = setTimeout(() => controller.abort(), limits.upstreamTimeoutMs)
@@ -690,8 +1058,7 @@ export function createGatewayServer(options = {}) {
     }
 
     let activeRun = null
-    let outputBytes = 0
-    sendSocket(socket, { type: 'hello', protocolVersion: 1, providers: listProviders() })
+    sendSocket(socket, { type: 'hello', protocolVersion: 1, providers: providerSummaries })
 
     socket.on('message', (raw) => {
       let message
@@ -702,7 +1069,7 @@ export function createGatewayServer(options = {}) {
         return
       }
       if (message?.type === 'cancel') {
-        if (activeRun) activeRun.cancel()
+        if (activeRun?.controller) activeRun.controller.cancel()
         else sendSocket(socket, { type: 'error', text: 'Tidak ada run yang aktif' })
         return
       }
@@ -717,50 +1084,63 @@ export function createGatewayServer(options = {}) {
 
       let parsed
       try {
-        parsed = parseRun(message, limits)
+        parsed = parseRun(message, limits, providerForId)
       } catch (error) {
         sendSocket(socket, { type: 'error', text: error.message })
         return
       }
 
-      outputBytes = 0
       const { provider, request } = parsed
+      const runState = { controller: null, outputBytes: 0, terminal: false }
+      activeRun = runState
       sendSocket(socket, { type: 'session', sessionId: request.sessionId, providerId: provider.id, agentId: request.agentId })
       try {
-        activeRun = provider.start(request, {
+        const controller = provider.start(request, {
+          onSession(sessionId) {
+            if (activeRun !== runState || runState.terminal) return
+            sendSocket(socket, { type: 'session', sessionId, providerId: provider.id, agentId: request.agentId })
+          },
           onChunk(text, level) {
-            outputBytes += Buffer.byteLength(text, 'utf8')
-            if (outputBytes > limits.maxOutputBytes) {
+            if (activeRun !== runState || runState.terminal) return
+            runState.outputBytes += Buffer.byteLength(text, 'utf8')
+            if (runState.outputBytes > limits.maxOutputBytes) {
+              runState.terminal = true
               sendSocket(socket, { type: 'error', text: `Output melebihi batas ${limits.maxOutputBytes} byte` })
-              activeRun?.dispose()
-              activeRun = null
+              runState.controller?.dispose()
+              if (activeRun === runState) activeRun = null
               return
             }
             sendSocket(socket, { type: 'chunk', text, level })
           },
           onDone(result) {
+            if (activeRun !== runState || runState.terminal) return
+            runState.terminal = true
             sendSocket(socket, { type: 'done', providerId: provider.id, ...result })
-            activeRun = null
+            if (activeRun === runState) activeRun = null
           },
           onError(text) {
+            if (activeRun !== runState || runState.terminal) return
+            runState.terminal = true
             sendSocket(socket, { type: 'error', text })
-            activeRun = null
+            if (activeRun === runState) activeRun = null
           },
         })
+        runState.controller = controller
+        if (runState.terminal) controller?.dispose?.()
       } catch (error) {
-        activeRun = null
+        runState.terminal = true
+        if (activeRun === runState) activeRun = null
         sendSocket(socket, { type: 'error', text: `Provider gagal dimulai: ${error.message}` })
       }
     })
 
-    socket.on('close', () => {
-      activeRun?.dispose()
+    const disposeActiveRun = () => {
+      const runState = activeRun
       activeRun = null
-    })
-    socket.on('error', () => {
-      activeRun?.dispose()
-      activeRun = null
-    })
+      runState?.controller?.dispose()
+    }
+    socket.on('close', disposeActiveRun)
+    socket.on('error', disposeActiveRun)
   })
 
   return {

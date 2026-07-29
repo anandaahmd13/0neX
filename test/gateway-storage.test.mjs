@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createCipheriv, scryptSync } from 'node:crypto'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -120,6 +120,172 @@ test('connection store persists encrypted keys and returns public projections', 
 
   await reloaded.delete('local-provider')
   assert.deepEqual(await reloaded.list(), [])
+})
+
+test('connection store migrates legacy records and defaults new input to openai-http', async () => {
+  const dataDir = await temporaryDirectory()
+  const encryptedApiKey = encryptSecret('sk-legacy-provider', MASTER_KEY)
+  await writeFile(join(dataDir, 'connections.json'), `${JSON.stringify({
+    version: 1,
+    connections: [{
+      id: 'legacy-provider',
+      name: 'Legacy Provider',
+      baseUrl: 'https://api.example.com/v1',
+      models: ['legacy/model'],
+      enabled: true,
+      encryptedApiKey,
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    }],
+  })}\n`, { mode: 0o600 })
+
+  const store = new ConnectionStore({ dataDir, masterKey: MASTER_KEY })
+  const [legacy] = await store.list()
+  assert.equal(legacy.kind, 'openai-http')
+  assert.equal(legacy.hasApiKey, true)
+  assert.equal((await store.getWithSecret('legacy-provider')).apiKey, 'sk-legacy-provider')
+
+  const created = await store.create({
+    id: 'new-provider',
+    name: 'New Provider',
+    baseUrl: 'https://new.example.com/v1',
+    apiKey: 'sk-new-provider',
+    models: [],
+  })
+  assert.equal(created.kind, 'openai-http')
+  assert.equal(created.hasApiKey, true)
+  assert.equal('authMode' in created, false)
+})
+
+test('Kiro connection modes validate, encrypt, redact, and clear incompatible secrets', async () => {
+  const dataDir = await temporaryDirectory()
+  const store = new ConnectionStore({ dataDir, masterKey: MASTER_KEY })
+
+  const account = await store.create({
+    id: 'kiro-account',
+    name: 'Kiro Account',
+    kind: 'kiro-cli',
+    authMode: 'account-session',
+    apiKey: 'must-not-be-stored-for-account-mode',
+    models: ['kiro-auto'],
+  })
+  assert.deepEqual({
+    kind: account.kind,
+    authMode: account.authMode,
+    hasApiKey: account.hasApiKey,
+    hasBaseUrl: 'baseUrl' in account,
+  }, {
+    kind: 'kiro-cli',
+    authMode: 'account-session',
+    hasApiKey: false,
+    hasBaseUrl: false,
+  })
+  assert.equal((await store.getWithSecret('kiro-account')).apiKey, undefined)
+
+  await assert.rejects(
+    store.create({
+      id: 'kiro-missing-key',
+      name: 'Kiro Missing Key',
+      kind: 'kiro-cli',
+      authMode: 'api-key',
+      models: [],
+    }),
+    /API key wajib diisi/,
+  )
+  await assert.rejects(
+    store.create({
+      id: 'kiro-bad-mode',
+      name: 'Kiro Bad Mode',
+      kind: 'kiro-cli',
+      authMode: 'browser-magic',
+      models: [],
+    }),
+    /authMode Kiro/,
+  )
+
+  const secret = 'ksk_store_super_secret'
+  const keyed = await store.create({
+    id: 'kiro-keyed',
+    name: 'Kiro Keyed',
+    kind: 'kiro-cli',
+    authMode: 'api-key',
+    apiKey: secret,
+    models: ['vendor/model:v1@2026'],
+  })
+  assert.equal(keyed.hasApiKey, true)
+  assert.equal('apiKey' in keyed, false)
+  assert.equal('encryptedApiKey' in keyed, false)
+  assert.equal('baseUrl' in keyed, false)
+  assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, secret)
+  assert.equal((await readFile(join(dataDir, 'connections.json'), 'utf8')).includes(secret), false)
+
+  await store.update('kiro-keyed', { name: 'Blank Preserves', apiKey: '   ' })
+  assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, secret)
+
+  const accountSwitched = await store.update('kiro-keyed', { authMode: 'account-session' })
+  assert.equal(accountSwitched.hasApiKey, false)
+  assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, undefined)
+  await assert.rejects(
+    store.update('kiro-keyed', { authMode: 'api-key' }),
+    /API key wajib diisi saat beralih/,
+  )
+
+  const keyedAgain = await store.update('kiro-keyed', {
+    authMode: 'api-key',
+    apiKey: 'ksk_replacement',
+  })
+  assert.equal(keyedAgain.hasApiKey, true)
+  assert.equal((await store.getWithSecret('kiro-keyed')).apiKey, 'ksk_replacement')
+  const clearedAgain = await store.update('kiro-keyed', { authMode: 'account-session' })
+  assert.equal(clearedAgain.hasApiKey, false)
+
+  await assert.rejects(
+    store.create({
+      id: 'wrong-kind',
+      name: 'Wrong Kind',
+      kind: 'other',
+      models: [],
+    }),
+    /kind harus/,
+  )
+})
+
+test('switching connection kinds only preserves compatible secrets', async () => {
+  const dataDir = await temporaryDirectory()
+  const store = new ConnectionStore({ dataDir, masterKey: MASTER_KEY })
+  await store.create({
+    id: 'switchable',
+    name: 'Switchable',
+    baseUrl: 'https://api.example.com/v1',
+    apiKey: 'sk-openai-secret',
+    models: ['model-a'],
+  })
+
+  const account = await store.update('switchable', {
+    kind: 'kiro-cli',
+    authMode: 'account-session',
+    models: ['kiro-auto'],
+  })
+  assert.equal(account.hasApiKey, false)
+  assert.equal('baseUrl' in account, false)
+
+  await assert.rejects(
+    store.update('switchable', {
+      kind: 'openai-http',
+      baseUrl: 'https://api.example.com/v1',
+    }),
+    /API key wajib diisi saat beralih/,
+  )
+
+  const openai = await store.update('switchable', {
+    kind: 'openai-http',
+    baseUrl: 'https://api.example.com/v1',
+    apiKey: 'sk-fresh-openai',
+    models: ['model-a'],
+  })
+  assert.equal(openai.kind, 'openai-http')
+  assert.equal(openai.hasApiKey, true)
+  assert.equal('authMode' in openai, false)
 })
 
 test('usage store aggregates metadata without storing prompt or completion', async () => {

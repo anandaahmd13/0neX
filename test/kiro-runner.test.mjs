@@ -1,0 +1,384 @@
+import assert from 'node:assert/strict'
+import { access, mkdtemp, readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import test from 'node:test'
+import { createKiroRunner, parseKiroModelList } from '../server/gateway/kiro-runner.mjs'
+
+const TEST_DIR = dirname(fileURLToPath(import.meta.url))
+const FIXTURE = join(TEST_DIR, 'fixtures', 'kiro-cli-fixture.mjs')
+
+async function setup(mode = 'normal', overrides = {}) {
+  const root = await mkdtemp(join(tmpdir(), '0nex-kiro-runner-'))
+  const dataDir = join(root, 'gateway-data')
+  const recordFile = join(root, 'fixture.jsonl')
+  const env = {
+    PATH: process.env.PATH,
+    HOME: join(root, 'normal-home'),
+    USERPROFILE: join(root, 'normal-home'),
+    KIRO_API_KEY: 'inherited-key-that-must-not-win',
+    KIRO_FIXTURE_MODE: mode,
+    KIRO_FIXTURE_RECORD: recordFile,
+    ...overrides.env,
+  }
+  const runner = createKiroRunner({
+    executable: overrides.executable ?? FIXTURE,
+    env,
+    dataDir,
+    timeoutMs: overrides.timeoutMs ?? 1_000,
+    killGraceMs: overrides.killGraceMs ?? 30,
+    maxOutputBytes: overrides.maxOutputBytes ?? 100_000,
+  })
+  return { root, dataDir, recordFile, env, runner }
+}
+
+async function records(path) {
+  const raw = await readFile(path, 'utf8')
+  return raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+}
+
+function rpcMessages(entries) {
+  return entries.filter((entry) => entry.type === 'rpc').map((entry) => entry.message)
+}
+
+async function runStart(runner, request) {
+  const chunks = []
+  const errors = []
+  const completed = []
+  const sessions = []
+  const controller = runner.start(request, {
+    onSession: (sessionId) => sessions.push(sessionId),
+    onChunk: (chunk) => chunks.push(chunk),
+    onDone: (result) => completed.push(result),
+    onError: (message, error) => errors.push({ message, error }),
+  })
+  const result = await controller.done
+  return { controller, chunks, errors, completed, sessions, result }
+}
+
+test('parseKiroModelList only returns explicit IDs from known containers', () => {
+  assert.deepEqual(parseKiroModelList({
+    models: [{ id: 'model-a', name: 'A' }, { modelId: 'model-b' }, 'model-c', { name: 'display only' }],
+    data: [{ model_id: 'model-d' }],
+    unrelated: { id: 'not-a-model' },
+  }), ['model-a', 'model-b', 'model-c', 'model-d'])
+})
+
+test('whoami/checkAuth and model listing use real CLI subprocesses', async () => {
+  const { runner, recordFile, env } = await setup()
+
+  const identity = await runner.whoami({ auth: { type: 'account-session' } })
+  assert.equal(identity.authMethod, 'account-session')
+  assert.deepEqual(await runner.checkAuth({ auth: { type: 'account-session' } }), {
+    authenticated: true,
+    identity: {
+      authenticated: true,
+      authMethod: 'account-session',
+      user: 'fixture-user',
+    },
+  })
+  assert.deepEqual(await runner.listModels({ auth: { type: 'account-session' } }), [
+    'kiro-auto',
+    'claude-sonnet-4',
+    'kiro-fast',
+    'raw-model-id',
+  ])
+
+  const entries = await records(recordFile)
+  assert.deepEqual(entries.map((entry) => entry.args), [
+    ['whoami', '--format', 'json'],
+    ['whoami', '--format', 'json'],
+    ['chat', '--list-models', '--format', 'json'],
+  ])
+  for (const entry of entries) {
+    assert.equal(entry.home, env.HOME)
+    assert.equal(entry.apiKeyPresent, false)
+  }
+})
+
+test('api-key auth gets isolated HOME and never puts its secret in args or parent env', async () => {
+  const { runner, dataDir, recordFile } = await setup()
+  const secret = 'ksk_fixture_super_secret'
+  const parentValue = process.env.KIRO_API_KEY
+
+  const identity = await runner.whoami({ auth: { type: 'api-key', secret } })
+  assert.equal(identity.authMethod, 'api-key')
+  assert.equal(process.env.KIRO_API_KEY, parentValue)
+
+  const raw = await readFile(recordFile, 'utf8')
+  assert.equal(raw.includes(secret), false)
+  const [spawnRecord] = await records(recordFile)
+  assert.equal(spawnRecord.apiKeyPresent, true)
+  assert.deepEqual(spawnRecord.args, ['whoami', '--format', 'json'])
+  assert.equal(spawnRecord.args.some((arg) => arg.includes(secret)), false)
+  assert.equal(spawnRecord.home.startsWith(join(dataDir, 'kiro', 'api-key') + '/'), true)
+  assert.equal(spawnRecord.userProfile, spawnRecord.home)
+  await access(spawnRecord.home)
+})
+
+test('authentication failures redact API-key secrets', async () => {
+  const { runner } = await setup('command-fail')
+  const secret = 'ksk_failure_must_be_redacted'
+
+  const result = await runner.checkAuth({ auth: { type: 'api-key', secret } })
+  assert.equal(result.authenticated, false)
+  assert.equal(result.error.includes(secret), false)
+  assert.match(result.error, /\[redacted\]/)
+})
+
+test('new session initializes ACP, sets model, streams fragmented chunks, and completes', async () => {
+  const { runner, recordFile } = await setup()
+  const cwd = resolve(TEST_DIR)
+  const execution = await runStart(runner, {
+    sessionId: 'caller-id-is-not-used-for-new',
+    resume: false,
+    model: 'claude-sonnet-4',
+    prompt: 'hello',
+    systemPrompt: 'answer briefly',
+    toolPolicy: 'none',
+    auth: { type: 'account-session' },
+    cwd,
+  })
+
+  assert.deepEqual(execution.chunks, ['hello ', 'from fixture'])
+  assert.equal(execution.errors.length, 0)
+  assert.equal(execution.completed.length, 1)
+  assert.equal(execution.result.sessionId, 'fixture-new-session')
+  assert.equal(execution.result.reason, 'end_turn')
+  assert.deepEqual(execution.sessions, ['fixture-new-session'])
+
+  const messages = rpcMessages(await records(recordFile))
+  assert.deepEqual(messages.map((message) => message.method), [
+    'initialize',
+    'session/new',
+    'session/set_model',
+    'session/prompt',
+  ])
+  assert.equal(messages[0].params.protocolVersion, 1)
+  assert.deepEqual(messages[0].params.clientCapabilities, {})
+  assert.deepEqual(messages[1].params, { cwd, mcpServers: [] })
+  assert.deepEqual(messages[2].params, {
+    sessionId: 'fixture-new-session',
+    modelId: 'claude-sonnet-4',
+  })
+  assert.deepEqual(messages[3].params.prompt, [{
+    type: 'text',
+    text: '<system-instructions>\nanswer briefly\n</system-instructions>\n\nhello',
+  }])
+})
+
+test('resume uses session/load and preserves requested session ID', async () => {
+  const { runner, recordFile } = await setup()
+  const execution = await runStart(runner, {
+    sessionId: 'existing-session',
+    resume: true,
+    prompt: 'continue',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+
+  assert.equal(execution.result.sessionId, 'existing-session')
+  assert.equal(execution.result.reason, 'end_turn')
+  assert.deepEqual(execution.sessions, ['existing-session'])
+  const messages = rpcMessages(await records(recordFile))
+  assert.deepEqual(messages.map((message) => message.method), [
+    'initialize',
+    'session/load',
+    'session/prompt',
+  ])
+  assert.equal(messages[1].params.sessionId, 'existing-session')
+})
+
+test('resume ignores replayed history from session/load', async () => {
+  const { runner } = await setup('load-replay')
+  const execution = await runStart(runner, {
+    sessionId: 'existing-session',
+    resume: true,
+    prompt: 'continue',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+
+  assert.deepEqual(execution.chunks, ['hello ', 'from fixture'])
+  assert.equal(execution.chunks.includes('old replayed output'), false)
+  assert.equal(execution.result.reason, 'end_turn')
+})
+
+test('TurnEnd completes a run when session/prompt response is absent', async () => {
+  const { runner } = await setup('turnend-only')
+  const execution = await runStart(runner, {
+    resume: false,
+    prompt: 'finish from notification',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+
+  assert.deepEqual(execution.chunks, ['hello ', 'from fixture'])
+  assert.equal(execution.errors.length, 0)
+  assert.equal(execution.result.reason, 'end_turn')
+  assert.equal(execution.result.stopReason, 'end_turn')
+})
+
+test('cancel sends session/cancel and reports a cancelled turn', async () => {
+  const { runner, recordFile } = await setup('cancel')
+  const chunks = []
+  const controller = runner.start({
+    resume: false,
+    prompt: 'wait',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  }, {
+    onChunk: (chunk) => {
+      chunks.push(chunk)
+      if (chunk === 'waiting for cancel') controller.cancel()
+    },
+  })
+
+  const result = await controller.done
+  assert.deepEqual(chunks, ['waiting for cancel'])
+  assert.equal(result.reason, 'cancelled')
+  const entries = await records(recordFile)
+  assert.equal(rpcMessages(entries).some((message) => message.method === 'session/cancel'), true)
+  assert.equal(entries.some((entry) => entry.type === 'cancel' && entry.sessionId === 'fixture-new-session'), true)
+})
+
+test('dispose sends session/cancel before process termination', async () => {
+  const { runner, recordFile } = await setup('cancel', { killGraceMs: 20 })
+  let controller
+  controller = runner.start({
+    resume: false,
+    prompt: 'wait',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  }, {
+    onChunk: (chunk) => {
+      if (chunk === 'waiting for cancel') controller.dispose()
+    },
+  })
+
+  const result = await controller.done
+  assert.equal(result.reason, 'disposed')
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
+  const entries = await records(recordFile)
+  assert.equal(rpcMessages(entries).some((message) => message.method === 'session/cancel'), true)
+  assert.equal(entries.some((entry) => entry.type === 'cancel' && entry.sessionId === 'fixture-new-session'), true)
+})
+
+test('inference-only mode rejects permission requests instead of granting tools', async () => {
+  const { runner, recordFile } = await setup('permission')
+  const execution = await runStart(runner, {
+    resume: false,
+    prompt: 'try a tool',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+
+  assert.equal(execution.errors.length, 0)
+  assert.deepEqual(execution.chunks, ['permission denied safely'])
+  const entries = await records(recordFile)
+  const permission = entries.find((entry) => entry.type === 'permission-response')?.message
+  assert.deepEqual(permission.result, {
+    outcome: { outcome: 'selected', optionId: 'reject' },
+  })
+})
+
+test('inference-only mode fails clearly if a tool starts without permission', async () => {
+  const { runner, recordFile } = await setup('active-tool')
+  const execution = await runStart(runner, {
+    resume: false,
+    prompt: 'start a tool',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+
+  assert.equal(execution.result.reason, 'failed')
+  assert.equal(execution.result.error.code, 'KIRO_TOOLS_UNSUPPORTED')
+  assert.match(execution.errors[0].message, /inference-only/)
+  const messages = rpcMessages(await records(recordFile))
+  assert.equal(messages.some((message) => message.method === 'session/cancel'), true)
+})
+
+test('malformed command output and oversized output return stable errors', async () => {
+  const malformed = await setup('malformed-command')
+  await assert.rejects(
+    malformed.runner.listModels({ auth: { type: 'account-session' } }),
+    (error) => error.code === 'KIRO_MALFORMED_OUTPUT' && !error.message.includes('not-json'),
+  )
+
+  const oversized = await setup('oversized-command', { maxOutputBytes: 100 })
+  await assert.rejects(
+    oversized.runner.listModels({ auth: { type: 'account-session' } }),
+    (error) => error.code === 'KIRO_MAX_OUTPUT',
+  )
+})
+
+test('oversized command output force-kills a child that ignores SIGTERM', async () => {
+  const { runner, recordFile } = await setup('oversized-command-hang', {
+    maxOutputBytes: 100,
+    killGraceMs: 20,
+  })
+  await assert.rejects(
+    runner.listModels({ auth: { type: 'account-session' } }),
+    (error) => error.code === 'KIRO_MAX_OUTPUT',
+  )
+
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  const entries = await records(recordFile)
+  const spawn = entries.find((entry) => entry.type === 'spawn')
+  assert.equal(entries.some((entry) => entry.type === 'signal' && entry.signal === 'SIGTERM'), true)
+  assert.throws(
+    () => process.kill(spawn.pid, 0),
+    (error) => error.code === 'ESRCH',
+  )
+})
+
+test('missing executable and command timeout are mapped deterministically', async () => {
+  const missing = await setup('normal', { executable: join(tmpdir(), 'definitely-missing-kiro-cli') })
+  await assert.rejects(
+    missing.runner.whoami({ auth: { type: 'account-session' } }),
+    (error) => error.code === 'KIRO_CLI_NOT_FOUND',
+  )
+
+  const timeout = await setup('timeout', { timeoutMs: 40, killGraceMs: 20 })
+  await assert.rejects(
+    timeout.runner.whoami({ auth: { type: 'account-session' } }),
+    (error) => error.code === 'KIRO_TIMEOUT',
+  )
+})
+
+test('malformed ACP and ACP timeout terminate the subprocess safely', async () => {
+  const malformed = await setup('malformed-acp')
+  const malformedRun = await runStart(malformed.runner, {
+    resume: false,
+    prompt: 'hello',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+  assert.equal(malformedRun.result.reason, 'failed')
+  assert.equal(malformedRun.result.error.code, 'KIRO_ACP_MALFORMED_JSON')
+
+  const timeout = await setup('acp-timeout', { timeoutMs: 40, killGraceMs: 20 })
+  const timedRun = await runStart(timeout.runner, {
+    resume: false,
+    prompt: 'hello',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+  assert.equal(timedRun.result.reason, 'timeout')
+  assert.equal(timedRun.result.error.code, 'KIRO_TIMEOUT')
+})
+
+test('broken ACP stdin returns a controlled error instead of crashing on EPIPE', async () => {
+  const { runner } = await setup('broken-stdin', { timeoutMs: 2_000, killGraceMs: 20 })
+  const execution = await runStart(runner, {
+    resume: false,
+    prompt: 'hello',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+
+  assert.equal(execution.result.reason, 'failed')
+  assert.equal(execution.result.error.code, 'KIRO_ACP_CLOSED')
+  assert.equal(execution.errors.length, 1)
+})

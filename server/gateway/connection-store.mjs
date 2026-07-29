@@ -6,6 +6,8 @@ import { isPrivateAddress } from './net-guard.mjs'
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/
 const MODEL_PATTERN = /^[^\s/][^\s]{0,199}$/
+const CONNECTION_KINDS = new Set(['openai-http', 'kiro-cli'])
+const KIRO_AUTH_MODES = new Set(['account-session', 'api-key'])
 
 function cleanText(value, label, maxLength = 200) {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} wajib diisi`)
@@ -22,6 +24,22 @@ function normalizeModels(value) {
     if (!MODEL_PATTERN.test(model)) throw new Error(`Model tidak valid: ${model}`)
   }
   return models
+}
+
+function normalizeKind(value) {
+  const kind = value ?? 'openai-http'
+  if (!CONNECTION_KINDS.has(kind)) {
+    throw new Error('kind harus openai-http atau kiro-cli')
+  }
+  return kind
+}
+
+function normalizeAuthMode(value) {
+  const authMode = value ?? 'api-key'
+  if (!KIRO_AUTH_MODES.has(authMode)) {
+    throw new Error('authMode Kiro harus account-session atau api-key')
+  }
+  return authMode
 }
 
 export function normalizeBaseUrl(value, { allowInsecureLocalhost = false } = {}) {
@@ -58,18 +76,67 @@ export function validateConnectionInput(input, options = {}) {
     throw new Error('ID connection hanya boleh huruf kecil, angka, dan tanda hubung')
   }
 
-  return {
+  const kind = normalizeKind(input?.kind)
+  const common = {
     id,
     name: cleanText(input?.name, 'Nama connection', 100),
-    baseUrl: normalizeBaseUrl(input?.baseUrl, options),
+    kind,
     models: normalizeModels(input?.models ?? []),
     enabled: input?.enabled !== false,
   }
+
+  if (kind === 'kiro-cli') {
+    return { ...common, authMode: normalizeAuthMode(input?.authMode) }
+  }
+
+  return {
+    ...common,
+    baseUrl: normalizeBaseUrl(input?.baseUrl, options),
+  }
+}
+
+function normalizeStoredConnection(connection) {
+  const kind = normalizeKind(connection?.kind)
+  if (kind === 'kiro-cli') {
+    const {
+      baseUrl: _baseUrl,
+      encryptedApiKey,
+      ...rest
+    } = connection
+    const authMode = normalizeAuthMode(
+      connection.authMode ?? (encryptedApiKey ? 'api-key' : 'account-session'),
+    )
+    return {
+      ...rest,
+      kind,
+      authMode,
+      ...(authMode === 'api-key' && encryptedApiKey ? { encryptedApiKey } : {}),
+    }
+  }
+  const { authMode: _authMode, ...rest } = connection
+  return { ...rest, kind }
 }
 
 function publicConnection(connection) {
-  const { encryptedApiKey: _encryptedApiKey, ...safe } = connection
+  const { encryptedApiKey: _encryptedApiKey, ...safe } = normalizeStoredConnection(connection)
   return { ...safe, hasApiKey: Boolean(connection.encryptedApiKey) }
+}
+
+function usesSecret(connection) {
+  return connection.kind === 'openai-http'
+    || (connection.kind === 'kiro-cli' && connection.authMode === 'api-key')
+}
+
+function compatibleSecret(current, next) {
+  if (!current.encryptedApiKey || current.kind !== next.kind) return false
+  if (next.kind === 'openai-http') return true
+  return current.authMode === 'api-key' && next.authMode === 'api-key'
+}
+
+function suppliedApiKey(input) {
+  return typeof input?.apiKey === 'string' && input.apiKey.trim()
+    ? cleanText(input.apiKey, 'API key', 10_000)
+    : null
 }
 
 export class ConnectionStore {
@@ -86,7 +153,9 @@ export class ConnectionStore {
     await mkdir(dirname(this.filePath), { recursive: true })
     try {
       const parsed = JSON.parse(await readFile(this.filePath, 'utf8'))
-      this.connections = Array.isArray(parsed.connections) ? parsed.connections : []
+      this.connections = Array.isArray(parsed.connections)
+        ? parsed.connections.map(normalizeStoredConnection)
+        : []
     } catch (error) {
       if (error.code !== 'ENOENT') throw new Error(`Gagal membaca connection store: ${error.message}`)
       this.connections = []
@@ -95,7 +164,7 @@ export class ConnectionStore {
 
   async persist() {
     const temporaryPath = `${this.filePath}.${process.pid}.tmp`
-    const payload = JSON.stringify({ version: 1, connections: this.connections }, null, 2)
+    const payload = JSON.stringify({ version: 2, connections: this.connections }, null, 2)
     await writeFile(temporaryPath, `${payload}\n`, { encoding: 'utf8', mode: 0o600 })
     await rename(temporaryPath, this.filePath)
   }
@@ -128,7 +197,9 @@ export class ConnectionStore {
     if (!connection) return null
     return {
       ...publicConnection(connection),
-      apiKey: decryptSecret(connection.encryptedApiKey, this.masterKey),
+      apiKey: connection.encryptedApiKey
+        ? decryptSecret(connection.encryptedApiKey, this.masterKey)
+        : undefined,
     }
   }
 
@@ -140,11 +211,19 @@ export class ConnectionStore {
       if (this.connections.some((item) => item.id === normalized.id)) {
         throw new Error(`Connection sudah ada: ${normalized.id}`)
       }
-      const apiKey = cleanText(input.apiKey, 'API key', 10_000)
+
+      const apiKey = suppliedApiKey(input)
+      if (usesSecret(normalized) && !apiKey) {
+        throw new Error(normalized.kind === 'kiro-cli'
+          ? 'API key wajib diisi untuk authMode api-key'
+          : 'API key wajib diisi')
+      }
       const now = new Date().toISOString()
       const connection = {
         ...normalized,
-        encryptedApiKey: encryptSecret(apiKey, this.masterKey),
+        ...(usesSecret(normalized) && apiKey
+          ? { encryptedApiKey: encryptSecret(apiKey, this.masterKey) }
+          : {}),
         createdAt: now,
         updatedAt: now,
       }
@@ -157,20 +236,37 @@ export class ConnectionStore {
     return this.mutate(() => {
       const index = this.connections.findIndex((item) => item.id === id)
       if (index === -1) throw new Error(`Connection tidak ditemukan: ${id}`)
-      const current = this.connections[index]
-      const normalized = validateConnectionInput(
-        { ...current, ...input, id: current.id },
-        { allowInsecureLocalhost: this.allowInsecureLocalhost },
-      )
-      const encryptedApiKey = input.apiKey
-        ? encryptSecret(cleanText(input.apiKey, 'API key', 10_000), this.masterKey)
-        : current.encryptedApiKey
+      const current = normalizeStoredConnection(this.connections[index])
+      const requestedKind = input?.kind ?? current.kind
+      const merged = { ...current, ...input, id: current.id, kind: requestedKind }
+      if (requestedKind === 'kiro-cli' && input?.authMode === undefined) {
+        merged.authMode = current.kind === 'kiro-cli' ? current.authMode : 'api-key'
+      }
+      const normalized = validateConnectionInput(merged, {
+        allowInsecureLocalhost: this.allowInsecureLocalhost,
+      })
+
+      const apiKey = suppliedApiKey(input)
+      let encryptedApiKey
+      if (usesSecret(normalized)) {
+        if (apiKey) encryptedApiKey = encryptSecret(apiKey, this.masterKey)
+        else if (compatibleSecret(current, normalized)) encryptedApiKey = current.encryptedApiKey
+        else {
+          throw new Error(normalized.kind === 'kiro-cli'
+            ? 'API key wajib diisi saat beralih ke authMode api-key'
+            : 'API key wajib diisi saat beralih ke openai-http')
+        }
+      }
+
       const connection = {
         ...current,
         ...normalized,
         encryptedApiKey,
         updatedAt: new Date().toISOString(),
       }
+      if (normalized.kind === 'kiro-cli') delete connection.baseUrl
+      else delete connection.authMode
+      if (!encryptedApiKey) delete connection.encryptedApiKey
       this.connections[index] = connection
       return publicConnection(connection)
     })
