@@ -20,6 +20,7 @@ import {
   type ConnectionInput,
   type GatewayConnection,
   type GatewayUsageData,
+  type KiroRegion,
   type UsageRange,
 } from '../lib/gatewayApi'
 import { fmtCompact, fmtInt, fmtTime, fmtUsd } from '../lib/format'
@@ -40,6 +41,16 @@ const emptyForm: ConnectionInput = {
   baseUrl: 'https://api.openai.com/v1',
   apiKey: '',
   models: [],
+  enabled: true,
+}
+
+const emptyKiroForm: ConnectionInput = {
+  id: 'kiro-main',
+  name: 'Kiro Personal',
+  kind: 'kiro-cli',
+  apiKey: '',
+  region: 'us-east-1',
+  models: ['auto'],
   enabled: true,
 }
 
@@ -298,10 +309,12 @@ function ConnectionsPanel({
   const [editingId, setEditingId] = useState<string | null>(null)
   const [form, setForm] = useState<ConnectionInput>(emptyForm)
   const [modelsText, setModelsText] = useState('')
+  const [kiroOpen, setKiroOpen] = useState(false)
+  const [kiroEditingId, setKiroEditingId] = useState<string | null>(null)
+  const [kiroForm, setKiroForm] = useState<ConnectionInput>(emptyKiroForm)
+  const [kiroError, setKiroError] = useState('')
   const [saving, setSaving] = useState(false)
   const [testingId, setTestingId] = useState<string | null>(null)
-  const validatesKiroCredential =
-    form.kind === 'kiro-cli' && (!editingId || Boolean(form.apiKey?.trim()))
 
   function openCreate() {
     setEditingId(null)
@@ -310,13 +323,36 @@ function ConnectionsPanel({
     setFormOpen(true)
   }
 
+  function openKiroCreate() {
+    setKiroEditingId(null)
+    setKiroForm({ ...emptyKiroForm })
+    setKiroError('')
+    setKiroOpen(true)
+  }
+
   function openEdit(connection: GatewayConnection, discoveredModels?: string[]) {
-    const models = connection.kind === 'kiro-cli' ? ['auto'] : (discoveredModels ?? connection.models)
+    if (connection.kind === 'kiro-cli') {
+      setKiroEditingId(connection.id)
+      setKiroForm({
+        id: connection.id,
+        name: connection.name,
+        kind: 'kiro-cli',
+        apiKey: '',
+        region: connection.region ?? 'us-east-1',
+        models: ['auto'],
+        enabled: connection.enabled,
+      })
+      setKiroError('')
+      setKiroOpen(true)
+      return
+    }
+
+    const models = discoveredModels ?? connection.models
     setEditingId(connection.id)
     setForm({
       id: connection.id,
       name: connection.name,
-      kind: connection.kind,
+      kind: 'openai-http',
       baseUrl: connection.baseUrl,
       apiKey: '',
       models,
@@ -333,35 +369,23 @@ function ConnectionsPanel({
     setFormOpen(false)
   }
 
-  function changeKind(kind: ConnectionInput['kind']) {
-    setForm((current) => kind === 'kiro-cli'
-      ? { ...current, kind, baseUrl: undefined, apiKey: '', models: ['auto'] }
-      : {
-          ...current,
-          kind,
-          baseUrl: current.baseUrl || 'https://api.openai.com/v1',
-          apiKey: '',
-          models: [],
-        })
-    setModelsText(kind === 'kiro-cli' ? 'auto' : '')
+  function closeKiro() {
+    setKiroForm((current) => ({ ...current, apiKey: '' }))
+    setKiroError('')
+    setKiroEditingId(null)
+    setKiroOpen(false)
   }
 
   async function submit() {
     const payload: ConnectionInput = {
       ...form,
-      models: form.kind === 'kiro-cli' ? ['auto'] : textToModels(modelsText),
-      baseUrl: form.kind === 'openai-http' ? form.baseUrl : undefined,
+      kind: 'openai-http',
+      models: textToModels(modelsText),
     }
     if (!editingId && !payload.apiKey?.trim()) {
-      push(
-        payload.kind === 'kiro-cli'
-          ? 'Kiro/CodeWhisperer API key wajib untuk bearer credential baru'
-          : 'API key wajib untuk connection baru',
-        'error',
-      )
+      push('API key wajib untuk connection baru', 'error')
       return
     }
-    const storesKiroBearer = payload.kind === 'kiro-cli' && Boolean(payload.apiKey?.trim())
     setSaving(true)
     try {
       if (editingId) {
@@ -372,15 +396,42 @@ function ConnectionsPanel({
         await gatewayApi.createConnection(payload)
       }
       closeForm()
-      push(
-        storesKiroBearer
-          ? 'AWS validated · bearer credential stored'
-          : editingId ? 'Connection diperbarui' : 'Connection ditambahkan',
-        'success',
-      )
+      push(editingId ? 'Connection diperbarui' : 'Connection ditambahkan', 'success')
       await onChanged()
     } catch (error) {
       push(error instanceof Error ? error.message : 'Gagal menyimpan connection', 'error')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function submitKiro() {
+    if (!kiroEditingId && !kiroForm.apiKey?.trim()) return
+    setSaving(true)
+    setKiroError('')
+    try {
+      if (kiroEditingId) {
+        const updatePayload: Partial<ConnectionInput> = {
+          name: kiroForm.name,
+          kind: 'kiro-cli',
+          region: kiroForm.region,
+          models: ['auto'],
+          enabled: kiroForm.enabled,
+        }
+        if (kiroForm.apiKey?.trim()) updatePayload.apiKey = kiroForm.apiKey
+        await gatewayApi.updateConnection(kiroEditingId, updatePayload)
+      } else {
+        await gatewayApi.createConnection({
+          ...kiroForm,
+          kind: 'kiro-cli',
+          models: ['auto'],
+        })
+      }
+      closeKiro()
+      await onChanged()
+      push('AWS validated · bearer credential stored', 'success')
+    } catch (error) {
+      setKiroError(error instanceof Error ? error.message : 'AWS validation failed')
     } finally {
       setSaving(false)
     }
@@ -423,7 +474,10 @@ function ConnectionsPanel({
           <h2 className="font-brand text-xl font-bold">Provider connections</h2>
           <p className="mt-1 text-xs text-ink/60">Provider credentials disimpan server-side dan tidak pernah dikirim balik ke browser.</p>
         </div>
-        <Button size="sm" onClick={openCreate}><PlusIcon width={15} height={15} />Tambah</Button>
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button variant="secondary" size="sm" onClick={openKiroCreate}>Connect Kiro</Button>
+          <Button size="sm" onClick={openCreate}><PlusIcon width={15} height={15} />Tambah HTTP</Button>
+        </div>
       </div>
 
       {error && <ErrorCard message={error} onRetry={onReload} />}
@@ -461,11 +515,14 @@ function ConnectionsPanel({
                       : connection.hasApiKey ? 'key tersimpan' : 'tanpa key'}
                   </Badge>
                   {connection.kind === 'kiro-cli' && (
-                    <Badge color={connection.validatedAt ? 'ok' : 'idle'}>
-                      {connection.validatedAt
-                        ? `AWS validated · ${fmtTime(connection.validatedAt)}`
-                        : 'AWS validation pending'}
-                    </Badge>
+                    <>
+                      <Badge color="sky">{connection.region ?? 'us-east-1'}</Badge>
+                      <Badge color={connection.validatedAt ? 'ok' : 'idle'}>
+                        {connection.validatedAt
+                          ? `AWS validated · ${fmtTime(connection.validatedAt)}`
+                          : 'AWS validation pending'}
+                      </Badge>
+                    </>
                   )}
                 </div>
                 {connection.models.length > 0 && (
@@ -490,63 +547,30 @@ function ConnectionsPanel({
 
       {formOpen && (
         <Card>
-          <CardHeader title={editingId ? `Edit ${editingId}` : 'Connection baru'} />
+          <CardHeader title={editingId ? `Edit ${editingId}` : 'Connection HTTP baru'} />
           <CardBody className="space-y-4">
             <div className="grid gap-4 md:grid-cols-2">
               <label className="space-y-1 text-xs font-bold">
-                <span>Tipe connection</span>
-                <select
-                  className={fieldClass}
-                  value={form.kind}
-                  disabled={Boolean(editingId)}
-                  onChange={(event) => changeKind(event.target.value as ConnectionInput['kind'])}
-                >
-                  <option value="openai-http">OpenAI-compatible HTTP</option>
-                  <option value="kiro-cli">Kiro / CodeWhisperer bearer credential</option>
-                </select>
-              </label>
-              {form.kind === 'kiro-cli' && (
-                <div className="space-y-1 text-xs font-bold">
-                  <span>Credential Kiro</span>
-                  <div className={`${fieldClass} bg-sky-soft`}>AWS-validated bearer credential</div>
-                </div>
-              )}
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <label className="space-y-1 text-xs font-bold">
                 <span>ID connection</span>
-                <input className={fieldClass} value={form.id} disabled={Boolean(editingId)} placeholder={form.kind === 'kiro-cli' ? 'kiro' : 'openrouter'} onChange={(event) => setForm((current) => ({ ...current, id: event.target.value.toLowerCase() }))} />
+                <input className={fieldClass} value={form.id} disabled={Boolean(editingId)} placeholder="openrouter" onChange={(event) => setForm((current) => ({ ...current, id: event.target.value.toLowerCase() }))} />
               </label>
               <label className="space-y-1 text-xs font-bold">
                 <span>Nama</span>
-                <input className={fieldClass} value={form.name} placeholder={form.kind === 'kiro-cli' ? 'Kiro Personal' : 'OpenRouter Personal'} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
+                <input className={fieldClass} value={form.name} placeholder="OpenRouter Personal" onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
               </label>
             </div>
-            {form.kind === 'openai-http' && (
-              <label className="block space-y-1 text-xs font-bold">
-                <span>Base URL</span>
-                <input className={fieldClass} value={form.baseUrl ?? ''} placeholder="https://openrouter.ai/api/v1" onChange={(event) => setForm((current) => ({ ...current, baseUrl: event.target.value }))} />
-              </label>
-            )}
             <label className="block space-y-1 text-xs font-bold">
-              <span>{form.kind === 'kiro-cli' ? 'Kiro/CodeWhisperer API key' : 'API key'} {editingId && <span className="font-normal text-ink/50">— leave blank to preserve the stored key</span>}</span>
-              <input type="password" autoComplete="new-password" className={fieldClass} value={form.apiKey ?? ''} placeholder={form.kind === 'kiro-cli' ? 'ksk_...' : 'sk-...'} onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} />
-              {form.kind === 'kiro-cli' && (
-                <p className="font-normal text-ink/55">Paste a long-lived Kiro/CodeWhisperer API key. It is validated against AWS and stored directly as a bearer credential.</p>
-              )}
+              <span>Base URL</span>
+              <input className={fieldClass} value={form.baseUrl ?? ''} placeholder="https://openrouter.ai/api/v1" onChange={(event) => setForm((current) => ({ ...current, baseUrl: event.target.value }))} />
             </label>
-            {form.kind === 'kiro-cli' ? (
-              <div className="space-y-1 text-xs font-bold">
-                <span>Model</span>
-                <div className={`${fieldClass} bg-sky-soft font-mono`}>auto</div>
-                <p className="font-normal text-ink/55">Kiro/CodeWhisperer memakai model Auto untuk bearer credential ini.</p>
-              </div>
-            ) : (
-              <label className="block space-y-1 text-xs font-bold">
-                <span>Model upstream — satu per baris</span>
-                <textarea className={fieldClass} rows={5} value={modelsText} placeholder="gpt-4.1\ngpt-4.1-mini" onChange={(event) => setModelsText(event.target.value)} />
-              </label>
-            )}
+            <label className="block space-y-1 text-xs font-bold">
+              <span>API key {editingId && <span className="font-normal text-ink/50">— leave blank to preserve the stored key</span>}</span>
+              <input type="password" autoComplete="new-password" className={fieldClass} value={form.apiKey ?? ''} placeholder="sk-..." onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} />
+            </label>
+            <label className="block space-y-1 text-xs font-bold">
+              <span>Model upstream — satu per baris</span>
+              <textarea className={fieldClass} rows={5} value={modelsText} placeholder="gpt-4.1\ngpt-4.1-mini" onChange={(event) => setModelsText(event.target.value)} />
+            </label>
             <label className="flex items-center gap-2 text-sm font-bold">
               <input type="checkbox" checked={form.enabled} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />
               Connection aktif
@@ -554,13 +578,102 @@ function ConnectionsPanel({
             <div className="flex justify-end gap-2">
               <Button variant="ghost" onClick={closeForm}>Batal</Button>
               <Button onClick={() => void submit()} disabled={saving}>
-                {saving
-                  ? validatesKiroCredential ? 'Validating...' : 'Menyimpan...'
-                  : validatesKiroCredential ? 'Validate & save' : 'Save connection'}
+                {saving ? 'Menyimpan...' : 'Save connection'}
               </Button>
             </div>
           </CardBody>
         </Card>
+      )}
+
+      {kiroOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !saving) closeKiro()
+        }}>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="kiro-modal-title"
+            className="max-h-[calc(100vh-2rem)] w-full max-w-xl overflow-y-auto rounded-xl border-2 border-ink bg-paper shadow-hard"
+          >
+            <div className="border-b-2 border-ink px-4 py-3">
+              <h3 id="kiro-modal-title" className="font-brand text-lg font-bold">
+                {kiroEditingId ? 'Edit Kiro credential' : 'Connect Kiro'}
+              </h3>
+              <p className="mt-1 text-xs text-ink/60">AWS-validated bearer credential · model Auto</p>
+            </div>
+            <div className="space-y-4 p-4 sm:p-5">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <label className="space-y-1 text-xs font-bold">
+                  <span>ID connection</span>
+                  <input className={fieldClass} value={kiroForm.id} disabled={Boolean(kiroEditingId)} placeholder="kiro-main" onChange={(event) => setKiroForm((current) => ({ ...current, id: event.target.value.toLowerCase() }))} />
+                </label>
+                <label className="space-y-1 text-xs font-bold">
+                  <span>Name</span>
+                  <input className={fieldClass} value={kiroForm.name} placeholder="Kiro Personal" onChange={(event) => setKiroForm((current) => ({ ...current, name: event.target.value }))} />
+                </label>
+              </div>
+
+              <div className="space-y-1 text-xs font-bold">
+                <label htmlFor="kiro-api-key">
+                  API Key * {kiroEditingId && <span className="font-normal text-ink/50">— leave blank to preserve the stored key</span>}
+                </label>
+                <input
+                  id="kiro-api-key"
+                  type="password"
+                  autoComplete="new-password"
+                  className={fieldClass}
+                  value={kiroForm.apiKey ?? ''}
+                  placeholder="Paste your Kiro API key..."
+                  onChange={(event) => setKiroForm((current) => ({ ...current, apiKey: event.target.value }))}
+                />
+                <p className="font-normal text-ink/60">
+                  Generate an API key from Kiro Portal → API Keys. API-key authentication requires an eligible paid plan.{' '}
+                  <a className="font-bold underline" href="https://app.kiro.dev" target="_blank" rel="noreferrer">Open Kiro Portal</a>
+                </p>
+              </div>
+
+              <div className="space-y-1 text-xs font-bold">
+                <label htmlFor="kiro-region">AWS Region</label>
+                <select
+                  id="kiro-region"
+                  className={fieldClass}
+                  value={kiroForm.region ?? 'us-east-1'}
+                  onChange={(event) => setKiroForm((current) => ({ ...current, region: event.target.value as KiroRegion }))}
+                >
+                  <option value="us-east-1">us-east-1</option>
+                  <option value="eu-central-1">eu-central-1</option>
+                </select>
+              </div>
+
+              <div className="rounded-lg border-2 border-ink bg-sky-soft p-3 text-xs leading-relaxed">
+                Paste a long-lived Kiro/CodeWhisperer API key. It is validated against AWS and stored directly as a bearer credential (no refresh).
+              </div>
+
+              <label className="flex items-center gap-2 text-sm font-bold">
+                <input type="checkbox" checked={kiroForm.enabled} onChange={(event) => setKiroForm((current) => ({ ...current, enabled: event.target.checked }))} />
+                Connection enabled
+              </label>
+
+              {kiroError && (
+                <div role="alert" className="rounded-lg border-2 border-ink bg-danger p-3 text-sm font-semibold">
+                  {kiroError}
+                </div>
+              )}
+
+              <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <Button variant="ghost" onClick={closeKiro} disabled={saving}>Cancel</Button>
+                <Button
+                  onClick={() => void submitKiro()}
+                  disabled={saving || (!kiroEditingId && !kiroForm.apiKey?.trim())}
+                >
+                  {saving
+                    ? 'Validating against AWS...'
+                    : kiroEditingId ? 'Validate & update' : 'Add API Key'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )
