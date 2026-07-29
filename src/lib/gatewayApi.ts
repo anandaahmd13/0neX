@@ -58,6 +58,7 @@ export interface GatewayUsageData {
     averageLatencyMs: number
     totalTokens: number
     knownTokenRequests: number
+    totalCostUsd: number
   }
   breakdown: Array<{
     connectionId: string
@@ -67,6 +68,7 @@ export interface GatewayUsageData {
     averageLatencyMs: number
     totalTokens: number
     knownTokenRequests: number
+    totalCostUsd: number
   }>
   timeSeries: Array<{ timestamp: string; requests: number }>
   recent: GatewayUsageEvent[]

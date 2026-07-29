@@ -16,6 +16,8 @@ import { claudeCliProvider } from './gateway/providers/claude-cli.mjs'
 import { UsageStore } from './gateway/usage-store.mjs'
 import { createSessionManager, parseCookies, serializeSessionCookie } from './gateway/session.mjs'
 import { assertPublicHost } from './gateway/net-guard.mjs'
+import { RateLimiter } from './gateway/rate-limiter.mjs'
+import { PricingTable } from './gateway/pricing.mjs'
 
 try {
   registerProvider(claudeCliProvider)
@@ -184,6 +186,10 @@ export function createGatewayServer(options = {}) {
     maxOutputBytes: Number(env.GATEWAY_MAX_OUTPUT_BYTES ?? 2_000_000),
     maxBodyBytes: Number(env.GATEWAY_MAX_BODY_BYTES ?? 1_000_000),
     upstreamTimeoutMs: Number(env.GATEWAY_UPSTREAM_TIMEOUT_MS ?? 120_000),
+    // Rate limit token bucket: kapasitas burst + laju refill per detik, per
+    // kombinasi (API key + connection). 0 = nonaktif.
+    rateCapacity: Number(env.GATEWAY_RATE_CAPACITY ?? 60),
+    rateRefillPerSec: Number(env.GATEWAY_RATE_REFILL_PER_SEC ?? 1),
   }
   const dataDir = resolve(options.dataDir ?? env.GATEWAY_DATA_DIR ?? '.data/gateway')
   const masterKey = options.masterKey ?? env.GATEWAY_MASTER_KEY
@@ -201,8 +207,24 @@ export function createGatewayServer(options = {}) {
     masterKey,
     allowInsecureLocalhost,
   })
-  const usageStore = options.usageStore ?? new UsageStore({ dataDir })
+  // Tabel harga (opsional file override) untuk menghitung biaya USD dari usage.
+  const pricingTable = options.pricingTable ?? new PricingTable()
+  if (!options.pricingTable) {
+    // Muat override file secara async; sampai selesai pakai default.
+    PricingTable.load({ dataDir, pricingFile: env.GATEWAY_PRICING_FILE })
+      .then((loaded) => { Object.assign(pricingTable.prices, loaded.prices) })
+      .catch(() => {})
+  }
+  const usageStore = options.usageStore ?? new UsageStore({ dataDir, pricingTable })
   const fetchImpl = options.fetchImpl ?? fetch
+
+  // Rate limiter per (API key + connection). Nonaktif bila refill/capacity <= 0.
+  const rateLimiterEnabled = limits.rateCapacity > 0 && limits.rateRefillPerSec > 0
+  const rateLimiter = rateLimiterEnabled
+    ? new RateLimiter({ capacity: limits.rateCapacity, refillPerSec: limits.rateRefillPerSec })
+    : null
+  const rateSweeper = rateLimiter ? setInterval(() => rateLimiter.sweep(), 600_000) : null
+  rateSweeper?.unref?.()
 
   // Anti-SSRF saat fetch: verifikasi host upstream tidak me-resolve ke jaringan
   // internal. Menutup celah DNS rebinding yang lolos dari cek literal-IP di
@@ -372,7 +394,27 @@ export function createGatewayServer(options = {}) {
           return
         }
         if (request.method === 'POST' && url.pathname === '/v1/chat/completions') {
-          await proxyChat(request, response, await readJson(request, limits.maxBodyBytes), headers)
+          const body = await readJson(request, limits.maxBodyBytes)
+          // Rate limit per (API key + connection). Connection di-parse dari model;
+          // kalau model invalid, biarkan proxyChat yang mengembalikan error format.
+          if (rateLimiter) {
+            let connectionId = 'unknown'
+            try {
+              connectionId = parseGatewayModel(body.model).connectionId
+            } catch {
+              // model invalid → tetap rate limit pakai key generik agar tidak jadi bypass.
+            }
+            const { allowed, retryAfterMs } = rateLimiter.take(`v1:${connectionId}`)
+            if (!allowed) {
+              const retryAfter = Math.ceil(retryAfterMs / 1000)
+              apiError(response, 429, `Rate limit terlampaui untuk ${connectionId}, coba lagi dalam ${retryAfter}s`, 'rate_limited', {
+                ...headers,
+                'retry-after': String(retryAfter),
+              })
+              return
+            }
+          }
+          await proxyChat(request, response, body, headers)
           return
         }
         apiError(response, 404, 'Endpoint tidak ditemukan', 'not_found', headers)
@@ -485,11 +527,15 @@ export function createGatewayServer(options = {}) {
         return
       }
 
-      sendJson(response, 200, {
-        name: '0neX Personal AI Gateway',
-        status: 'ok',
-        endpoints: ['/v1/models', '/v1/chat/completions'],
-      }, headers)
+      // Health check ringan, tanpa membocorkan daftar endpoint atau banner.
+      if (request.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
+        sendJson(response, 200, { status: 'ok' }, headers)
+        return
+      }
+
+      // Catch-all: 404 polos. Tidak lagi mengembalikan banner + daftar endpoint
+      // di sembarang path (menghindari fingerprinting tanpa auth).
+      apiError(response, 404, 'Not found', 'not_found', headers)
     } catch (error) {
       apiError(response, Number(error.status) || 400, error.message, error.code ?? 'invalid_request', headers)
     }
@@ -613,6 +659,7 @@ export function createGatewayServer(options = {}) {
       })
     },
     close() {
+      if (rateSweeper) clearInterval(rateSweeper)
       for (const client of wss.clients) client.terminate()
       return new Promise((resolveClose, reject) => {
         wss.close(() => httpServer.close((error) => (error ? reject(error) : resolveClose())))

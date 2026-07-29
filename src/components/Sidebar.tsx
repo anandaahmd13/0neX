@@ -108,7 +108,7 @@ export function Sidebar({
                   {user.name}
                 </div>
                 <div className="truncate text-[10px] text-ink/50">
-                  {user.email}
+                  Sesi gateway
                 </div>
               </div>
               <button

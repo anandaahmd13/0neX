@@ -22,7 +22,7 @@ import {
   type GatewayUsageData,
   type UsageRange,
 } from '../lib/gatewayApi'
-import { fmtCompact, fmtInt, fmtTime } from '../lib/format'
+import { fmtCompact, fmtInt, fmtTime, fmtUsd } from '../lib/format'
 import { useToast } from '../lib/toast'
 import { cn } from '../lib/cn'
 
@@ -192,7 +192,7 @@ function UsageOverview({
         {loading && <span className="text-xs font-bold text-ink/50">Refreshing...</span>}
       </div>
 
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
         <StatCard label="Requests" value={fmtInt(summary.requests)} hint={`range ${usage.range}`} icon={<PulseIcon />} accent="sky" />
         <StatCard
           label="Known tokens"
@@ -200,6 +200,13 @@ function UsageOverview({
           hint={unknownTokens ? `${unknownTokens} request tanpa usage` : 'semua request terukur'}
           icon={<TokenIcon />}
           accent="mustard"
+        />
+        <StatCard
+          label="Est. biaya"
+          value={fmtUsd(summary.totalCostUsd)}
+          hint="berdasar tabel harga"
+          icon={<TokenIcon />}
+          accent="ok"
         />
         <StatCard label="Success rate" value={`${summary.successRate.toFixed(1)}%`} hint={`${summary.successes} sukses`} icon={<CheckIcon />} accent="ok" />
         <StatCard label="Avg latency" value={`${Math.round(summary.averageLatencyMs)}ms`} hint="end-to-end upstream" icon={<ClockIcon />} accent="mustard" />
@@ -241,7 +248,7 @@ function UsageOverview({
                   </div>
                   <div className="shrink-0 text-right">
                     <div className="font-bold tabular-nums">{fmtInt(row.requests)} req</div>
-                    <div className="text-xs text-ink/50">{fmtCompact(row.totalTokens)} tok</div>
+                    <div className="text-xs text-ink/50">{fmtCompact(row.totalTokens)} tok · {fmtUsd(row.totalCostUsd)}</div>
                   </div>
                 </div>
               ))}

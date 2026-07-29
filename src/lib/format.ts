@@ -11,6 +11,13 @@ export function fmtInt(n: number): string {
   return n.toLocaleString('id-ID')
 }
 
+/** USD cost: kecil → 4 desimal ($0.0123), besar → 2 desimal ($12.30). */
+export function fmtUsd(n: number): string {
+  if (!Number.isFinite(n) || n === 0) return '$0'
+  if (n < 1) return `$${n.toFixed(4)}`
+  return `$${n.toFixed(2)}`
+}
+
 /** Milliseconds → human duration. */
 export function fmtDuration(ms: number): string {
   if (ms === 0) return '—'
