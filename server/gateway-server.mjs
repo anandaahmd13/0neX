@@ -302,7 +302,6 @@ function mapKiroBearerError(error) {
     KIRO_BEARER_KEY_REQUIRED: [400, 'kiro_api_key_required', 'Kiro API key wajib diisi'],
     KIRO_BEARER_INVALID_REGION: [400, 'kiro_invalid_region', 'Region Kiro tidak didukung'],
     KIRO_BEARER_REJECTED: [401, 'kiro_auth_failed', 'Kiro API key ditolak CodeWhisperer. Periksa key dan region-nya'],
-    KIRO_BEARER_NO_PROFILE: [422, 'kiro_no_profile', 'Kiro API key tidak punya profile CodeWhisperer yang bisa dipakai'],
     KIRO_BEARER_TIMEOUT: [504, 'kiro_timeout', 'Validasi Kiro API key melewati batas waktu'],
     KIRO_BEARER_UNREACHABLE: [504, 'kiro_unreachable', 'Gagal menghubungi CodeWhisperer'],
     KIRO_BEARER_HTTP_ERROR: [502, 'kiro_failed', 'CodeWhisperer menolak permintaan validasi'],

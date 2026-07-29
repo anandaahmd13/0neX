@@ -115,14 +115,7 @@ export function createKiroBearerValidator({
     }
 
     const payload = await response.json().catch(() => null)
-    const profiles = Array.isArray(payload?.profiles) ? payload.profiles : []
-    if (!profiles.length) {
-      throw new KiroBearerError(
-        'Kiro API key valid tetapi tidak punya profile CodeWhisperer yang bisa dipakai.',
-        { code: 'KIRO_BEARER_NO_PROFILE', status: 422 },
-      )
-    }
-    return profiles
+    return Array.isArray(payload?.profiles) ? payload.profiles : []
   }
 
   async function validateApiKey({ apiKey, region } = {}) {
@@ -146,13 +139,10 @@ export function createKiroBearerValidator({
     }
 
     const profiles = await listProfiles({ secret, region: resolvedRegion })
+    // API-key Kiro tertentu terautentikasi dengan sukses tetapi tidak mendapat
+    // profile eksplisit dari ListAvailableProfiles. Dalam kasus itu profileArn
+    // sengaja dibiarkan null agar runtime memakai profile default milik token.
     const profileArn = selectProfileArn(profiles, resolvedRegion)
-    if (!profileArn) {
-      throw new KiroBearerError(
-        'CodeWhisperer tidak mengembalikan profile ARN yang valid.',
-        { code: 'KIRO_BEARER_NO_PROFILE', status: 422 },
-      )
-    }
 
     return {
       region: resolvedRegion,

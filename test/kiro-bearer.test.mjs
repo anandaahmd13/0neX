@@ -90,13 +90,15 @@ test('rejected bearer credentials fail without leaking the secret', async () => 
   )
 })
 
-test('empty profile lists, bad regions, and blank keys are refused before any request', async () => {
+test('empty profile lists use the token default; bad regions and blank keys are refused', async () => {
   const emptyProfiles = stubFetch(() => jsonResponse({ profiles: [] }))
-  await assert.rejects(
-    () => createKiroBearerValidator({ fetchImpl: emptyProfiles.impl, assertHost: async () => {} })
-      .validateApiKey({ apiKey: SECRET }),
-    /profile/i,
-  )
+  const withoutProfile = await createKiroBearerValidator({
+    fetchImpl: emptyProfiles.impl,
+    assertHost: async () => {},
+  }).validateApiKey({ apiKey: SECRET })
+  assert.equal(withoutProfile.profileArn, null)
+  assert.equal(withoutProfile.region, 'us-east-1')
+  assert.equal(emptyProfiles.calls.length, 1)
 
   const unused = stubFetch(() => jsonResponse({ profiles: [] }))
   const validator = createKiroBearerValidator({ fetchImpl: unused.impl, assertHost: async () => {} })

@@ -96,6 +96,30 @@ test('importing a Kiro API key validates over HTTPS and stores the connection', 
   assert.ok(stored.includes('encryptedApiKey'))
 })
 
+test('import accepts an authenticated key without an explicit profile ARN', async (t) => {
+  const validator = recordingValidator({ profileArn: null })
+  validator.validateApiKey = async ({ apiKey, region }) => {
+    validator.calls.push({ apiKey, region })
+    return {
+      region: region ?? 'us-east-1',
+      profileArn: null,
+      email: null,
+      validatedAt: '2026-07-29T10:00:00.000Z',
+    }
+  }
+  const { baseUrl } = await setup(t, validator)
+
+  const { response, payload } = await post(baseUrl, '/admin/connections/kiro/api-key', {
+    id: 'kiro-default-profile',
+    apiKey: 'ksk_default_profile_probe',
+  })
+
+  assert.equal(response.status, 201, JSON.stringify(payload))
+  assert.equal(payload.data.id, 'kiro-default-profile')
+  assert.equal(payload.data.hasApiKey, true)
+  assert.equal('profileArn' in payload.data, false)
+})
+
 test('import defaults to us-east-1 and derives an id when none is given', async (t) => {
   const validator = recordingValidator()
   const { baseUrl } = await setup(t, validator)
