@@ -1,7 +1,7 @@
 // Domain types for 0neX — AI agent orchestration platform.
 
 export type AgentStatus = 'active' | 'idle' | 'error' | 'paused'
-export type ProviderId = 'claude-cli'
+export type ProviderId = 'claude-cli' | 'kiro-cli'
 export type AgentToolPolicy = 'none' | 'read-only' | 'standard'
 
 export interface Agent {

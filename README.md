@@ -4,14 +4,14 @@
 
 Tampilan menggunakan gaya **neo-brutalist** dengan React, TypeScript, dan Tailwind CSS.
 
-> Status: **v0.3** — OpenAI-compatible gateway, encrypted provider connections, usage telemetry, dan Claude CLI playground. Data workflow/agent utama masih dipersist di browser.
+> Status: **v0.3** — OpenAI-compatible gateway, encrypted provider connections, usage telemetry, serta playground Claude dan Kiro CLI. Data workflow/agent utama masih dipersist di browser.
 
 ## Fitur
 
 - **Personal AI Gateway** — endpoint `POST /v1/chat/completions` dan `GET /v1/models` yang kompatibel dengan SDK OpenAI.
-- **Provider Connections** — kelola banyak akun/provider OpenAI-compatible; API key terenkripsi AES-256-GCM di server.
+- **Provider Connections** — kelola provider OpenAI-compatible dan Kiro CLI lokal; API key terenkripsi AES-256-GCM di server.
 - **Usage Overview** — request, model, connection, status, latency, token usage, time series, dan request terbaru dari telemetry aktual.
-- **CLI Playground** — percakapan multi-sesi lewat Claude Code CLI lokal dengan streaming, cancel, resume context, dan pencatatan otomatis ke Runs.
+- **CLI Playground** — percakapan multi-sesi lewat Claude Code atau Kiro CLI lokal dengan streaming, cancel, resume context, dan pencatatan otomatis ke Runs.
 - **Dashboard** — ringkasan request, token, agent aktif, success rate, chart, dan run terbaru.
 - **Agents** — profil agent dengan provider, model, system prompt, tool policy, tools, dan metrik.
 - **Workflows** — canvas node-based untuk merangkai trigger, agent, tool, dan output.
@@ -38,9 +38,13 @@ pnpm gateway                 # terminal 1: HTTP + WS di 127.0.0.1:8788
 pnpm dev                     # terminal 2: UI di localhost:5199
 ```
 
-Buka halaman **AI Gateway → Connections**, tambahkan provider OpenAI-compatible, lalu jalankan **Test & discover** untuk mengambil model dari endpoint upstream `/models`.
+Buka halaman **AI Gateway → Connections**, pilih **OpenAI-compatible HTTP** atau **Kiro CLI lokal**, lalu jalankan **Test & discover**. Connection Kiro meminta API key Kiro dan menyimpannya terenkripsi di server.
 
-Claude Code CLI hanya diperlukan untuk tab **CLI Playground**. Perintah `claude` harus tersedia di `PATH` dan sudah terautentikasi. Script lama `pnpm claude-bridge` tetap berfungsi sebagai alias kompatibilitas.
+Claude Code CLI dan Kiro CLI hanya diperlukan untuk provider Playground masing-masing. Perintah `claude`/`kiro-cli` harus tersedia di `PATH`. Provider Kiro memakai `KIRO_API_KEY` dari `.env`; key diteruskan hanya ke child process dalam HOME terisolasi dan tidak masuk bundle browser. Script lama `pnpm claude-bridge` tetap berfungsi sebagai alias kompatibilitas.
+
+### Batas kompatibilitas Kiro Connection
+
+Facade OpenAI untuk Kiro mendukung chat teks, satu choice, non-streaming/SSE, model discovery, dan `/v1/models`. Request tool calling, multimodal, audio, `response_format`, legacy completions, dan embeddings ditolak eksplisit karena tidak punya kontrak ACP yang ekuivalen. Traffic `/v1` selalu inference-only: MCP kosong dan permission tool ditolak.
 
 ## Memakai endpoint Gateway
 
@@ -91,12 +95,12 @@ Gunakan `stream: true` seperti API OpenAI biasa untuk response SSE. Token hanya 
 ## Arsitektur Gateway
 
 ```text
-OpenAI SDK / app ── HTTPS ──> /v1/* ──> connection router ──> provider upstream
-                                  │
+OpenAI SDK / app ── HTTPS ──> /v1/* ──> connection router ──> HTTP upstream
+                                  │                  └──> Kiro CLI (ACP)
                                   └──> usage metadata JSONL
 
 Private dashboard ───────────> /admin/* ──> encrypted connection store
-CLI Playground ── WebSocket ─> provider registry ──> Claude Code CLI
+CLI Playground ── WebSocket ─> provider registry ──> Claude Code / Kiro CLI
 ```
 
 - [`server/gateway-server.mjs`](server/gateway-server.mjs) melayani HTTP dan WebSocket pada host/port yang sama, termasuk auth, CORS, body/output limits, timeout, dan routing.
@@ -105,6 +109,8 @@ CLI Playground ── WebSocket ─> provider registry ──> Claude Code CLI
 - [`server/gateway/usage-store.mjs`](server/gateway/usage-store.mjs) menyimpan metadata request append-only. Prompt, completion, dan provider API key tidak disimpan.
 - [`server/gateway/openai-compatible.mjs`](server/gateway/openai-compatible.mjs) menangani model routing, safe upstream errors, dan ekstraksi usage SSE.
 - [`server/gateway/providers/claude-cli.mjs`](server/gateway/providers/claude-cli.mjs) menangani lifecycle Claude CLI lokal.
+- [`server/gateway/kiro-runner.mjs`](server/gateway/kiro-runner.mjs) dan [`server/gateway/kiro-transport.mjs`](server/gateway/kiro-transport.mjs) menangani proses Kiro CLI, ACP JSON-RPC, auth isolation, streaming, dan cancellation.
+- [`server/gateway/providers/kiro-cli.mjs`](server/gateway/providers/kiro-cli.mjs) menghubungkan shared Kiro runner ke Playground.
 
 Data server default berada di `.data/gateway/` dan diabaikan Git. Jangan mengubah `GATEWAY_MASTER_KEY` setelah connection dibuat; key baru tidak bisa mendekripsi secret lama.
 
@@ -131,7 +137,7 @@ pnpm lint
 pnpm build
 ```
 
-Test integrasi mencakup encrypted connection storage, auth/CORS, model discovery, non-stream forwarding, SSE pass-through, usage capture, dan larangan menyimpan prompt/secret pada telemetry.
+Test integrasi mencakup encrypted connection storage, migrasi schema, auth/CORS, model discovery, OpenAI dan Kiro non-stream/SSE, ACP session/cancel, API-key isolation, broken-pipe handling, usage capture, serta larangan menyimpan prompt/secret pada telemetry.
 
 ## Struktur
 

@@ -36,6 +36,7 @@ const tabs: Array<{ id: Tab; label: string }> = [
 const emptyForm: ConnectionInput = {
   id: '',
   name: '',
+  kind: 'openai-http',
   baseUrl: 'https://api.openai.com/v1',
   apiKey: '',
   models: [],
@@ -312,7 +313,9 @@ function ConnectionsPanel({
     setForm({
       id: connection.id,
       name: connection.name,
+      kind: connection.kind,
       baseUrl: connection.baseUrl,
+      authMode: connection.kind === 'kiro-cli' ? 'api-key' : connection.authMode,
       apiKey: '',
       models: discoveredModels ?? connection.models,
       enabled: connection.enabled,
@@ -328,10 +331,29 @@ function ConnectionsPanel({
     setFormOpen(false)
   }
 
+  function changeKind(kind: ConnectionInput['kind']) {
+    setForm((current) => kind === 'kiro-cli'
+      ? { ...current, kind, baseUrl: undefined, authMode: 'api-key', apiKey: '' }
+      : {
+          ...current,
+          kind,
+          baseUrl: current.baseUrl || 'https://api.openai.com/v1',
+          authMode: undefined,
+          apiKey: '',
+        })
+    setModelsText('')
+  }
+
   async function submit() {
-    const payload = { ...form, models: textToModels(modelsText) }
-    if (!editingId && !payload.apiKey) {
-      push('API key wajib untuk connection baru', 'error')
+    const payload: ConnectionInput = {
+      ...form,
+      models: textToModels(modelsText),
+      baseUrl: form.kind === 'openai-http' ? form.baseUrl : undefined,
+      authMode: form.kind === 'kiro-cli' ? 'api-key' : undefined,
+    }
+    const requiresApiKey = payload.kind === 'openai-http' || payload.authMode === 'api-key'
+    if (!editingId && requiresApiKey && !payload.apiKey) {
+      push(payload.kind === 'kiro-cli' ? 'Kiro API key wajib untuk mode API key' : 'API key wajib untuk connection baru', 'error')
       return
     }
     setSaving(true)
@@ -403,9 +425,14 @@ function ConnectionsPanel({
               <CardBody className="space-y-4">
                 <div>
                   <code className="text-sm font-bold">{connection.id}</code>
-                  <div className="mt-1 break-all text-xs text-ink/60">{connection.baseUrl}</div>
+                  <div className="mt-1 break-all text-xs text-ink/60">
+                    {connection.kind === 'kiro-cli'
+                      ? `Kiro CLI · ${connection.authMode === 'api-key' ? 'API key' : 'akun lokal (legacy)'}`
+                      : connection.baseUrl}
+                  </div>
                 </div>
                 <div className="flex flex-wrap gap-2">
+                  <Badge color="mustard">{connection.kind === 'kiro-cli' ? 'Kiro CLI' : 'OpenAI HTTP'}</Badge>
                   <Badge color="sky">{connection.models.length} model</Badge>
                   <Badge color="neutral">{connection.hasApiKey ? 'key tersimpan' : 'tanpa key'}</Badge>
                 </div>
@@ -433,25 +460,47 @@ function ConnectionsPanel({
           <CardBody className="space-y-4">
             <div className="grid gap-4 md:grid-cols-2">
               <label className="space-y-1 text-xs font-bold">
+                <span>Tipe connection</span>
+                <select
+                  className={fieldClass}
+                  value={form.kind}
+                  disabled={Boolean(editingId)}
+                  onChange={(event) => changeKind(event.target.value as ConnectionInput['kind'])}
+                >
+                  <option value="openai-http">OpenAI-compatible HTTP</option>
+                  <option value="kiro-cli">Kiro CLI lokal</option>
+                </select>
+              </label>
+              {form.kind === 'kiro-cli' && (
+                <div className="space-y-1 text-xs font-bold">
+                  <span>Autentikasi Kiro</span>
+                  <div className={`${fieldClass} bg-sky-soft`}>API key Kiro</div>
+                </div>
+              )}
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <label className="space-y-1 text-xs font-bold">
                 <span>ID connection</span>
-                <input className={fieldClass} value={form.id} disabled={Boolean(editingId)} placeholder="openrouter" onChange={(event) => setForm((current) => ({ ...current, id: event.target.value.toLowerCase() }))} />
+                <input className={fieldClass} value={form.id} disabled={Boolean(editingId)} placeholder={form.kind === 'kiro-cli' ? 'kiro' : 'openrouter'} onChange={(event) => setForm((current) => ({ ...current, id: event.target.value.toLowerCase() }))} />
               </label>
               <label className="space-y-1 text-xs font-bold">
                 <span>Nama</span>
-                <input className={fieldClass} value={form.name} placeholder="OpenRouter Personal" onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
+                <input className={fieldClass} value={form.name} placeholder={form.kind === 'kiro-cli' ? 'Kiro Personal' : 'OpenRouter Personal'} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
               </label>
             </div>
+            {form.kind === 'openai-http' && (
+              <label className="block space-y-1 text-xs font-bold">
+                <span>Base URL</span>
+                <input className={fieldClass} value={form.baseUrl ?? ''} placeholder="https://openrouter.ai/api/v1" onChange={(event) => setForm((current) => ({ ...current, baseUrl: event.target.value }))} />
+              </label>
+            )}
             <label className="block space-y-1 text-xs font-bold">
-              <span>Base URL</span>
-              <input className={fieldClass} value={form.baseUrl} placeholder="https://openrouter.ai/api/v1" onChange={(event) => setForm((current) => ({ ...current, baseUrl: event.target.value }))} />
-            </label>
-            <label className="block space-y-1 text-xs font-bold">
-              <span>API key {editingId && <span className="font-normal text-ink/50">— kosongkan untuk mempertahankan key lama</span>}</span>
-              <input type="password" autoComplete="new-password" className={fieldClass} value={form.apiKey ?? ''} placeholder="sk-..." onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} />
+              <span>{form.kind === 'kiro-cli' ? 'Kiro API key' : 'API key'} {editingId && <span className="font-normal text-ink/50">— kosongkan untuk mempertahankan key lama</span>}</span>
+              <input type="password" autoComplete="new-password" className={fieldClass} value={form.apiKey ?? ''} placeholder={form.kind === 'kiro-cli' ? 'ksk_...' : 'sk-...'} onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} />
             </label>
             <label className="block space-y-1 text-xs font-bold">
               <span>Model upstream — satu per baris</span>
-              <textarea className={fieldClass} rows={5} value={modelsText} placeholder={'gpt-4.1\ngpt-4.1-mini'} onChange={(event) => setModelsText(event.target.value)} />
+              <textarea className={fieldClass} rows={5} value={modelsText} placeholder={form.kind === 'kiro-cli' ? 'auto' : 'gpt-4.1\ngpt-4.1-mini'} onChange={(event) => setModelsText(event.target.value)} />
             </label>
             <label className="flex items-center gap-2 text-sm font-bold">
               <input type="checkbox" checked={form.enabled} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />

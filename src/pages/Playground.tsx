@@ -45,6 +45,7 @@ interface PaneCardProps {
   onRemove: (id: string) => void
   onReset: (id: string) => void
   onAppend: (id: string, lines: string[]) => void
+  onSession: (id: string, sessionId: string) => void
   onBump: (id: string) => void
   onTitle: (id: string, title: string) => void
   onAgent: (id: string, agentId: string) => void
@@ -57,6 +58,7 @@ function PaneCard({
   onRemove,
   onReset,
   onAppend,
+  onSession,
   onBump,
   onTitle,
   onAgent,
@@ -95,7 +97,7 @@ function PaneCard({
           ts: nowTime(),
           level: 'info',
           agent: agent.name,
-          message: `Memulai ${agent.providerId} dengan model ${agent.model}`,
+          message: `Memulai ${agent.providerId} dengan model ${agent.model || 'Auto'}`,
         },
       ],
     }
@@ -117,6 +119,7 @@ function PaneCard({
         resume: pane.turns > 0,
       },
       {
+        onSession: (sessionId) => onSession(pane.id, sessionId),
         onChunk: (text, level) => {
           const prefix = level === 'error' ? '[stderr] ' : ''
           const lines = text.split('\n').map((line) => prefix + line)
@@ -217,7 +220,7 @@ function PaneCard({
           >
             {agents.map((candidate) => (
               <option key={candidate.id} value={candidate.id}>
-                {candidate.name} - {candidate.model}
+                {candidate.name} - {candidate.model || 'Auto'}
               </option>
             ))}
           </select>
@@ -228,7 +231,7 @@ function PaneCard({
         <details className="rounded-lg border-2 border-dashed border-ink/30 bg-cream px-3 py-2 text-xs">
           <summary className="cursor-pointer font-bold">Konfigurasi agent</summary>
           <div className="mt-2 space-y-1 text-ink/60">
-            <p>Model: {agent.model}</p>
+            <p>Model: {agent.model || 'Auto'}</p>
             <p>System prompt: {agent.systemPrompt}</p>
           </div>
         </details>
@@ -299,6 +302,7 @@ export function Playground() {
     addPane,
     removePane,
     appendOutput,
+    setSession,
     bumpTurn,
     setTitle,
     resetPane,
@@ -322,7 +326,7 @@ export function Playground() {
     <div className="space-y-6">
       <PageTitle
         title="CLI Playground"
-        subtitle="Sesi Claude CLI lokal berdampingan. Secret tetap di server."
+        subtitle="Sesi provider CLI lokal berdampingan. Secret tetap di server."
         action={
           <Button variant="primary" size="sm" onClick={() => addPane()} disabled={full}>
             <PlusIcon width={16} height={16} />
@@ -342,7 +346,7 @@ export function Playground() {
         <Card>
           <CardBody className="flex flex-col items-center gap-3 py-12 text-center">
             <p className="text-sm text-ink/60">
-              Belum ada sesi. Claude CLI berjalan lokal dan secret tetap di server.
+              Belum ada sesi. Provider CLI berjalan lokal dan secret tetap di server.
             </p>
             <Button variant="primary" onClick={() => addPane()}>
               <PlusIcon width={16} height={16} />
@@ -363,6 +367,7 @@ export function Playground() {
                 onRemove={removePane}
                 onReset={resetPane}
                 onAppend={appendOutput}
+                onSession={setSession}
                 onBump={bumpTurn}
                 onTitle={setTitle}
                 onAgent={setAgent}

@@ -116,6 +116,24 @@ export const agents: Agent[] = [
     avgLatencyMs: 640,
     createdAt: '2026-06-14',
   },
+  {
+    id: 'agt_kiro',
+    name: 'Kiro Assistant',
+    role: 'Local CLI assistant',
+    model: '',
+    status: 'active',
+    description:
+      'Asisten lokal lewat Kiro CLI dengan model Auto dan izin tool yang selalu ditolak sampai UI permission tersedia.',
+    providerId: 'kiro-cli',
+    systemPrompt: 'Berikan jawaban yang ringkas, akurat, dan dapat ditindaklanjuti.',
+    toolPolicy: 'none',
+    tools: [],
+    tokensUsed: 0,
+    requests: 0,
+    successRate: 100,
+    avgLatencyMs: 0,
+    createdAt: '2026-07-29',
+  },
 ]
 
 // ─── Workflows ────────────────────────────────────────────────────────────

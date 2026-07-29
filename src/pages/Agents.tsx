@@ -155,7 +155,7 @@ function AgentCard({ agent, onRun }: { agent: Agent; onRun: () => void }) {
         <p className="text-sm text-ink/70">{agent.description}</p>
 
         <div className="mt-3 flex flex-wrap gap-1.5">
-          <Badge color="sky">{agent.model}</Badge>
+          <Badge color="sky">{agent.model || 'Auto'}</Badge>
           <Badge color="mustard">{agent.providerId}</Badge>
           <Badge color="neutral">tools: {agent.toolPolicy}</Badge>
           {agent.tools.slice(0, 3).map((t) => (

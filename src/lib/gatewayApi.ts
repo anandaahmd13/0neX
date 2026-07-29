@@ -3,10 +3,15 @@
 // Autentikasi memakai cookie sesi httpOnly — TIDAK ADA token admin di bundle browser.
 const HTTP_BASE = (import.meta.env.VITE_GATEWAY_HTTP_URL as string | undefined)?.replace(/\/+$/, '') ?? ''
 
+export type ConnectionKind = 'openai-http' | 'kiro-cli'
+export type KiroAuthMode = 'account-session' | 'api-key'
+
 export interface GatewayConnection {
   id: string
   name: string
-  baseUrl: string
+  kind: ConnectionKind
+  baseUrl?: string
+  authMode?: KiroAuthMode
   models: string[]
   enabled: boolean
   hasApiKey: boolean
@@ -17,7 +22,9 @@ export interface GatewayConnection {
 export interface ConnectionInput {
   id: string
   name: string
-  baseUrl: string
+  kind: ConnectionKind
+  baseUrl?: string
+  authMode?: KiroAuthMode
   apiKey?: string
   models: string[]
   enabled: boolean

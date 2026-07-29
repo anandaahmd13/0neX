@@ -96,6 +96,20 @@ export function usePanes() {
     [persist],
   )
 
+  const setSession = useCallback(
+    (id: string, sessionId: string) => {
+      if (!sessionId) return
+      setPanes((previous) =>
+        persist(
+          previous.map((pane) =>
+            pane.id === id ? { ...pane, sessionId } : pane,
+          ),
+        ),
+      )
+    },
+    [persist],
+  )
+
   const bumpTurn = useCallback(
     (id: string) =>
       setPanes((previous) =>
@@ -162,6 +176,7 @@ export function usePanes() {
     addPane,
     removePane,
     appendOutput,
+    setSession,
     bumpTurn,
     setTitle,
     resetPane,
