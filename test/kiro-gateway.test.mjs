@@ -1,61 +1,131 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, realpath } from 'node:fs/promises'
+import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, sep } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 import test from 'node:test'
 import WebSocket from 'ws'
 import { createGatewayServer } from '../server/gateway-server.mjs'
-import { createKiroRunner } from '../server/gateway/kiro-runner.mjs'
 
-const TEST_DIR = dirname(fileURLToPath(import.meta.url))
-const FIXTURE = join(TEST_DIR, 'fixtures', 'kiro-cli-fixture.mjs')
 const MASTER_KEY = '0123456789abcdef0123456789abcdef'
 const ORIGIN = 'http://localhost:5199'
 const WS_TOKEN = 'gateway-ws-kiro-test'
+const ADMIN_TOKEN = 'gateway-admin-test'
+const API_TOKEN = 'gateway-api-test'
+const DEFAULT_SECRET = 'ksk_connection_https_fixture'
+const USAGE = Object.freeze({
+  inputTokens: 8,
+  outputTokens: 3,
+  cacheReadTokens: 2,
+  cacheWriteTokens: 1,
+  totalTokens: 14,
+})
 
-async function setupGateway(t, mode = 'normal', { playgroundApiKey = 'ksk_playground_fixture' } = {}) {
-  const root = await mkdtemp(join(tmpdir(), '0nex-kiro-gateway-'))
-  const recordFile = join(root, 'fixture.jsonl')
-  const runnerDataDir = join(root, 'runner-data')
-  const gatewayDataDir = join(root, 'gateway-data')
-  const runnerEnv = {
-    PATH: process.env.PATH,
-    HOME: join(root, 'home'),
-    USERPROFILE: join(root, 'home'),
-    KIRO_FIXTURE_MODE: mode,
-    KIRO_FIXTURE_RECORD: recordFile,
+function profileArn(region, apiKey) {
+  const credential = apiKey.includes('rotated') ? 'rotated' : 'primary'
+  return `arn:aws:codewhisperer:${region}:123456789012:profile/${credential}`
+}
+
+function createFakeKiroBearerValidator() {
+  const calls = []
+  return {
+    calls,
+    async validateApiKey({ apiKey, region = 'us-east-1' }) {
+      calls.push({ apiKey, region })
+      if (apiKey.includes('rejected')) {
+        throw Object.assign(new Error('upstream rejected credential'), {
+          code: 'KIRO_BEARER_REJECTED',
+          status: 401,
+        })
+      }
+      return {
+        region,
+        profileArn: profileArn(region, apiKey),
+        email: 'kiro-user@example.com',
+        validatedAt: new Date(1_750_000_000_000 + calls.length * 1_000).toISOString(),
+      }
+    },
   }
-  const kiroRunner = createKiroRunner({
-    executable: process.execPath,
-    executableArgs: [FIXTURE],
-    env: runnerEnv,
-    dataDir: runnerDataDir,
-    timeoutMs: 2_000,
-    killGraceMs: 30,
-    maxOutputBytes: 100_000,
-  })
+}
+
+function createFakeKiroHttpClient() {
+  const calls = []
+  return {
+    calls,
+    async generate(options) {
+      const call = {
+        apiKey: options.apiKey,
+        region: options.region,
+        profileArn: options.profileArn,
+        model: options.model,
+        conversationId: options.conversationId,
+        systemPrompt: options.systemPrompt,
+        messages: options.messages,
+        signal: options.signal,
+        aborted: false,
+      }
+      calls.push(call)
+      options.onOpen?.({ status: 200 })
+
+      const input = (options.messages ?? []).map((message) => message.text).join('\n')
+      if (input.includes('WAIT_FOR_CANCEL')) {
+        return new Promise((resolve, reject) => {
+          const abort = () => {
+            call.aborted = true
+            reject(Object.assign(new Error('request aborted'), {
+              name: 'AbortError',
+              code: 'KIRO_CANCELLED',
+              status: 499,
+            }))
+          }
+          if (options.signal?.aborted) abort()
+          else options.signal?.addEventListener('abort', abort, { once: true })
+        })
+      }
+
+      const chunks = input.includes('STREAM_RESPONSE')
+        ? ['streamed ', 'over HTTPS']
+        : ['hello ', 'over HTTPS']
+      for (const chunk of chunks) {
+        await Promise.resolve()
+        options.onChunk?.(chunk)
+      }
+      options.onUsage?.(USAGE)
+      return { usage: { ...USAGE } }
+    },
+  }
+}
+
+async function setupGateway(t) {
+  const root = await mkdtemp(join(tmpdir(), '0nex-kiro-gateway-'))
+  const gatewayDataDir = join(root, 'gateway-data')
+  const kiroBearerValidator = createFakeKiroBearerValidator()
+  const kiroHttpClient = createFakeKiroHttpClient()
   const gateway = createGatewayServer({
     host: '127.0.0.1',
     port: 0,
     dataDir: gatewayDataDir,
     wsToken: WS_TOKEN,
-    apiKey: 'gateway-api-test',
-    adminToken: 'gateway-admin-test',
+    apiKey: API_TOKEN,
+    adminToken: ADMIN_TOKEN,
     masterKey: MASTER_KEY,
     allowedOrigins: [ORIGIN],
     allowInsecureLocalhost: true,
-    kiroRunner,
-    env: { ...process.env, KIRO_API_KEY: playgroundApiKey },
+    kiroBearerValidator,
+    kiroHttpClient,
+    env: {
+      ...process.env,
+      GATEWAY_RATE_CAPACITY: '0',
+      GATEWAY_RATE_REFILL_PER_SEC: '0',
+    },
   })
   const address = await gateway.listen()
   t.after(() => gateway.close())
   return {
-    recordFile,
-    runnerDataDir,
     gatewayDataDir,
+    kiroBearerValidator,
+    kiroHttpClient,
     baseUrl: `http://127.0.0.1:${address.port}`,
-    url: `ws://127.0.0.1:${address.port}/?token=${WS_TOKEN}`,
+    wsUrl: `ws://127.0.0.1:${address.port}/?token=${WS_TOKEN}`,
   }
 }
 
@@ -79,45 +149,24 @@ async function jsonRequest(url, token, init = {}) {
   return { response, payload }
 }
 
-async function createKiroConnection(baseUrl, body) {
-  const result = await jsonRequest(`${baseUrl}/admin/connections`, 'gateway-admin-test', {
+async function createKiroConnection(baseUrl, overrides = {}) {
+  const result = await jsonRequest(`${baseUrl}/admin/connections`, ADMIN_TOKEN, {
     method: 'POST',
     body: JSON.stringify({
       id: 'kiro-main',
       name: 'Kiro Main',
       kind: 'kiro-cli',
       authMode: 'api-key',
-      apiKey: 'ksk_connection_fixture',
+      apiKey: DEFAULT_SECRET,
       region: 'us-east-1',
       models: ['auto'],
       enabled: true,
-      ...body,
+      ...overrides,
     }),
   })
   assert.equal(result.response.status, 201, JSON.stringify(result.payload))
   return result.payload.data
 }
-
-async function waitFor(predicate, timeoutMs = 2_000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (await predicate()) return
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
-  }
-  throw new Error('Timeout menunggu kondisi fixture')
-}
-
-function processIsRunning(pid) {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    if (error?.code === 'ESRCH') return false
-    throw error
-  }
-}
-
-const VALIDATION_PROMPT = 'Reply with OK only. Do not use tools.'
 
 function connect(url) {
   const socket = new WebSocket(url, { origin: ORIGIN })
@@ -174,34 +223,51 @@ function runMessage(overrides = {}) {
   }
 }
 
-async function fixtureRecords(path) {
-  const raw = await readFile(path, 'utf8')
-  return raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+async function waitFor(predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error('Timeout menunggu kondisi test')
 }
 
-test('Kiro Playground runs headless with buffered output and no resumable session', async (t) => {
-  const { url, recordFile } = await setupGateway(t)
-  const client = connect(url)
+function parseSse(text) {
+  return text
+    .split('\n\n')
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block) => block.replace(/^data: /, ''))
+}
+
+test('Kiro Playground requires a selected connection and streams with its stored credential', async (t) => {
+  const { baseUrl, wsUrl, kiroHttpClient } = await setupGateway(t)
+  const created = await createKiroConnection(baseUrl)
+  const client = connect(wsUrl)
   t.after(() => client.socket.close())
   await client.opened
 
   const hello = await client.next((message) => message.type === 'hello')
-  assert.equal(hello.providers.some((provider) => provider.id === 'claude-cli'), true)
   const kiro = hello.providers.find((provider) => provider.id === 'kiro-cli')
+  assert.equal(kiro.label, 'Kiro HTTPS')
   assert.deepEqual(kiro.capabilities, {
-    streaming: false,
+    streaming: true,
     sessions: false,
     cancellation: true,
     tools: false,
   })
 
-  client.socket.send(JSON.stringify(runMessage()))
-  const correlation = await client.next(
-    (message) => message.type === 'session' && message.sessionId === 'correlation-session',
-  )
-  assert.equal(correlation.providerId, 'kiro-cli')
-  const chunk = await client.next((message) => message.type === 'chunk')
-  assert.equal(chunk.text, 'hello from fixture')
+  client.socket.send(JSON.stringify(runMessage({ sessionId: 'missing-connection' })))
+  await client.next((message) => message.type === 'session' && message.sessionId === 'missing-connection')
+  const missing = await client.next((message) => message.type === 'error')
+  assert.match(missing.text, /Pilih connection Kiro aktif/)
+  assert.equal(kiroHttpClient.calls.length, 0)
+
+  client.socket.send(JSON.stringify(runMessage({ connectionId: created.id })))
+  await client.next((message) => message.type === 'session' && message.sessionId === 'correlation-session')
+  const first = await client.next((message) => message.type === 'chunk')
+  const second = await client.next((message) => message.type === 'chunk')
+  assert.deepEqual([first.text, second.text], ['hello ', 'over HTTPS'])
   const done = await client.next((message) => message.type === 'done')
   assert.deepEqual(done, {
     type: 'done',
@@ -209,64 +275,34 @@ test('Kiro Playground runs headless with buffered output and no resumable sessio
     code: 0,
     reason: 'completed',
     sessionId: null,
-    usage: null,
+    usage: USAGE,
   })
 
-  const records = await fixtureRecords(recordFile)
-  assert.equal(records.some((entry) => entry.type === 'rpc'), false)
-  const spawn = records.find((entry) => entry.type === 'spawn')
-  assert.deepEqual(spawn.args.slice(0, 2), ['chat', '--no-interactive'])
-  assert.equal(spawn.apiKeyPresent, true)
-  assert.equal(records.find((entry) => entry.type === 'headless-input').input, [
-    '<system-instructions>',
-    'answer briefly',
-    '</system-instructions>',
-    '',
-    'hello',
-  ].join('\n'))
-
-  client.socket.send(JSON.stringify(runMessage({ sessionId: '../unsafe-session', resume: true })))
-  const unsafe = await client.next((message) => message.type === 'error')
-  assert.match(unsafe.text, /sessionId.*separator path/)
+  assert.equal(kiroHttpClient.calls.length, 1)
+  const inference = kiroHttpClient.calls[0]
+  assert.equal(inference.apiKey, DEFAULT_SECRET)
+  assert.equal(inference.region, 'us-east-1')
+  assert.equal(inference.profileArn, profileArn('us-east-1', DEFAULT_SECRET))
+  assert.equal(inference.model, 'auto')
+  assert.equal(inference.conversationId, 'correlation-session')
+  assert.equal(inference.systemPrompt, 'answer briefly')
+  assert.deepEqual(inference.messages, [{ role: 'user', text: 'hello' }])
 })
 
-test('Kiro Playground requires KIRO_API_KEY and does not spawn CLI when missing', async (t) => {
-  const { url, recordFile } = await setupGateway(t, 'normal', { playgroundApiKey: '' })
-  const client = connect(url)
+test('Kiro Playground cancellation aborts HTTPS inference', async (t) => {
+  const { baseUrl, wsUrl, kiroHttpClient } = await setupGateway(t)
+  await createKiroConnection(baseUrl)
+  const client = connect(wsUrl)
   t.after(() => client.socket.close())
   await client.opened
   await client.next((message) => message.type === 'hello')
 
-  client.socket.send(JSON.stringify(runMessage()))
-  await client.next(
-    (message) => message.type === 'session' && message.sessionId === 'correlation-session',
-  )
-  const error = await client.next((message) => message.type === 'error')
-  assert.match(error.text, /KIRO_API_KEY wajib diisi/)
-  await assert.rejects(readFile(recordFile, 'utf8'), { code: 'ENOENT' })
-})
-
-test('Kiro Playground cancellation terminates the headless process', async (t) => {
-  const { url, recordFile } = await setupGateway(t, 'cancel')
-  const client = connect(url)
-  t.after(() => client.socket.close())
-  await client.opened
-  await client.next((message) => message.type === 'hello')
-
-  client.socket.send(JSON.stringify(runMessage()))
-  await client.next(
-    (message) => message.type === 'session' && message.sessionId === 'correlation-session',
-  )
-  await waitFor(async () => {
-    try {
-      return (await fixtureRecords(recordFile)).some((entry) => entry.type === 'headless-input')
-    } catch {
-      return false
-    }
-  })
-  const spawn = (await fixtureRecords(recordFile)).find(
-    (entry) => entry.type === 'spawn' && entry.args.includes('--no-interactive'),
-  )
+  client.socket.send(JSON.stringify(runMessage({
+    connectionId: 'kiro-main',
+    prompt: 'WAIT_FOR_CANCEL',
+  })))
+  await client.next((message) => message.type === 'session')
+  await waitFor(() => kiroHttpClient.calls.length === 1)
   client.socket.send(JSON.stringify({ type: 'cancel' }))
 
   const done = await client.next((message) => message.type === 'done')
@@ -274,37 +310,29 @@ test('Kiro Playground cancellation terminates the headless process', async (t) =
   assert.equal(done.code, null)
   assert.equal(done.sessionId, null)
   assert.equal(done.usage, null)
-  await waitFor(() => !processIsRunning(spawn.pid))
+  assert.equal(kiroHttpClient.calls[0].signal.aborted, true)
+  assert.equal(kiroHttpClient.calls[0].aborted, true)
 })
 
-test('Kiro HTTP connection validates auth and serves buffered OpenAI chat with Auto model', async (t) => {
-  const { baseUrl, recordFile, gatewayDataDir } = await setupGateway(t)
+test('Kiro /v1 chat returns OpenAI non-stream and stream shapes with usage', async (t) => {
+  const { baseUrl, kiroBearerValidator, kiroHttpClient } = await setupGateway(t)
   const created = await createKiroConnection(baseUrl)
   assert.equal(created.kind, 'kiro-cli')
   assert.equal(created.authMode, 'api-key')
   assert.equal(created.hasApiKey, true)
   assert.equal(created.credentialType, 'bearer')
   assert.equal(created.region, 'us-east-1')
+  assert.equal(created.profileArn, profileArn('us-east-1', DEFAULT_SECRET))
+  assert.equal(created.email, 'kiro-user@example.com')
   assert.equal(typeof created.validatedAt, 'string')
-  assert.equal('baseUrl' in created, false)
   assert.equal('apiKey' in created, false)
+  assert.deepEqual(kiroBearerValidator.calls, [{ apiKey: DEFAULT_SECRET, region: 'us-east-1' }])
 
-  const tested = await jsonRequest(`${baseUrl}/admin/connections/kiro-main/test`, 'gateway-admin-test', {
-    method: 'POST',
-  })
-  assert.equal(tested.response.status, 200)
-  assert.equal(tested.payload.data.ok, true)
-  assert.deepEqual(tested.payload.data.models, ['auto'])
-  assert.equal(tested.payload.data.credentialType, 'bearer')
-  assert.equal(typeof tested.payload.data.validatedAt, 'string')
-
-  const models = await jsonRequest(`${baseUrl}/v1/models`, 'gateway-api-test')
+  const models = await jsonRequest(`${baseUrl}/v1/models`, API_TOKEN)
   assert.equal(models.response.status, 200)
-  assert.deepEqual(models.payload.data.map((model) => model.id), [
-    'kiro-main/auto',
-  ])
+  assert.deepEqual(models.payload.data.map((model) => model.id), ['kiro-main/auto'])
 
-  const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, 'gateway-api-test', {
+  const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, API_TOKEN, {
     method: 'POST',
     body: JSON.stringify({
       model: 'kiro-main/auto',
@@ -318,101 +346,111 @@ test('Kiro HTTP connection validates auth and serves buffered OpenAI chat with A
     }),
   })
   assert.equal(completion.response.status, 200)
+  assert.match(completion.response.headers.get('x-request-id') ?? '', /^req_/)
+  assert.match(completion.payload.id, /^chatcmpl_/)
   assert.equal(completion.payload.object, 'chat.completion')
   assert.equal(completion.payload.model, 'kiro-main/auto')
+  assert.equal(typeof completion.payload.created, 'number')
   assert.deepEqual(completion.payload.choices, [{
     index: 0,
-    message: { role: 'assistant', content: 'hello from fixture' },
+    message: { role: 'assistant', content: 'hello over HTTPS' },
     finish_reason: 'stop',
   }])
-  assert.equal('usage' in completion.payload, false)
+  assert.deepEqual(completion.payload.usage, {
+    prompt_tokens: 8,
+    completion_tokens: 3,
+    total_tokens: 14,
+    prompt_tokens_details: { cached_tokens: 2 },
+  })
+
+  const nonStreamCall = kiroHttpClient.calls[0]
+  assert.equal(nonStreamCall.apiKey, DEFAULT_SECRET)
+  assert.equal(nonStreamCall.region, 'us-east-1')
+  assert.equal(nonStreamCall.profileArn, profileArn('us-east-1', DEFAULT_SECRET))
+  assert.equal(nonStreamCall.systemPrompt, '[system]\nFollow system.\n\n[developer]\nFollow developer.')
+  assert.deepEqual(nonStreamCall.messages, [
+    { role: 'user', text: 'First question.' },
+    { role: 'assistant', text: 'Earlier answer.' },
+    { role: 'user', text: 'Final question.' },
+  ])
 
   const streamed = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: 'POST',
-    headers: authHeaders('gateway-api-test', true),
+    headers: authHeaders(API_TOKEN, true),
     body: JSON.stringify({
       model: 'kiro-main/auto',
-      messages: [{ role: 'user', content: 'Stream this.' }],
+      messages: [{ role: 'user', content: 'STREAM_RESPONSE' }],
       stream: true,
       stream_options: { include_usage: true },
     }),
   })
   assert.equal(streamed.status, 200)
   assert.match(streamed.headers.get('content-type') ?? '', /text\/event-stream/)
-  const streamText = await streamed.text()
-  assert.match(streamText, /"object":"chat\.completion\.chunk"/)
-  assert.match(streamText, /"content":"hello from fixture"/)
-  assert.match(streamText, /"finish_reason":"stop"/)
-  assert.match(streamText, /data: \[DONE\]\n\n$/)
-  assert.equal(streamText.includes('usage'), false)
-
-  const records = await fixtureRecords(recordFile)
-  const inputs = records
-    .filter((entry) => entry.type === 'headless-input' && entry.input !== VALIDATION_PROMPT)
-    .map((entry) => entry.input)
-  assert.equal(inputs[0], [
-    '<system-instructions>',
-    '[system]\nFollow system.\n\n[developer]\nFollow developer.',
-    '</system-instructions>',
-    '',
-    '[user]\nFirst question.\n\n[assistant]\nEarlier answer.\n\n[user]\nFinal question.',
-  ].join('\n'))
-  const headlessSpawn = records.find(
-    (entry) => entry.type === 'spawn'
-      && entry.args.includes('--no-interactive')
-      && entry.cwd.includes(join('kiro', 'inference')),
-  )
-  assert.equal(
-    await realpath(headlessSpawn.cwd),
-    await realpath(join(gatewayDataDir, 'kiro', 'inference', 'kiro-main')),
-  )
-  assert.notEqual(headlessSpawn.cwd, process.cwd())
-  assert.equal(records.filter((entry) => entry.type === 'spawn').every((entry) => entry.apiKeyPresent), true)
-  assert.equal(records.filter((entry) => entry.type === 'spawn').every((entry) => entry.awsRegion === 'us-east-1'), true)
-  assert.equal(records.filter((entry) => entry.type === 'spawn').every((entry) => entry.awsDefaultRegion === 'us-east-1'), true)
+  const events = parseSse(await streamed.text())
+  assert.equal(events.at(-1), '[DONE]')
+  const chunks = events.slice(0, -1).map((event) => JSON.parse(event))
+  assert.equal(chunks.every((chunk) => chunk.object === 'chat.completion.chunk'), true)
+  assert.deepEqual(chunks[0].choices, [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }])
+  assert.deepEqual(chunks.slice(1, -1).map((chunk) => chunk.choices[0].delta.content), [
+    'streamed ',
+    'over HTTPS',
+  ])
+  assert.deepEqual(chunks.at(-1).choices, [{ index: 0, delta: {}, finish_reason: 'stop' }])
+  assert.deepEqual(chunks.at(-1).usage, {
+    prompt_tokens: 8,
+    completion_tokens: 3,
+    total_tokens: 14,
+    prompt_tokens_details: { cached_tokens: 2 },
+  })
+  assert.equal(chunks.slice(0, -1).some((chunk) => 'usage' in chunk), false)
 })
 
-test('Kiro region changes revalidate stored key atomically and inference uses the saved region', async (t) => {
-  const { baseUrl, recordFile, gatewayDataDir } = await setupGateway(t)
-  await createKiroConnection(baseUrl, { region: 'us-east-1' })
-  const connectionPath = join(gatewayDataDir, 'connections.json')
+test('Kiro region, profile ARN, and rotated credential flow through validation and inference', async (t) => {
+  const { baseUrl, kiroBearerValidator, kiroHttpClient } = await setupGateway(t)
+  await createKiroConnection(baseUrl)
 
-  const changed = await jsonRequest(`${baseUrl}/admin/connections/kiro-main`, 'gateway-admin-test', {
+  const regional = await jsonRequest(`${baseUrl}/admin/connections/kiro-main`, ADMIN_TOKEN, {
     method: 'PATCH',
     body: JSON.stringify({ region: 'eu-central-1' }),
   })
-  assert.equal(changed.response.status, 200, JSON.stringify(changed.payload))
-  assert.equal(changed.payload.data.region, 'eu-central-1')
+  assert.equal(regional.response.status, 200, JSON.stringify(regional.payload))
+  assert.equal(regional.payload.data.region, 'eu-central-1')
+  assert.equal(regional.payload.data.profileArn, profileArn('eu-central-1', DEFAULT_SECRET))
+  assert.deepEqual(kiroBearerValidator.calls.at(-1), {
+    apiKey: DEFAULT_SECRET,
+    region: 'eu-central-1',
+  })
 
-  const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, 'gateway-api-test', {
+  const rotatedSecret = 'ksk_rotated_https_fixture'
+  const rotated = await jsonRequest(`${baseUrl}/admin/connections/kiro-main`, ADMIN_TOKEN, {
+    method: 'PATCH',
+    body: JSON.stringify({ apiKey: rotatedSecret }),
+  })
+  assert.equal(rotated.response.status, 200, JSON.stringify(rotated.payload))
+  assert.equal(rotated.payload.data.region, 'eu-central-1')
+  assert.equal(rotated.payload.data.profileArn, profileArn('eu-central-1', rotatedSecret))
+  assert.equal('apiKey' in rotated.payload.data, false)
+  assert.deepEqual(kiroBearerValidator.calls.at(-1), {
+    apiKey: rotatedSecret,
+    region: 'eu-central-1',
+  })
+
+  const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, API_TOKEN, {
     method: 'POST',
     body: JSON.stringify({
       model: 'kiro-main/auto',
-      messages: [{ role: 'user', content: 'hello from eu' }],
+      messages: [{ role: 'user', content: 'use rotated credential' }],
     }),
   })
   assert.equal(completion.response.status, 200)
-
-  const regionalSpawns = (await fixtureRecords(recordFile)).filter(
-    (entry) => entry.type === 'spawn' && entry.awsRegion === 'eu-central-1',
-  )
-  assert.equal(regionalSpawns.length >= 2, true)
-  assert.equal(regionalSpawns.every((entry) => entry.awsDefaultRegion === 'eu-central-1'), true)
-
-  const beforeInvalid = await readFile(connectionPath, 'utf8')
-  const invalid = await jsonRequest(`${baseUrl}/admin/connections/kiro-main`, 'gateway-admin-test', {
-    method: 'PATCH',
-    body: JSON.stringify({
-      name: 'Must Not Persist',
-      region: 'ap-southeast-1',
-    }),
-  })
-  assert.equal(invalid.response.status, 400)
-  assert.equal(await readFile(connectionPath, 'utf8'), beforeInvalid)
+  assert.equal(kiroHttpClient.calls.length, 1)
+  assert.equal(kiroHttpClient.calls[0].apiKey, rotatedSecret)
+  assert.equal(kiroHttpClient.calls[0].region, 'eu-central-1')
+  assert.equal(kiroHttpClient.calls[0].profileArn, profileArn('eu-central-1', rotatedSecret))
 })
 
-test('Kiro HTTP connection rejects unsupported OpenAI features without invoking runner', async (t) => {
-  const { baseUrl, recordFile } = await setupGateway(t)
+test('unsupported Kiro OpenAI features fail before HTTPS inference', async (t) => {
+  const { baseUrl, kiroHttpClient } = await setupGateway(t)
   await createKiroConnection(baseUrl)
 
   const cases = [
@@ -464,7 +502,7 @@ test('Kiro HTTP connection rejects unsupported OpenAI features without invoking 
   ]
 
   for (const entry of cases) {
-    const result = await jsonRequest(`${baseUrl}${entry.path}`, 'gateway-api-test', {
+    const result = await jsonRequest(`${baseUrl}${entry.path}`, API_TOKEN, {
       method: 'POST',
       body: JSON.stringify(entry.body),
     })
@@ -472,128 +510,119 @@ test('Kiro HTTP connection rejects unsupported OpenAI features without invoking 
     assert.equal(result.payload.error.type, 'invalid_request_error')
     assert.equal(result.payload.error.code, entry.code)
   }
-
-  const records = await fixtureRecords(recordFile)
-  const nonValidationRuns = records.filter(
-    (entry) => entry.type === 'headless-input' && entry.input !== VALIDATION_PROMPT,
-  )
-  assert.deepEqual(nonValidationRuns, [])
+  assert.deepEqual(kiroHttpClient.calls, [])
 })
 
-test('Kiro bearer validation is atomic for rejected creates and rotations', async (t) => {
-  const { baseUrl, recordFile, gatewayDataDir } = await setupGateway(t)
+test('rejected Kiro validation is atomic for creates and credential rotations', async (t) => {
+  const { baseUrl, gatewayDataDir, kiroBearerValidator, kiroHttpClient } = await setupGateway(t)
 
-  const rejectedCreate = await jsonRequest(`${baseUrl}/admin/connections`, 'gateway-admin-test', {
+  const rejectedCreate = await jsonRequest(`${baseUrl}/admin/connections`, ADMIN_TOKEN, {
     method: 'POST',
     body: JSON.stringify({
       id: 'kiro-rejected',
       name: 'Rejected Kiro',
       kind: 'kiro-cli',
+      authMode: 'api-key',
       apiKey: 'ksk_rejected_create_secret',
+      region: 'us-east-1',
       models: ['auto'],
       enabled: true,
     }),
   })
   assert.equal(rejectedCreate.response.status, 401)
   assert.equal(rejectedCreate.payload.error.code, 'kiro_auth_failed')
-
-  const afterRejectedCreate = await jsonRequest(`${baseUrl}/admin/connections`, 'gateway-admin-test')
+  const afterRejectedCreate = await jsonRequest(`${baseUrl}/admin/connections`, ADMIN_TOKEN)
   assert.deepEqual(afterRejectedCreate.payload.data, [])
 
-  await createKiroConnection(baseUrl, {
-    apiKey: 'ksk_original_valid_secret',
-    region: 'eu-central-1',
-  })
+  await createKiroConnection(baseUrl, { region: 'eu-central-1' })
   const connectionPath = join(gatewayDataDir, 'connections.json')
   const beforeRotation = await readFile(connectionPath, 'utf8')
 
-  const rejectedRotation = await jsonRequest(
-    `${baseUrl}/admin/connections/kiro-main`,
-    'gateway-admin-test',
-    {
-      method: 'PATCH',
-      body: JSON.stringify({
-        name: 'Must Not Persist',
-        apiKey: 'ksk_rejected_rotation_secret',
-        region: 'us-east-1',
-      }),
-    },
-  )
+  const rejectedRotation = await jsonRequest(`${baseUrl}/admin/connections/kiro-main`, ADMIN_TOKEN, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      name: 'Must Not Persist',
+      apiKey: 'ksk_rejected_rotation_secret',
+      region: 'us-east-1',
+    }),
+  })
   assert.equal(rejectedRotation.response.status, 401)
   assert.equal(rejectedRotation.payload.error.code, 'kiro_auth_failed')
   assert.equal(await readFile(connectionPath, 'utf8'), beforeRotation)
 
-  const afterRejectedRotation = await jsonRequest(`${baseUrl}/admin/connections`, 'gateway-admin-test')
+  const afterRejectedRotation = await jsonRequest(`${baseUrl}/admin/connections`, ADMIN_TOKEN)
   assert.equal(afterRejectedRotation.payload.data.length, 1)
   assert.equal(afterRejectedRotation.payload.data[0].name, 'Kiro Main')
   assert.equal(afterRejectedRotation.payload.data[0].region, 'eu-central-1')
-  assert.equal(afterRejectedRotation.payload.data[0].credentialType, 'bearer')
-  assert.equal(typeof afterRejectedRotation.payload.data[0].validatedAt, 'string')
+  assert.equal(afterRejectedRotation.payload.data[0].profileArn, profileArn('eu-central-1', DEFAULT_SECRET))
 
-  const rawRecords = await readFile(recordFile, 'utf8')
-  assert.equal(rawRecords.includes('ksk_rejected_create_secret'), false)
-  assert.equal(rawRecords.includes('ksk_rejected_rotation_secret'), false)
-  assert.equal(beforeRotation.includes('ksk_original_valid_secret'), false)
-
-  const rotationSpawns = (await fixtureRecords(recordFile)).filter(
-    (entry) => entry.type === 'spawn' && entry.args.includes('--no-interactive'),
-  )
-  assert.equal(rotationSpawns.some((entry) => entry.awsRegion === 'us-east-1'), true)
+  const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, API_TOKEN, {
+    method: 'POST',
+    body: JSON.stringify({
+      model: 'kiro-main/auto',
+      messages: [{ role: 'user', content: 'verify atomic credential' }],
+    }),
+  })
+  assert.equal(completion.response.status, 200)
+  assert.equal(kiroHttpClient.calls[0].apiKey, DEFAULT_SECRET)
+  assert.equal(kiroHttpClient.calls[0].region, 'eu-central-1')
+  assert.equal(kiroBearerValidator.calls.some((call) => call.apiKey === 'ksk_rejected_create_secret'), true)
+  assert.equal(kiroBearerValidator.calls.some((call) => call.apiKey === 'ksk_rejected_rotation_secret'), true)
 })
 
-test('Kiro API-key connection isolates and redacts its secret across admin, runner, and logs', async (t) => {
-  const { baseUrl, recordFile, runnerDataDir, gatewayDataDir } = await setupGateway(t)
-  const secret = 'ksk_gateway_fixture_super_secret'
+test('Kiro secret is never exposed by APIs or persisted in plaintext', async (t) => {
+  const { baseUrl, gatewayDataDir } = await setupGateway(t)
+  const secret = 'ksk_gateway_https_super_secret'
   const created = await createKiroConnection(baseUrl, {
     id: 'kiro-keyed',
     name: 'Kiro Keyed',
-    authMode: 'api-key',
     apiKey: secret,
-    models: ['auto'],
   })
   assert.equal(created.hasApiKey, true)
-  assert.equal(JSON.stringify(created).includes(secret), false)
   assert.equal('apiKey' in created, false)
+  assert.equal(JSON.stringify(created).includes(secret), false)
 
-  const tested = await jsonRequest(`${baseUrl}/admin/connections/kiro-keyed/test`, 'gateway-admin-test', {
+  const listed = await jsonRequest(`${baseUrl}/admin/connections`, ADMIN_TOKEN)
+  assert.equal(JSON.stringify(listed.payload).includes(secret), false)
+  assert.equal('apiKey' in listed.payload.data[0], false)
+
+  const tested = await jsonRequest(`${baseUrl}/admin/connections/kiro-keyed/test`, ADMIN_TOKEN, {
     method: 'POST',
   })
   assert.equal(tested.response.status, 200)
+  assert.deepEqual(tested.payload.data.models, ['auto'])
+  assert.equal(tested.payload.data.credentialType, 'bearer')
   assert.equal(JSON.stringify(tested.payload).includes(secret), false)
 
-  const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, 'gateway-api-test', {
+  const completion = await jsonRequest(`${baseUrl}/v1/chat/completions`, API_TOKEN, {
     method: 'POST',
     body: JSON.stringify({
       model: 'kiro-keyed/auto',
-      messages: [{ role: 'user', content: 'hello' }],
+      messages: [{ role: 'user', content: 'do not expose credentials' }],
     }),
   })
   assert.equal(completion.response.status, 200)
   assert.equal(JSON.stringify(completion.payload).includes(secret), false)
 
-  const rawRecords = await readFile(recordFile, 'utf8')
-  assert.equal(rawRecords.includes(secret), false)
-  const records = await fixtureRecords(recordFile)
-  const spawns = records.filter((entry) => entry.type === 'spawn')
-  assert.equal(spawns.length >= 2, true)
-  assert.equal(spawns.every((entry) => entry.apiKeyPresent), true)
-  assert.equal(spawns.every((entry) => entry.args.every((arg) => !arg.includes(secret))), true)
-  assert.equal(spawns.every((entry) => entry.home.startsWith(join(runnerDataDir, 'kiro', 'api-key') + sep)), true)
-  const persisted = await readFile(join(gatewayDataDir, 'connections.json'), 'utf8')
-  assert.equal(persisted.includes(secret), false)
+  const persistedText = await readFile(join(gatewayDataDir, 'connections.json'), 'utf8')
+  assert.equal(persistedText.includes(secret), false)
+  const persisted = JSON.parse(persistedText).connections[0]
+  assert.equal('apiKey' in persisted, false)
+  assert.equal(typeof persisted.encryptedApiKey, 'object')
+  assert.equal(typeof persisted.encryptedApiKey.ciphertext, 'string')
 })
 
-test('Kiro HTTP stream abort terminates the headless process', async (t) => {
-  const { baseUrl, recordFile } = await setupGateway(t, 'cancel')
+test('aborting a Kiro /v1 stream aborts HTTPS inference', async (t) => {
+  const { baseUrl, kiroHttpClient } = await setupGateway(t)
   await createKiroConnection(baseUrl)
 
   const abortController = new AbortController()
   const streamed = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: 'POST',
-    headers: authHeaders('gateway-api-test', true),
+    headers: authHeaders(API_TOKEN, true),
     body: JSON.stringify({
       model: 'kiro-main/auto',
-      messages: [{ role: 'user', content: 'wait' }],
+      messages: [{ role: 'user', content: 'WAIT_FOR_CANCEL' }],
       stream: true,
     }),
     signal: abortController.signal,
@@ -602,20 +631,11 @@ test('Kiro HTTP stream abort terminates the headless process', async (t) => {
   const reader = streamed.body.getReader()
   const first = await reader.read()
   assert.equal(first.done, false)
-  await waitFor(async () => {
-    try {
-      return (await fixtureRecords(recordFile)).some(
-        (entry) => entry.type === 'headless-input' && entry.input !== VALIDATION_PROMPT,
-      )
-    } catch (error) {
-      if (error?.code === 'ENOENT') return false
-      throw error
-    }
-  })
-  const spawn = (await fixtureRecords(recordFile)).find(
-    (entry) => entry.type === 'spawn' && entry.cwd.includes(join('kiro', 'inference')),
-  )
+  assert.match(Buffer.from(first.value).toString('utf8'), /chat\.completion\.chunk/)
+  await waitFor(() => kiroHttpClient.calls.length === 1)
+
   abortController.abort()
   await assert.rejects(reader.read(), /abort/i)
-  await waitFor(() => !processIsRunning(spawn.pid))
+  await waitFor(() => kiroHttpClient.calls[0].aborted)
+  assert.equal(kiroHttpClient.calls[0].signal.aborted, true)
 })
