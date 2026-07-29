@@ -447,6 +447,10 @@ test('Kiro model catalog preserves activation choices and gates explicit inferen
   assert.equal(liveTest.response.status, 200, JSON.stringify(liveTest.payload))
   assert.equal(liveTest.payload.data.model, 'kiro-main/claude-sonnet-5')
   assert.equal(kiroHttpClient.calls[0].model, 'claude-sonnet-5')
+  assert.equal(kiroHttpClient.calls[0].systemPrompt, undefined)
+  assert.deepEqual(kiroHttpClient.calls[0].messages, [
+    { role: 'user', text: 'Reply with OK only.' },
+  ])
 
   kiroBearerValidator.models = ['auto', 'claude-sonnet-5', 'claude-opus-5']
   const refreshed = await jsonRequest(`${baseUrl}/admin/connections/kiro-main/test`, ADMIN_TOKEN, {

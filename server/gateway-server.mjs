@@ -1086,7 +1086,6 @@ export function createGatewayServer(options = {}) {
             profileArn: connection.profileArn,
             model,
             messages: [{ role: 'user', text: 'Reply with OK only.' }],
-            systemPrompt: 'Return exactly OK and nothing else.',
             onChunk(text) { chunks.push(text) },
           })
           sendJson(response, 200, {
