@@ -18,7 +18,7 @@ const nav = [
   { to: '/workflows', label: 'Workflows', icon: WorkflowIcon, end: false },
   { to: '/runs', label: 'Runs', icon: RunsIcon, end: false },
   { to: '/gateway', label: 'AI Gateway', icon: BoltIcon, end: false },
-  { to: '/playground', label: 'CLI Playground', icon: PlayIcon, end: false },
+  { to: '/playground', label: 'AI Playground', icon: PlayIcon, end: false },
 ]
 
 export function Sidebar({

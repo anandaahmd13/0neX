@@ -7,6 +7,8 @@ import { Button } from '../components/ui/Button'
 import { CloseIcon, PlusIcon, SendIcon, StopIcon, TrashIcon } from '../components/icons'
 import { agents } from '../data/mock'
 import { newRunId } from '../lib/execWorkflow'
+import { gatewayApi } from '../lib/gatewayApi'
+import type { GatewayConnection } from '../lib/gatewayApi'
 import { useGatewayStream } from '../lib/useGatewayStream'
 import type { GatewayStatus } from '../lib/useGatewayStream'
 import { usePanes, MAX_PANES } from '../lib/usePanes'
@@ -41,6 +43,8 @@ function nowTime(): string {
 interface PaneCardProps {
   pane: Pane
   agent: Agent
+  kiroConnections: GatewayConnection[]
+  connectionsError: string
   canClose: boolean
   onRemove: (id: string) => void
   onReset: (id: string) => void
@@ -49,11 +53,14 @@ interface PaneCardProps {
   onBump: (id: string) => void
   onTitle: (id: string, title: string) => void
   onAgent: (id: string, agentId: string) => void
+  onConnection: (id: string, connectionId: string) => void
 }
 
 function PaneCard({
   pane,
   agent,
+  kiroConnections,
+  connectionsError,
   canClose,
   onRemove,
   onReset,
@@ -62,6 +69,7 @@ function PaneCard({
   onBump,
   onTitle,
   onAgent,
+  onConnection,
 }: PaneCardProps) {
   const [prompt, setPrompt] = useState('')
   const { run, stop, status } = useGatewayStream()
@@ -78,6 +86,10 @@ function PaneCard({
   function handleRun() {
     const task = prompt.trim()
     if (!task || busy) return
+    if (agent.providerId === 'kiro-cli' && !pane.connectionId) {
+      onAppend(pane.id, ['[error] Pilih connection Kiro aktif sebelum mengirim prompt.'])
+      return
+    }
 
     const startedAt = new Date()
     const runId = newRunId()
@@ -110,6 +122,7 @@ function PaneCard({
       task,
       {
         providerId: agent.providerId,
+        connectionId: agent.providerId === 'kiro-cli' ? pane.connectionId : undefined,
         agent: {
           id: agent.id,
           model: agent.model,
@@ -231,6 +244,33 @@ function PaneCard({
           <Badge color="neutral">tools: {agent.toolPolicy}</Badge>
         </div>
 
+        {agent.providerId === 'kiro-cli' && (
+          <div className="space-y-1">
+            <label htmlFor={`kiro-connection-${pane.id}`} className="text-[10px] font-bold uppercase tracking-wider text-ink/60">
+              Connection Kiro
+            </label>
+            <select
+              id={`kiro-connection-${pane.id}`}
+              value={pane.connectionId}
+              onChange={(event) => onConnection(pane.id, event.target.value)}
+              disabled={busy || kiroConnections.length === 0}
+              className="w-full rounded-lg border-2 border-ink bg-cream px-2 py-1.5 text-xs font-bold outline-none disabled:opacity-60"
+            >
+              <option value="">Pilih connection tersimpan</option>
+              {kiroConnections.map((connection) => (
+                <option key={connection.id} value={connection.id}>
+                  {connection.name} · {connection.region ?? 'us-east-1'}
+                </option>
+              ))}
+            </select>
+            {connectionsError ? (
+              <p className="text-xs font-bold text-danger">{connectionsError}</p>
+            ) : kiroConnections.length === 0 ? (
+              <p className="text-xs text-ink/60">Tambahkan dan aktifkan connection Kiro di AI Gateway dulu.</p>
+            ) : null}
+          </div>
+        )}
+
         <details className="rounded-lg border-2 border-dashed border-ink/30 bg-cream px-3 py-2 text-xs">
           <summary className="cursor-pointer font-bold">Konfigurasi agent</summary>
           <div className="mt-2 space-y-1 text-ink/60">
@@ -310,10 +350,43 @@ export function Playground() {
     setTitle,
     resetPane,
     setAgent,
+    setConnection,
   } = usePanes()
   const [searchParams, setSearchParams] = useSearchParams()
+  const [kiroConnections, setKiroConnections] = useState<GatewayConnection[]>([])
+  const [connectionsError, setConnectionsError] = useState('')
   const consumedAgent = useRef(false)
   const full = panes.length >= MAX_PANES
+
+  useEffect(() => {
+    let active = true
+    gatewayApi.listConnections().then(
+      (connections) => {
+        if (!active) return
+        setKiroConnections(
+          connections.filter(
+            (connection) => connection.kind === 'kiro-cli' && connection.enabled && connection.hasApiKey,
+          ),
+        )
+        setConnectionsError('')
+      },
+      (error) => {
+        if (!active) return
+        setConnectionsError(error instanceof Error ? error.message : 'Gagal membaca connection Kiro')
+      },
+    )
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    if (kiroConnections.length !== 1) return
+    for (const pane of panes) {
+      const agent = agents.find((candidate) => candidate.id === pane.agentId)
+      if (agent?.providerId === 'kiro-cli' && !pane.connectionId) {
+        setConnection(pane.id, kiroConnections[0].id)
+      }
+    }
+  }, [kiroConnections, panes, setConnection])
 
   useEffect(() => {
     if (consumedAgent.current) return
@@ -328,8 +401,8 @@ export function Playground() {
   return (
     <div className="space-y-6">
       <PageTitle
-        title="CLI Playground"
-        subtitle="Sesi provider CLI lokal berdampingan. Secret tetap di server."
+        title="AI Playground"
+        subtitle="Claude berjalan via CLI lokal; Kiro streaming via HTTPS dengan credential connection tersimpan."
         action={
           <Button variant="primary" size="sm" onClick={() => addPane()} disabled={full}>
             <PlusIcon width={16} height={16} />
@@ -339,7 +412,7 @@ export function Playground() {
       />
 
       <div className="flex items-center gap-2">
-        <Badge color="ok">CLI lokal</Badge>
+        <Badge color="ok">CLI + HTTPS</Badge>
         <span className="text-xs font-bold uppercase tracking-wider text-ink/60">
           {panes.length} / {MAX_PANES} sesi
         </span>
@@ -349,7 +422,7 @@ export function Playground() {
         <Card>
           <CardBody className="flex flex-col items-center gap-3 py-12 text-center">
             <p className="text-sm text-ink/60">
-              Belum ada sesi. Provider CLI berjalan lokal dan secret tetap di server.
+              Belum ada sesi. Credential provider tetap tersimpan aman di server.
             </p>
             <Button variant="primary" onClick={() => addPane()}>
               <PlusIcon width={16} height={16} />
@@ -366,6 +439,8 @@ export function Playground() {
                 key={pane.id}
                 pane={pane}
                 agent={agent}
+                kiroConnections={kiroConnections}
+                connectionsError={connectionsError}
                 canClose={panes.length > 1}
                 onRemove={removePane}
                 onReset={resetPane}
@@ -374,6 +449,7 @@ export function Playground() {
                 onBump={bumpTurn}
                 onTitle={setTitle}
                 onAgent={setAgent}
+                onConnection={setConnection}
               />
             )
           })}

@@ -119,11 +119,11 @@ export const agents: Agent[] = [
   {
     id: 'agt_kiro',
     name: 'Kiro Assistant',
-    role: 'Headless gateway assistant',
+    role: 'HTTPS gateway assistant',
     model: '',
     status: 'active',
     description:
-      'Asisten stateless lewat Kiro CLI Headless di host gateway dengan model Auto dan output buffered.',
+      'Asisten stateless lewat Kiro HTTPS dengan credential connection tersimpan dan streaming realtime.',
     providerId: 'kiro-cli',
     systemPrompt: 'Berikan jawaban yang ringkas, akurat, dan dapat ditindaklanjuti.',
     toolPolicy: 'none',

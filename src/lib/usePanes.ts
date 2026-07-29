@@ -4,6 +4,7 @@ export interface Pane {
   id: string
   sessionId: string
   agentId: string
+  connectionId: string
   title: string
   transcript: string[]
   turns: number
@@ -27,6 +28,7 @@ function load(): Pane[] {
       .map((pane) => ({
         ...pane,
         agentId: typeof pane.agentId === 'string' ? pane.agentId : DEFAULT_AGENT_ID,
+        connectionId: typeof pane.connectionId === 'string' ? pane.connectionId : '',
         transcript: Array.isArray(pane.transcript) ? pane.transcript.slice(-MAX_LINES) : [],
         turns: typeof pane.turns === 'number' ? pane.turns : 0,
       })) as Pane[]
@@ -49,6 +51,7 @@ function makePane(agentId = DEFAULT_AGENT_ID): Pane {
     id: crypto.randomUUID(),
     sessionId: crypto.randomUUID(),
     agentId,
+    connectionId: '',
     title: 'Sesi baru',
     transcript: [],
     turns: 0,
@@ -159,6 +162,28 @@ export function usePanes() {
               ? {
                   ...pane,
                   agentId,
+                  connectionId: '',
+                  sessionId: crypto.randomUUID(),
+                  transcript: [],
+                  turns: 0,
+                  title: 'Sesi baru',
+                }
+              : pane,
+          ),
+        ),
+      ),
+    [persist],
+  )
+
+  const setConnection = useCallback(
+    (id: string, connectionId: string) =>
+      setPanes((previous) =>
+        persist(
+          previous.map((pane) =>
+            pane.id === id && pane.connectionId !== connectionId
+              ? {
+                  ...pane,
+                  connectionId,
                   sessionId: crypto.randomUUID(),
                   transcript: [],
                   turns: 0,
@@ -181,5 +206,6 @@ export function usePanes() {
     setTitle,
     resetPane,
     setAgent,
+    setConnection,
   }
 }

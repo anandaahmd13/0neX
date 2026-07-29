@@ -72,6 +72,7 @@ export interface GatewayAgentConfig {
 export interface RunOptions {
   providerId: ProviderId
   agent: GatewayAgentConfig
+  connectionId?: string
   sessionId?: string
   resume?: boolean
 }
@@ -138,6 +139,7 @@ export function useGatewayStream() {
             prompt: trimmed,
             providerId: options.providerId,
             agent: options.agent,
+            connectionId: options.connectionId,
             sessionId: options.sessionId,
             resume: options.resume === true,
           }),
