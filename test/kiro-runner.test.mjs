@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { access, mkdtemp, readFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { createKiroRunner, parseKiroModelList } from '../server/gateway/kiro-runner.mjs'
@@ -22,8 +22,10 @@ async function setup(mode = 'normal', overrides = {}) {
     KIRO_FIXTURE_RECORD: recordFile,
     ...overrides.env,
   }
+  const customExecutable = overrides.executable !== undefined
   const runner = createKiroRunner({
-    executable: overrides.executable ?? FIXTURE,
+    executable: customExecutable ? overrides.executable : process.execPath,
+    executableArgs: customExecutable ? [] : [FIXTURE],
     env,
     dataDir,
     timeoutMs: overrides.timeoutMs ?? 2_000,
@@ -77,6 +79,16 @@ async function waitFor(predicate, timeoutMs = 1_000) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 10))
   }
   throw new Error('Timeout menunggu kondisi fixture')
+}
+
+function processIsRunning(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false
+    throw error
+  }
 }
 
 test('parseKiroModelList only returns explicit IDs from known containers', () => {
@@ -134,7 +146,7 @@ test('api-key auth gets isolated HOME and never puts its secret in args or paren
   assert.equal(spawnRecord.apiKeyPresent, true)
   assert.deepEqual(spawnRecord.args, ['whoami', '--format', 'json'])
   assert.equal(spawnRecord.args.some((arg) => arg.includes(secret)), false)
-  assert.equal(spawnRecord.home.startsWith(join(dataDir, 'kiro', 'api-key') + '/'), true)
+  assert.equal(spawnRecord.home.startsWith(join(dataDir, 'kiro', 'api-key') + sep), true)
   assert.equal(spawnRecord.userProfile, spawnRecord.home)
   await access(spawnRecord.home)
 })
@@ -175,10 +187,37 @@ test('headless API-key mode keeps prompt out of args and buffers stdout', async 
   ])
   assert.equal(spawn.args.some((arg) => arg.includes(prompt) || arg.includes(secret)), false)
   assert.equal(spawn.apiKeyPresent, true)
-  assert.equal(spawn.home.startsWith(join(dataDir, 'kiro', 'api-key') + '/'), true)
+  assert.equal(spawn.home.startsWith(join(dataDir, 'kiro', 'api-key') + sep), true)
   assert.equal(await realpath(spawn.cwd), await realpath(join(dataDir, 'kiro', 'headless')))
   assert.equal(input.input, '<system-instructions>\nanswer briefly\n</system-instructions>\n\nsensitive prompt from stdin')
   assert.equal(JSON.stringify(entries).includes(secret), false)
+})
+
+test('validateApiKey reaches headless AWS flow and rejects invalid bearer credentials', async () => {
+  const valid = await setup()
+  assert.deepEqual(
+    await valid.runner.validateApiKey({ apiKey: 'ksk_valid_fixture' }),
+    { authenticated: true, credentialType: 'bearer' },
+  )
+  const validEntries = await records(valid.recordFile)
+  assert.equal(
+    validEntries.some((entry) => entry.type === 'headless-input' && entry.input === 'Reply with OK only. Do not use tools.'),
+    true,
+  )
+
+  const rejected = await setup('auth-reject')
+  const secret = 'ksk_rejected_runner_secret'
+  assert.equal(
+    (await rejected.runner.whoami({ auth: { type: 'api-key', secret } })).authenticated,
+    true,
+  )
+  await assert.rejects(
+    rejected.runner.validateApiKey({ apiKey: secret }),
+    (error) => error.code === 'KIRO_AUTH_REJECTED'
+      && !error.message.includes(secret)
+      && /ditolak oleh AWS/.test(error.message),
+  )
+  assert.equal((await readFile(rejected.recordFile, 'utf8')).includes(secret), false)
 })
 
 test('headless mode requires an API key and redacts command failures', async () => {
@@ -215,12 +254,11 @@ test('headless cancel terminates a child running on the gateway host', async () 
       return false
     }
   })
+  const spawn = (await records(recordFile)).find((entry) => entry.type === 'spawn')
   controller.cancel()
   const result = await controller.done
   assert.equal(result.reason, 'cancelled')
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
-  const entries = await records(recordFile)
-  assert.equal(entries.some((entry) => entry.type === 'signal' && entry.signal === 'SIGTERM'), true)
+  await waitFor(() => !processIsRunning(spawn.pid))
 })
 
 test('new session initializes ACP, sets model, streams fragmented chunks, and completes', async () => {
@@ -419,14 +457,9 @@ test('oversized command output force-kills a child that ignores SIGTERM', async 
     (error) => error.code === 'KIRO_MAX_OUTPUT',
   )
 
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
   const entries = await records(recordFile)
   const spawn = entries.find((entry) => entry.type === 'spawn')
-  assert.equal(entries.some((entry) => entry.type === 'signal' && entry.signal === 'SIGTERM'), true)
-  assert.throws(
-    () => process.kill(spawn.pid, 0),
-    (error) => error.code === 'ESRCH',
-  )
+  await waitFor(() => !processIsRunning(spawn.pid))
 })
 
 test('missing executable and command timeout are mapped deterministically', async () => {

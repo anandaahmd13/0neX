@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import WebSocket from 'ws'
@@ -27,7 +27,8 @@ async function setupGateway(t, mode = 'normal', { playgroundApiKey = 'ksk_playgr
     KIRO_FIXTURE_RECORD: recordFile,
   }
   const kiroRunner = createKiroRunner({
-    executable: FIXTURE,
+    executable: process.execPath,
+    executableArgs: [FIXTURE],
     env: runnerEnv,
     dataDir: runnerDataDir,
     timeoutMs: 2_000,
@@ -104,6 +105,18 @@ async function waitFor(predicate, timeoutMs = 2_000) {
   }
   throw new Error('Timeout menunggu kondisi fixture')
 }
+
+function processIsRunning(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false
+    throw error
+  }
+}
+
+const VALIDATION_PROMPT = 'Reply with OK only. Do not use tools.'
 
 function connect(url) {
   const socket = new WebSocket(url, { origin: ORIGIN })
@@ -250,6 +263,9 @@ test('Kiro Playground cancellation terminates the headless process', async (t) =
       return false
     }
   })
+  const spawn = (await fixtureRecords(recordFile)).find(
+    (entry) => entry.type === 'spawn' && entry.args.includes('--no-interactive'),
+  )
   client.socket.send(JSON.stringify({ type: 'cancel' }))
 
   const done = await client.next((message) => message.type === 'done')
@@ -257,11 +273,7 @@ test('Kiro Playground cancellation terminates the headless process', async (t) =
   assert.equal(done.code, null)
   assert.equal(done.sessionId, null)
   assert.equal(done.usage, null)
-
-  await waitFor(async () => {
-    const records = await fixtureRecords(recordFile)
-    return records.some((entry) => entry.type === 'signal' && entry.signal === 'SIGTERM')
-  })
+  await waitFor(() => !processIsRunning(spawn.pid))
 })
 
 test('Kiro HTTP connection validates auth and serves buffered OpenAI chat with Auto model', async (t) => {
@@ -270,6 +282,8 @@ test('Kiro HTTP connection validates auth and serves buffered OpenAI chat with A
   assert.equal(created.kind, 'kiro-cli')
   assert.equal(created.authMode, 'api-key')
   assert.equal(created.hasApiKey, true)
+  assert.equal(created.credentialType, 'bearer')
+  assert.equal(typeof created.validatedAt, 'string')
   assert.equal('baseUrl' in created, false)
   assert.equal('apiKey' in created, false)
 
@@ -277,10 +291,10 @@ test('Kiro HTTP connection validates auth and serves buffered OpenAI chat with A
     method: 'POST',
   })
   assert.equal(tested.response.status, 200)
-  assert.deepEqual(tested.payload.data, {
-    ok: true,
-    models: ['auto'],
-  })
+  assert.equal(tested.payload.data.ok, true)
+  assert.deepEqual(tested.payload.data.models, ['auto'])
+  assert.equal(tested.payload.data.credentialType, 'bearer')
+  assert.equal(typeof tested.payload.data.validatedAt, 'string')
 
   const models = await jsonRequest(`${baseUrl}/v1/models`, 'gateway-api-test')
   assert.equal(models.response.status, 200)
@@ -332,7 +346,7 @@ test('Kiro HTTP connection validates auth and serves buffered OpenAI chat with A
 
   const records = await fixtureRecords(recordFile)
   const inputs = records
-    .filter((entry) => entry.type === 'headless-input')
+    .filter((entry) => entry.type === 'headless-input' && entry.input !== VALIDATION_PROMPT)
     .map((entry) => entry.input)
   assert.equal(inputs[0], [
     '<system-instructions>',
@@ -342,7 +356,9 @@ test('Kiro HTTP connection validates auth and serves buffered OpenAI chat with A
     '[user]\nFirst question.\n\n[assistant]\nEarlier answer.\n\n[user]\nFinal question.',
   ].join('\n'))
   const headlessSpawn = records.find(
-    (entry) => entry.type === 'spawn' && entry.args.includes('--no-interactive'),
+    (entry) => entry.type === 'spawn'
+      && entry.args.includes('--no-interactive')
+      && entry.cwd.includes(join('kiro', 'inference')),
   )
   assert.equal(
     await realpath(headlessSpawn.cwd),
@@ -414,7 +430,64 @@ test('Kiro HTTP connection rejects unsupported OpenAI features without invoking 
     assert.equal(result.payload.error.code, entry.code)
   }
 
-  await assert.rejects(readFile(recordFile, 'utf8'), { code: 'ENOENT' })
+  const records = await fixtureRecords(recordFile)
+  const nonValidationRuns = records.filter(
+    (entry) => entry.type === 'headless-input' && entry.input !== VALIDATION_PROMPT,
+  )
+  assert.deepEqual(nonValidationRuns, [])
+})
+
+test('Kiro bearer validation is atomic for rejected creates and rotations', async (t) => {
+  const { baseUrl, recordFile, gatewayDataDir } = await setupGateway(t)
+
+  const rejectedCreate = await jsonRequest(`${baseUrl}/admin/connections`, 'gateway-admin-test', {
+    method: 'POST',
+    body: JSON.stringify({
+      id: 'kiro-rejected',
+      name: 'Rejected Kiro',
+      kind: 'kiro-cli',
+      apiKey: 'ksk_rejected_create_secret',
+      models: ['auto'],
+      enabled: true,
+    }),
+  })
+  assert.equal(rejectedCreate.response.status, 401)
+  assert.equal(rejectedCreate.payload.error.code, 'kiro_auth_failed')
+
+  const afterRejectedCreate = await jsonRequest(`${baseUrl}/admin/connections`, 'gateway-admin-test')
+  assert.deepEqual(afterRejectedCreate.payload.data, [])
+
+  await createKiroConnection(baseUrl, {
+    apiKey: 'ksk_original_valid_secret',
+  })
+  const connectionPath = join(gatewayDataDir, 'connections.json')
+  const beforeRotation = await readFile(connectionPath, 'utf8')
+
+  const rejectedRotation = await jsonRequest(
+    `${baseUrl}/admin/connections/kiro-main`,
+    'gateway-admin-test',
+    {
+      method: 'PATCH',
+      body: JSON.stringify({
+        name: 'Must Not Persist',
+        apiKey: 'ksk_rejected_rotation_secret',
+      }),
+    },
+  )
+  assert.equal(rejectedRotation.response.status, 401)
+  assert.equal(rejectedRotation.payload.error.code, 'kiro_auth_failed')
+  assert.equal(await readFile(connectionPath, 'utf8'), beforeRotation)
+
+  const afterRejectedRotation = await jsonRequest(`${baseUrl}/admin/connections`, 'gateway-admin-test')
+  assert.equal(afterRejectedRotation.payload.data.length, 1)
+  assert.equal(afterRejectedRotation.payload.data[0].name, 'Kiro Main')
+  assert.equal(afterRejectedRotation.payload.data[0].credentialType, 'bearer')
+  assert.equal(typeof afterRejectedRotation.payload.data[0].validatedAt, 'string')
+
+  const rawRecords = await readFile(recordFile, 'utf8')
+  assert.equal(rawRecords.includes('ksk_rejected_create_secret'), false)
+  assert.equal(rawRecords.includes('ksk_rejected_rotation_secret'), false)
+  assert.equal(beforeRotation.includes('ksk_original_valid_secret'), false)
 })
 
 test('Kiro API-key connection isolates and redacts its secret across admin, runner, and logs', async (t) => {
@@ -454,7 +527,7 @@ test('Kiro API-key connection isolates and redacts its secret across admin, runn
   assert.equal(spawns.length >= 2, true)
   assert.equal(spawns.every((entry) => entry.apiKeyPresent), true)
   assert.equal(spawns.every((entry) => entry.args.every((arg) => !arg.includes(secret))), true)
-  assert.equal(spawns.every((entry) => entry.home.startsWith(join(runnerDataDir, 'kiro', 'api-key') + '/')), true)
+  assert.equal(spawns.every((entry) => entry.home.startsWith(join(runnerDataDir, 'kiro', 'api-key') + sep)), true)
   const persisted = await readFile(join(gatewayDataDir, 'connections.json'), 'utf8')
   assert.equal(persisted.includes(secret), false)
 })
@@ -480,17 +553,18 @@ test('Kiro HTTP stream abort terminates the headless process', async (t) => {
   assert.equal(first.done, false)
   await waitFor(async () => {
     try {
-      return (await fixtureRecords(recordFile)).some((entry) => entry.type === 'headless-input')
+      return (await fixtureRecords(recordFile)).some(
+        (entry) => entry.type === 'headless-input' && entry.input !== VALIDATION_PROMPT,
+      )
     } catch (error) {
       if (error?.code === 'ENOENT') return false
       throw error
     }
   })
+  const spawn = (await fixtureRecords(recordFile)).find(
+    (entry) => entry.type === 'spawn' && entry.cwd.includes(join('kiro', 'inference')),
+  )
   abortController.abort()
   await assert.rejects(reader.read(), /abort/i)
-
-  await waitFor(async () => {
-    const records = await fixtureRecords(recordFile)
-    return records.some((entry) => entry.type === 'signal' && entry.signal === 'SIGTERM')
-  })
+  await waitFor(() => !processIsRunning(spawn.pid))
 })

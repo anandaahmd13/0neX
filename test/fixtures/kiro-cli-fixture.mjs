@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto'
-import { appendFileSync, closeSync } from 'node:fs'
+import { appendFileSync } from 'node:fs'
 
 const args = process.argv.slice(2)
 const mode = process.env.KIRO_FIXTURE_MODE ?? 'normal'
@@ -75,6 +75,16 @@ function runHeadless() {
   process.stdin.on('data', (chunk) => { input += chunk })
   process.stdin.on('end', () => {
     record('headless-input', { input })
+    const validation = input === 'Reply with OK only. Do not use tools.'
+    if (validation) {
+      if (mode === 'auth-reject' || process.env.KIRO_API_KEY?.startsWith('ksk_rejected')) {
+        process.stderr.write(`The bearer token included in the request is invalid: KIRO_API_KEY=${process.env.KIRO_API_KEY ?? 'missing'}\n`)
+        process.exitCode = 7
+      } else {
+        process.stdout.write('OK\n')
+      }
+      return
+    }
     if (mode === 'cancel' || mode === 'headless-ignore-term') {
       process.on('SIGTERM', () => {
         record('signal', { signal: 'SIGTERM' })
@@ -83,7 +93,7 @@ function runHeadless() {
       hang()
       return
     }
-    if (mode === 'headless-fail') {
+    if (mode === 'headless-fail' || mode === 'auth-reject') {
       process.stderr.write(`headless auth failed for KIRO_API_KEY=${process.env.KIRO_API_KEY ?? 'missing'}\n`)
       process.exitCode = 7
       return
@@ -183,8 +193,7 @@ function runAcp() {
       })
       if (mode === 'broken-stdin') {
         send(initialized)
-        closeSync(0)
-        hang()
+        setImmediate(() => process.exit(0))
         return
       }
       sendFragmented(initialized)
