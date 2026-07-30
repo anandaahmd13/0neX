@@ -69,6 +69,48 @@ export interface KiroModelTestResult {
   } | null
 }
 
+/** Scope yang bisa diberikan ke API key gateway (client-facing). */
+export type GatewayApiKeyScope = 'models:read' | 'chat:write'
+
+export interface GatewayApiKeyRateLimit {
+  capacity: number
+  refillPerSec: number
+}
+
+export interface GatewayApiKey {
+  id: string
+  name: string
+  /** onex_sk_ + prefix…suffix. Aman ditampilkan berulang kali. */
+  maskedKey: string
+  scopes: GatewayApiKeyScope[]
+  enabled: boolean
+  expiresAt: string | null
+  rateLimit: GatewayApiKeyRateLimit | null
+  createdAt: string
+  updatedAt: string
+  lastUsedAt: string | null
+  requestCount: number
+  revokedAt: string | null
+  rotatedAt: string | null
+  expired: boolean
+}
+
+/**
+ * Hasil create/rotate. `secret` adalah plaintext key dan HANYA muncul di
+ * respons ini — server cuma menyimpan hash-nya.
+ */
+export interface GatewayApiKeyWithSecret extends GatewayApiKey {
+  secret: string
+}
+
+export interface GatewayApiKeyInput {
+  name: string
+  scopes?: GatewayApiKeyScope[]
+  expiresAt?: string | null
+  rateLimit?: GatewayApiKeyRateLimit | null
+  enabled?: boolean
+}
+
 export type UsageRange = '24h' | '7d' | '30d'
 
 export interface GatewayUsageEvent {
@@ -110,6 +152,18 @@ export interface GatewayUsageData {
     totalTokens: number
     knownTokenRequests: number
     totalCostUsd: number
+  }>
+  /** Atribusi per API key gateway. keyId null = bootstrap GATEWAY_API_KEY. */
+  keyBreakdown: Array<{
+    keyId: string | null
+    keyName: string | null
+    requests: number
+    successRate: number
+    averageLatencyMs: number
+    totalTokens: number
+    knownTokenRequests: number
+    totalCostUsd: number
+    lastUsedAt: string | null
   }>
   timeSeries: Array<{ timestamp: string; requests: number }>
   recent: GatewayUsageEvent[]
@@ -186,4 +240,31 @@ export const gatewayApi = {
       { method: 'POST' },
     ),
   getUsage: (range: UsageRange) => request<GatewayUsageData>(`/admin/usage?range=${range}`),
+
+  // --- API key gateway (dipakai OpenCode/client di /v1/*) ---
+  listApiKeys: () =>
+    request<{ keys: GatewayApiKey[]; scopes: GatewayApiKeyScope[] }>('/admin/api-keys'),
+  /** Plaintext key hanya ada di respons ini; tampilkan sekali lalu lupakan. */
+  createApiKey: (input: GatewayApiKeyInput) =>
+    request<GatewayApiKeyWithSecret>('/admin/api-keys', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  updateApiKey: (id: string, input: Partial<GatewayApiKeyInput>) =>
+    request<GatewayApiKey>(`/admin/api-keys/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    }),
+  /** Terbitkan secret baru untuk key yang sama; secret lama langsung mati. */
+  rotateApiKey: (id: string) =>
+    request<GatewayApiKeyWithSecret>(`/admin/api-keys/${encodeURIComponent(id)}/rotate`, {
+      method: 'POST',
+    }),
+  /** Matikan key tapi simpan record-nya sebagai jejak audit. */
+  revokeApiKey: (id: string) =>
+    request<GatewayApiKey>(`/admin/api-keys/${encodeURIComponent(id)}?mode=revoke`, {
+      method: 'DELETE',
+    }),
+  deleteApiKey: (id: string) =>
+    request<GatewayApiKey>(`/admin/api-keys/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 }

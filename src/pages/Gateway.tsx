@@ -18,6 +18,8 @@ import {
   gatewayApi,
   gatewayHttpBase,
   type ConnectionInput,
+  type GatewayApiKey,
+  type GatewayApiKeyScope,
   type GatewayConnection,
   type GatewayUsageData,
   type KiroRegion,
@@ -27,11 +29,12 @@ import { fmtCompact, fmtInt, fmtTime, fmtUsd } from '../lib/format'
 import { useToast } from '../lib/toast'
 import { cn } from '../lib/cn'
 
-type Tab = 'overview' | 'connections'
+type Tab = 'overview' | 'connections' | 'api-keys'
 
 const tabs: Array<{ id: Tab; label: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'connections', label: 'Connections' },
+  { id: 'api-keys', label: 'API Keys' },
 ]
 
 const emptyForm: ConnectionInput = {
@@ -157,6 +160,8 @@ export function Gateway() {
           onChanged={loadConnections}
         />
       )}
+
+      {tab === 'api-keys' && <ApiKeysPanel />}
     </div>
   )
 }
@@ -257,6 +262,31 @@ function UsageOverview({
                   <div className="min-w-0">
                     <div className="truncate font-bold">{row.model}</div>
                     <div className="text-xs text-ink/50">{row.connectionId} · {row.successRate.toFixed(1)}% sukses</div>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <div className="font-bold tabular-nums">{fmtInt(row.requests)} req</div>
+                    <div className="text-xs text-ink/50">{fmtCompact(row.totalTokens)} tok · {fmtUsd(row.totalCostUsd)}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        <Card>
+          <CardHeader title="API key pemakai" />
+          {usage.keyBreakdown.length === 0 ? (
+            <CardBody><EmptyText text="Belum ada request dari API key mana pun." /></CardBody>
+          ) : (
+            <div className="divide-y-2 divide-ink">
+              {usage.keyBreakdown.slice(0, 10).map((row) => (
+                <div key={row.keyId ?? 'bootstrap'} className="flex items-center justify-between gap-4 px-4 py-3 text-sm">
+                  <div className="min-w-0">
+                    <div className="truncate font-bold">{row.keyName ?? row.keyId ?? 'Unknown key'}</div>
+                    <div className="text-xs text-ink/50">
+                      {row.successRate.toFixed(1)}% sukses
+                      {row.lastUsedAt && ` · terakhir ${fmtTime(row.lastUsedAt)}`}
+                    </div>
                   </div>
                   <div className="shrink-0 text-right">
                     <div className="font-bold tabular-nums">{fmtInt(row.requests)} req</div>
@@ -770,6 +800,383 @@ function ConnectionsPanel({
                   {saving
                     ? 'Validating against AWS...'
                     : kiroEditingId ? 'Validate & update' : 'Add API Key'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+const ALL_SCOPES: GatewayApiKeyScope[] = ['models:read', 'chat:write']
+
+interface ApiKeyDraft {
+  name: string
+  scopes: GatewayApiKeyScope[]
+  expiresAt: string
+  rateCapacity: string
+  rateRefillPerSec: string
+}
+
+const emptyKeyDraft: ApiKeyDraft = {
+  name: '',
+  scopes: [...ALL_SCOPES],
+  expiresAt: '',
+  rateCapacity: '',
+  rateRefillPerSec: '',
+}
+
+function keyStatus(key: GatewayApiKey): { label: string; color: 'ok' | 'danger' | 'warn' } {
+  if (key.revokedAt) return { label: 'revoked', color: 'danger' }
+  if (key.expired) return { label: 'expired', color: 'danger' }
+  if (!key.enabled) return { label: 'disabled', color: 'warn' }
+  return { label: 'active', color: 'ok' }
+}
+
+/**
+ * Gateway → API Keys. Key yang dibuat di sini dipakai OpenCode/client lain di
+ * /v1/*. Plaintext-nya cuma muncul sekali (saat create/rotate); server hanya
+ * menyimpan hash. GATEWAY_API_KEY dari env tetap jadi bootstrap/emergency key.
+ */
+function ApiKeysPanel() {
+  const { push } = useToast()
+  const [keys, setKeys] = useState<GatewayApiKey[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [formOpen, setFormOpen] = useState(false)
+  const [draft, setDraft] = useState<ApiKeyDraft>(emptyKeyDraft)
+  const [formError, setFormError] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [busyId, setBusyId] = useState<string | null>(null)
+  // Plaintext hasil create/rotate. Ditahan di state sampai user menutupnya.
+  const [revealed, setRevealed] = useState<{ name: string; secret: string } | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    try {
+      setKeys((await gatewayApi.listApiKeys()).keys)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Gagal membaca API keys')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  function toggleScope(scope: GatewayApiKeyScope) {
+    setDraft((current) => ({
+      ...current,
+      scopes: current.scopes.includes(scope)
+        ? current.scopes.filter((item) => item !== scope)
+        : [...current.scopes, scope],
+    }))
+  }
+
+  async function submit() {
+    if (!draft.name.trim()) {
+      setFormError('Nama API key wajib diisi.')
+      return
+    }
+    if (draft.scopes.length === 0) {
+      setFormError('Pilih minimal satu scope.')
+      return
+    }
+    const capacity = Number(draft.rateCapacity)
+    const refillPerSec = Number(draft.rateRefillPerSec)
+    const wantsRateLimit = draft.rateCapacity.trim() !== '' || draft.rateRefillPerSec.trim() !== ''
+    if (wantsRateLimit && (!Number.isFinite(capacity) || capacity <= 0 || !Number.isFinite(refillPerSec) || refillPerSec <= 0)) {
+      setFormError('Rate limit butuh burst dan refill berupa angka lebih dari 0.')
+      return
+    }
+
+    setSaving(true)
+    setFormError('')
+    try {
+      const created = await gatewayApi.createApiKey({
+        name: draft.name.trim(),
+        scopes: draft.scopes,
+        expiresAt: draft.expiresAt ? new Date(draft.expiresAt).toISOString() : null,
+        rateLimit: wantsRateLimit ? { capacity, refillPerSec } : null,
+      })
+      setRevealed({ name: created.name, secret: created.secret })
+      setFormOpen(false)
+      setDraft({ ...emptyKeyDraft })
+      await load()
+    } catch (caught) {
+      setFormError(caught instanceof Error ? caught.message : 'Gagal membuat API key')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function rotate(key: GatewayApiKey) {
+    if (!window.confirm(`Rotate "${key.name}"? Key lama langsung berhenti bekerja.`)) return
+    setBusyId(key.id)
+    try {
+      const rotated = await gatewayApi.rotateApiKey(key.id)
+      setRevealed({ name: rotated.name, secret: rotated.secret })
+      await load()
+    } catch (caught) {
+      push(caught instanceof Error ? caught.message : 'Gagal rotate API key', 'error')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  async function setEnabled(key: GatewayApiKey, enabled: boolean) {
+    setBusyId(key.id)
+    try {
+      await gatewayApi.updateApiKey(key.id, { enabled })
+      await load()
+    } catch (caught) {
+      push(caught instanceof Error ? caught.message : 'Gagal memperbarui API key', 'error')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  async function revoke(key: GatewayApiKey) {
+    if (!window.confirm(`Revoke "${key.name}"? Client yang memakainya langsung kena 401.`)) return
+    setBusyId(key.id)
+    try {
+      await gatewayApi.revokeApiKey(key.id)
+      await load()
+    } catch (caught) {
+      push(caught instanceof Error ? caught.message : 'Gagal revoke API key', 'error')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  async function remove(key: GatewayApiKey) {
+    if (!window.confirm(`Hapus record "${key.name}" permanen?`)) return
+    setBusyId(key.id)
+    try {
+      await gatewayApi.deleteApiKey(key.id)
+      await load()
+    } catch (caught) {
+      push(caught instanceof Error ? caught.message : 'Gagal menghapus API key', 'error')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  async function copySecret(secret: string) {
+    try {
+      await navigator.clipboard.writeText(secret)
+      push('API key tersalin ke clipboard', 'success')
+    } catch {
+      push('Clipboard ditolak browser; salin manual.', 'error')
+    }
+  }
+
+  if (loading && keys.length === 0) return <StateCard message="Membaca API keys..." />
+  if (error && keys.length === 0) return <ErrorCard message={error} onRetry={() => void load()} />
+
+  return (
+    <div className="space-y-5">
+      <Card>
+        <CardBody className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="font-bold">API keys untuk client</div>
+            <div className="mt-1 text-xs text-ink/60">
+              Dipakai OpenCode dan client lain sebagai <code>Authorization: Bearer</code> di {gatewayHttpBase}/v1.
+              Server hanya menyimpan hash-nya, jadi plaintext cuma tampil sekali.
+            </div>
+          </div>
+          <Button onClick={() => { setDraft({ ...emptyKeyDraft }); setFormError(''); setFormOpen(true) }}>
+            <PlusIcon /> Create API Key
+          </Button>
+        </CardBody>
+      </Card>
+
+      {revealed && (
+        <Card className="bg-mustard">
+          <CardBody className="space-y-3">
+            <div>
+              <div className="font-bold">Simpan key ini sekarang</div>
+              <div className="mt-1 text-xs">
+                Plaintext untuk <strong>{revealed.name}</strong> tidak akan ditampilkan lagi. Kalau hilang, rotate keynya.
+              </div>
+            </div>
+            <code className="block break-all rounded-lg border-2 border-ink bg-paper px-3 py-2 text-sm font-bold">
+              {revealed.secret}
+            </code>
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" variant="secondary" onClick={() => void copySecret(revealed.secret)}>Copy</Button>
+              <Button size="sm" variant="ghost" onClick={() => setRevealed(null)}>Saya sudah simpan</Button>
+            </div>
+          </CardBody>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader title="Keys" />
+        {keys.length === 0 ? (
+          <CardBody><EmptyText text="Belum ada API key. Bikin satu untuk tiap client." /></CardBody>
+        ) : (
+          <div className="divide-y-2 divide-ink">
+            {keys.map((key) => {
+              const status = keyStatus(key)
+              const busy = busyId === key.id
+              return (
+                <div key={key.id} className="space-y-3 px-4 py-3">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-bold">{key.name}</span>
+                        <Badge color={status.color}>{status.label}</Badge>
+                      </div>
+                      <code className="mt-1 block break-all text-xs text-ink/60">{key.maskedKey}</code>
+                      <div className="mt-1 text-xs text-ink/50">
+                        {key.scopes.join(' · ')}
+                        {key.rateLimit && ` · limit ${key.rateLimit.capacity} burst / ${key.rateLimit.refillPerSec}/s`}
+                        {key.expiresAt && ` · expires ${fmtTime(key.expiresAt)}`}
+                      </div>
+                    </div>
+                    <div className="shrink-0 text-right text-xs text-ink/50">
+                      <div className="font-bold tabular-nums text-ink">{fmtInt(key.requestCount)} req</div>
+                      <div>{key.lastUsedAt ? `terakhir ${fmtTime(key.lastUsedAt)}` : 'belum dipakai'}</div>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void rotate(key)}>
+                      {busy ? 'Working...' : 'Rotate'}
+                    </Button>
+                    {!key.revokedAt && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy}
+                        onClick={() => void setEnabled(key, !key.enabled)}
+                      >
+                        {key.enabled ? 'Disable' : 'Enable'}
+                      </Button>
+                    )}
+                    {!key.revokedAt && (
+                      <Button size="sm" variant="danger" disabled={busy} onClick={() => void revoke(key)}>
+                        Revoke
+                      </Button>
+                    )}
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => void remove(key)}>
+                      <TrashIcon /> Delete
+                    </Button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </Card>
+
+      {formOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="api-key-modal-title"
+            className="w-full max-w-lg max-h-[calc(100vh-2rem)] overflow-y-auto rounded-xl border-2 border-ink bg-paper p-5 shadow-hard"
+          >
+            <div className="space-y-4">
+              <h2 id="api-key-modal-title" className="text-lg font-bold">Create API Key</h2>
+
+              <div>
+                <label htmlFor="api-key-name" className="mb-1 block text-xs font-bold uppercase tracking-wider text-ink/60">
+                  Nama
+                </label>
+                <input
+                  id="api-key-name"
+                  className={fieldClass}
+                  placeholder="OpenCode Laptop"
+                  value={draft.name}
+                  onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
+                />
+              </div>
+
+              <fieldset>
+                <legend className="mb-1 text-xs font-bold uppercase tracking-wider text-ink/60">Scope</legend>
+                <div className="space-y-1">
+                  {ALL_SCOPES.map((scope) => (
+                    <label key={scope} className="flex items-center gap-2 text-sm font-bold">
+                      <input
+                        type="checkbox"
+                        checked={draft.scopes.includes(scope)}
+                        onChange={() => toggleScope(scope)}
+                      />
+                      <code>{scope}</code>
+                      <span className="text-xs font-normal text-ink/50">
+                        {scope === 'models:read' ? 'baca katalog /v1/models' : 'pakai /v1/chat/completions'}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
+              <div>
+                <label htmlFor="api-key-expires" className="mb-1 block text-xs font-bold uppercase tracking-wider text-ink/60">
+                  Expiration date (opsional)
+                </label>
+                <input
+                  id="api-key-expires"
+                  type="date"
+                  className={fieldClass}
+                  value={draft.expiresAt}
+                  onChange={(event) => setDraft((current) => ({ ...current, expiresAt: event.target.value }))}
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="api-key-burst" className="mb-1 block text-xs font-bold uppercase tracking-wider text-ink/60">
+                    Rate burst (opsional)
+                  </label>
+                  <input
+                    id="api-key-burst"
+                    type="number"
+                    min="1"
+                    className={fieldClass}
+                    placeholder="60"
+                    value={draft.rateCapacity}
+                    onChange={(event) => setDraft((current) => ({ ...current, rateCapacity: event.target.value }))}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="api-key-refill" className="mb-1 block text-xs font-bold uppercase tracking-wider text-ink/60">
+                    Refill / detik
+                  </label>
+                  <input
+                    id="api-key-refill"
+                    type="number"
+                    min="0"
+                    step="0.1"
+                    className={fieldClass}
+                    placeholder="1"
+                    value={draft.rateRefillPerSec}
+                    onChange={(event) => setDraft((current) => ({ ...current, rateRefillPerSec: event.target.value }))}
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-lg border-2 border-ink bg-sky-soft p-3 text-xs leading-relaxed">
+                Plaintext key ditampilkan sekali setelah dibuat. Server menyimpan hash saja, jadi key tidak bisa dilihat ulang — hanya di-rotate atau di-revoke.
+              </div>
+
+              {formError && (
+                <div role="alert" className="rounded-lg border-2 border-ink bg-danger p-3 text-sm font-semibold">
+                  {formError}
+                </div>
+              )}
+
+              <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <Button variant="ghost" onClick={() => setFormOpen(false)} disabled={saving}>Cancel</Button>
+                <Button onClick={() => void submit()} disabled={saving || !draft.name.trim()}>
+                  {saving ? 'Creating...' : 'Create API Key'}
                 </Button>
               </div>
             </div>

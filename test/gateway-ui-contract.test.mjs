@@ -91,3 +91,67 @@ test('Kiro model discovery controls and Playground selection use active connecti
   assert.match(playground, /model: agent\.providerId === 'kiro-cli' \? pane\.modelId : agent\.model/)
   assert.match(playground, /!availableModels\.includes\(pane\.modelId\)/)
 })
+
+test('Gateway API Keys tab exposes create/rotate/revoke flow with one-time plaintext', async () => {
+  const [gateway, api] = await Promise.all([
+    readFile(sourcePath, 'utf8'),
+    readFile(apiPath, 'utf8'),
+  ])
+
+  // Kontrak client: scope, masked key, dan plaintext sekali pakai.
+  assert.match(api, /export type GatewayApiKeyScope = 'models:read' \| 'chat:write'/)
+  assert.match(api, /maskedKey: string/)
+  assert.match(api, /export interface GatewayApiKeyWithSecret extends GatewayApiKey/)
+  assert.match(api, /secret: string/)
+  assert.match(api, /listApiKeys/)
+  assert.match(api, /createApiKey/)
+  assert.match(api, /rotateApiKey/)
+  assert.match(api, /revokeApiKey/)
+  assert.match(api, /deleteApiKey/)
+  assert.match(api, /'\/admin\/api-keys'/)
+  assert.match(api, /\/rotate`/)
+  assert.match(api, /\?mode=revoke`/)
+  // Atribusi pemakaian per key di dashboard usage.
+  assert.match(api, /keyBreakdown: Array</)
+  assert.match(api, /keyId: string \| null/)
+
+  // Tab baru + panelnya.
+  assert.match(gateway, /type Tab = 'overview' \| 'connections' \| 'api-keys'/)
+  assert.match(gateway, /\{ id: 'api-keys', label: 'API Keys' \}/)
+  assert.match(gateway, /tab === 'api-keys' && <ApiKeysPanel \/>/)
+  assert.match(gateway, /function ApiKeysPanel\(\)/)
+
+  // Modal create: aksesibel, punya nama, scope, expiry, dan rate limit.
+  assert.match(gateway, /aria-labelledby="api-key-modal-title"/)
+  assert.match(gateway, /id="api-key-name"/)
+  assert.match(gateway, /htmlFor="api-key-name"/)
+  assert.match(gateway, /placeholder="OpenCode Laptop"/)
+  assert.match(gateway, /id="api-key-expires"/)
+  assert.match(gateway, /id="api-key-burst"/)
+  assert.match(gateway, /id="api-key-refill"/)
+  assert.match(gateway, /ALL_SCOPES/)
+  assert.match(gateway, /models:read/)
+  assert.match(gateway, /chat:write/)
+  assert.match(gateway, /Create API Key/)
+
+  // Plaintext hanya sekali: ditampilkan dari hasil create/rotate, bisa dicopy.
+  assert.match(gateway, /Simpan key ini sekarang/)
+  assert.match(gateway, /revealed\.secret/)
+  assert.match(gateway, /navigator\.clipboard\.writeText/)
+  assert.match(gateway, /break-all/)
+
+  // Lifecycle key.
+  assert.match(gateway, /gatewayApi\.rotateApiKey\(key\.id\)/)
+  assert.match(gateway, /gatewayApi\.revokeApiKey\(key\.id\)/)
+  assert.match(gateway, /gatewayApi\.deleteApiKey\(key\.id\)/)
+  assert.match(gateway, /gatewayApi\.updateApiKey\(key\.id, \{ enabled \}\)/)
+  assert.match(gateway, /key\.maskedKey/)
+  assert.match(gateway, /requestCount/)
+
+  // Panel usage menampilkan key mana yang memakai token.
+  assert.match(gateway, /API key pemakai/)
+  assert.match(gateway, /usage\.keyBreakdown/)
+
+  // Plaintext key tidak boleh pernah dibaca ulang dari daftar.
+  assert.doesNotMatch(gateway, /key\.secret/)
+})
