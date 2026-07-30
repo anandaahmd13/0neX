@@ -115,7 +115,7 @@ test('probe performs a real ACP initialize handshake and reports runtime capabil
     supports: {
       acp: true,
       loadSession: true,
-      mcpTransports: [],
+      mcpTransports: ['stdio'],
     },
   })
   const entries = await records(recordFile)
@@ -323,6 +323,27 @@ test('headless cancel terminates a child running on the gateway host', async () 
   const result = await controller.done
   assert.equal(result.reason, 'cancelled')
   await waitFor(() => !processIsRunning(spawn.pid))
+})
+
+test('rejects unsupported remote MCP transports before creating a session', async () => {
+  const { runner, recordFile } = await setup()
+  const execution = await runStart(runner, {
+    resume: false,
+    prompt: 'use remote MCP',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+    mcpServers: [{
+      type: 'http',
+      name: 'Remote MCP',
+      url: 'https://example.com/mcp',
+      headers: [],
+    }],
+  })
+
+  assert.equal(execution.result.reason, 'failed')
+  assert.equal(execution.result.error.code, 'KIRO_MCP_TRANSPORT_UNSUPPORTED')
+  const methods = rpcMessages(await records(recordFile)).map((message) => message.method)
+  assert.deepEqual(methods, ['initialize'])
 })
 
 test('new session initializes ACP, sets model, streams fragmented chunks, and completes', async () => {

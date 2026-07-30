@@ -1,3 +1,4 @@
+import { createAcpClientServices, createToolPolicyGuard } from '../acp-client-services.mjs'
 import { createKiroRunner } from '../kiro-runner.mjs'
 
 function publicProbeReason(status) {
@@ -19,9 +20,24 @@ function completion(result) {
   }
 }
 
+function assertMcpTransportsSupported(servers, runtimeStatus) {
+  const supported = new Set(runtimeStatus.supports?.mcpTransports ?? ['stdio'])
+  for (const server of servers) {
+    const transport = server?.type ?? 'stdio'
+    if (!supported.has(transport)) {
+      throw Object.assign(
+        new Error(`Runtime Kiro ACP tidak mendukung MCP transport ${transport}.`),
+        { code: 'KIRO_MCP_TRANSPORT_UNSUPPORTED' },
+      )
+    }
+  }
+}
+
 export function createKiroAcpProvider({
   runner = createKiroRunner(),
   getConnection = async () => null,
+  getWorkspace = async () => ({ id: 'default', root: process.cwd() }),
+  getMcpServers = async () => [],
   cwd,
   probeAuth = { type: 'account-session' },
 } = {}) {
@@ -75,13 +91,15 @@ export function createKiroAcpProvider({
         streaming: true,
         sessions: runtimeStatus.supports?.loadSession === true,
         cancellation: true,
-        tools: false,
+        tools: true,
+        toolPolicies: ['none', 'read-only', 'standard'],
         available: runtimeStatus.available === true,
         ...(runtimeStatus.available === true
           ? {
               runtime: {
                 version: runtimeStatus.version ?? null,
                 acpProtocolVersion: runtimeStatus.acpProtocolVersion ?? null,
+                mcpTransports: runtimeStatus.supports?.mcpTransports ?? ['stdio'],
               },
             }
           : { unavailableReason: publicProbeReason(runtimeStatus) }),
@@ -90,6 +108,7 @@ export function createKiroAcpProvider({
 
     start(request, handlers) {
       let controller = null
+      let clientServices = null
       let terminal = false
       let cancelled = false
       let disposed = false
@@ -102,6 +121,7 @@ export function createKiroAcpProvider({
       const fail = (error) => {
         if (terminal || disposed) return
         terminal = true
+        clientServices?.dispose()
         handlers.onError(error?.message || 'Kiro Agent gagal dimulai.', error)
       }
 
@@ -112,18 +132,31 @@ export function createKiroAcpProvider({
             code: status.code ?? 'KIRO_ACP_UNAVAILABLE',
           })
         }
-        const auth = await authForRequest(request)
+        const [auth, workspace, mcpServers] = await Promise.all([
+          authForRequest(request),
+          getWorkspace(request.workspaceId),
+          getMcpServers(request.mcpServerIds, { policy: request.toolPolicy }),
+        ])
+        assertMcpTransportsSupported(mcpServers, status)
         if (disposed) return
         if (cancelled) {
           done({ reason: 'cancelled', sessionId: request.sessionId })
           return
         }
 
+        const guard = createToolPolicyGuard(request.toolPolicy)
+        clientServices = createAcpClientServices({
+          workspaceRoot: workspace.root,
+          policy: request.toolPolicy,
+          guard,
+        })
         controller = runner.start({
           ...request,
           auth,
-          cwd,
-          allowTools: false,
+          cwd: workspace.root,
+          allowTools: request.toolPolicy !== 'none',
+          clientServices,
+          mcpServers,
         }, {
           onSession: handlers.onSession,
           onChunk: handlers.onChunk,
@@ -146,7 +179,8 @@ export function createKiroAcpProvider({
         dispose() {
           if (terminal || disposed) return
           disposed = true
-          controller?.dispose()
+          if (controller) controller.dispose()
+          else clientServices?.dispose()
         },
       }
     },

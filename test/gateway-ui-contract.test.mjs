@@ -6,6 +6,9 @@ const sourcePath = new URL('../src/pages/Gateway.tsx', import.meta.url)
 const apiPath = new URL('../src/lib/gatewayApi.ts', import.meta.url)
 const playgroundPath = new URL('../src/pages/Playground.tsx', import.meta.url)
 const panesPath = new URL('../src/lib/usePanes.ts', import.meta.url)
+const streamPath = new URL('../src/lib/useGatewayStream.ts', import.meta.url)
+const typesPath = new URL('../src/types.ts', import.meta.url)
+const mockPath = new URL('../src/data/mock.ts', import.meta.url)
 
 test('Connect Kiro modal exposes accessible regional bearer fields and safe responsive layout', async () => {
   const [source, api] = await Promise.all([
@@ -88,8 +91,137 @@ test('Kiro model discovery controls and Playground selection use active connecti
   assert.match(playground, /id=\{`kiro-model-\$\{pane\.id\}`\}/)
   assert.match(playground, /selectedConnection\?\.models/)
   assert.match(playground, /connection\.models\.includes\('auto'\) \? 'auto' : connection\.models\[0\]/)
-  assert.match(playground, /model: agent\.providerId === 'kiro-cli' \? pane\.modelId : agent\.model/)
+  assert.match(playground, /const selectedModel = isKiroInference \? pane\.modelId : agent\.model/)
+  assert.match(playground, /model: selectedModel/)
   assert.match(playground, /!availableModels\.includes\(pane\.modelId\)/)
+})
+
+test('Kiro Agent hello capabilities and structured stream events are typed and handled', async () => {
+  const [types, stream, playground, panes, mock] = await Promise.all([
+    readFile(typesPath, 'utf8'),
+    readFile(streamPath, 'utf8'),
+    readFile(playgroundPath, 'utf8'),
+    readFile(panesPath, 'utf8'),
+    readFile(mockPath, 'utf8'),
+  ])
+
+  assert.match(types, /export interface ProviderCapabilities/)
+  assert.match(types, /streaming: boolean/)
+  assert.match(types, /sessions: boolean/)
+  assert.match(types, /cancellation: boolean/)
+  assert.match(types, /tools: boolean/)
+  assert.match(types, /available\?: boolean/)
+  assert.match(types, /unavailableReason\?: string/)
+  assert.match(types, /toolPolicies\?: AgentToolPolicy\[\]/)
+  assert.match(types, /runtime\?: ProviderRuntime/)
+  assert.match(types, /export interface GatewayProvider/)
+  assert.match(types, /id: ProviderId/)
+  assert.match(types, /label: string/)
+
+  assert.match(stream, /providers: GatewayProvider\[\]/)
+  assert.match(stream, /const \[providers, setProviders\] = useState<GatewayProvider\[\]>\(\[\]\)/)
+  assert.match(stream, /return \{ run, stop, status, providers, providersError, cleanup \}/)
+  assert.match(stream, /workspaceId: options\.workspaceId/)
+  assert.match(stream, /mcpServerIds\?: string\[\]/)
+  assert.match(stream, /onPlan\?:/)
+  assert.match(stream, /onToolCall\?:/)
+  assert.match(stream, /onToolCallUpdate\?:/)
+  assert.match(stream, /onDiagnostic\?:/)
+  assert.match(stream, /handlersRef\.current\.onPlan\?\./)
+  assert.match(stream, /handlersRef\.current\.onToolCallUpdate\?\./)
+  assert.match(stream, /handlersRef\.current\.onDiagnostic\?\./)
+  assert.doesNotMatch(stream, /find\(\(option\) => option\.kind\.startsWith\('reject'\)\)/)
+
+  assert.match(playground, /providerUnavailable = isAgenticKiro/)
+  assert.match(playground, /provider\?\.capabilities\.unavailableReason/)
+  assert.match(playground, /compatibleMcpServers = mcpServers\.filter/)
+  assert.match(playground, /server\.enabled && server\.trusted/)
+  assert.match(playground, /agent\.toolPolicy !== 'read-only' \|\| server\.readOnly/)
+  assert.match(playground, /workspaceId: isAgenticKiro \? pane\.workspaceId : undefined/)
+  assert.match(playground, /mcpServerIds: isAgenticKiro \? pane\.mcpServerIds : undefined/)
+  assert.match(playground, /eventLines\('\[plan\]'/)
+  assert.match(playground, /eventLines\('\[tool\]'/)
+  assert.match(playground, /eventLines\('\[tool:update\]'/)
+  assert.match(playground, /eventLines\('\[diagnostic\]'/)
+
+  assert.match(panes, /workspaceId: string/)
+  assert.match(panes, /mcpServerIds: string\[\]/)
+  assert.match(panes, /workspaceId: typeof pane\.workspaceId === 'string' \? pane\.workspaceId : 'default'/)
+  assert.match(panes, /const setWorkspace = useCallback/)
+  assert.match(panes, /const setMcpServers = useCallback/)
+
+  assert.match(mock, /id: 'agt_kiro'/)
+  assert.match(mock, /providerId: 'kiro-agent'/)
+  assert.match(mock, /toolPolicy: 'standard'/)
+  assert.match(mock, /name: 'Kiro HTTPS'/)
+  assert.match(mock, /providerId: 'kiro-cli'/)
+})
+
+test('Playground permission prompt waits for an explicit option and settles safely', async () => {
+  const [stream, playground] = await Promise.all([
+    readFile(streamPath, 'utf8'),
+    readFile(playgroundPath, 'utf8'),
+  ])
+
+  assert.match(playground, /const \[permission, setPermission\] = useState<GatewayPermissionRequest \| null>\(null\)/)
+  assert.match(playground, /onPermissionRequest: \(request\) => new Promise<string \| null>/)
+  assert.match(playground, /permissionResolverRef\.current = resolve/)
+  assert.match(playground, /role="alertdialog"/)
+  assert.match(playground, /permission\.options\.map/)
+  assert.match(playground, /onClick=\{\(\) => settlePermission\(option\.optionId\)\}/)
+  assert.match(playground, /onPermissionCancelled: \(\) => settlePermission\(null\)/)
+  assert.match(playground, /useEffect\(\(\) => \(\) => settlePermission\(null\)/)
+  assert.match(playground, /server akan menolak otomatis/)
+
+  assert.match(stream, /const handler = handlersRef\.current\.onPermissionRequest/)
+  assert.match(stream, /if \(!handler\) return/)
+  assert.match(stream, /handlersRef\.current\.onPermissionCancelled\?\.\(\)/)
+  assert.match(stream, /if \(\s*!optionId/)
+  assert.doesNotMatch(stream, /const reject = message\.options/)
+})
+
+test('Workspace and MCP admin contracts expose CRUD without returning secrets', async () => {
+  const [gateway, api] = await Promise.all([
+    readFile(sourcePath, 'utf8'),
+    readFile(apiPath, 'utf8'),
+  ])
+
+  assert.match(api, /export interface GatewayWorkspace/)
+  assert.match(api, /export interface GatewayMcpServer/)
+  assert.match(api, /hasSecrets: boolean/)
+  assert.match(api, /export interface GatewayMcpServerInput/)
+  assert.match(api, /env\?: Record<string, string>/)
+  assert.match(api, /headers\?: Record<string, string>/)
+  assert.match(api, /listWorkspaces/)
+  assert.match(api, /'\/admin\/workspaces'/)
+  assert.match(api, /listMcpServers/)
+  assert.match(api, /createMcpServer/)
+  assert.match(api, /updateMcpServer/)
+  assert.match(api, /deleteMcpServer/)
+  assert.match(api, /'\/admin\/mcp-servers'/)
+  assert.match(api, /\/admin\/mcp-servers\/\$\{encodeURIComponent\(id\)\}/)
+  // Public MCP interface tidak boleh membawa secret. Ekstrak body interface-nya
+  // saja (bukan GatewayMcpServerInput yang memang write-only) supaya cek ini
+  // tidak salah menabrak `headers:` di helper fetch.
+  const publicMcpInterface = api.match(/export interface GatewayMcpServer \{[\s\S]*?\n\}/)?.[0] ?? ''
+  assert.match(publicMcpInterface, /hasSecrets: boolean/)
+  assert.doesNotMatch(publicMcpInterface, /\benv\b/)
+  assert.doesNotMatch(publicMcpInterface, /\bheaders\b/)
+
+  assert.match(gateway, /type Tab = 'overview' \| 'connections' \| 'mcp' \| 'api-keys'/)
+  assert.match(gateway, /\{ id: 'mcp', label: 'MCP Servers' \}/)
+  assert.match(gateway, /tab === 'mcp' && <McpServersPanel \/>/)
+  assert.match(gateway, /function McpServersPanel\(\)/)
+  assert.match(gateway, /gatewayApi\.listMcpServers\(\)/)
+  assert.match(gateway, /gatewayApi\.createMcpServer\(payload\)/)
+  assert.match(gateway, /gatewayApi\.updateMcpServer\(editingId, payload\)/)
+  assert.match(gateway, /gatewayApi\.deleteMcpServer\(server\.id\)/)
+  assert.match(gateway, /'enabled' \| 'trusted' \| 'readOnly'/)
+  assert.match(gateway, /server\.hasSecrets/)
+  assert.match(gateway, /envText: ''/)
+  assert.match(gateway, /headersText: ''/)
+  assert.doesNotMatch(gateway, /server\.env/)
+  assert.doesNotMatch(gateway, /server\.headers/)
 })
 
 test('Gateway API Keys tab exposes create/rotate/revoke flow with one-time plaintext', async () => {
@@ -116,7 +248,7 @@ test('Gateway API Keys tab exposes create/rotate/revoke flow with one-time plain
   assert.match(api, /keyId: string \| null/)
 
   // Tab baru + panelnya.
-  assert.match(gateway, /type Tab = 'overview' \| 'connections' \| 'api-keys'/)
+  assert.match(gateway, /type Tab = 'overview' \| 'connections' \| 'mcp' \| 'api-keys'/)
   assert.match(gateway, /\{ id: 'api-keys', label: 'API Keys' \}/)
   assert.match(gateway, /tab === 'api-keys' && <ApiKeysPanel \/>/)
   assert.match(gateway, /function ApiKeysPanel\(\)/)

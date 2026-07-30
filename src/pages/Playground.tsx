@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { PageTitle } from '../components/PageTitle'
 import { Badge } from '../components/ui/Badge'
@@ -8,14 +8,14 @@ import { CloseIcon, PlusIcon, SendIcon, StopIcon, TrashIcon } from '../component
 import { agents } from '../data/mock'
 import { newRunId } from '../lib/execWorkflow'
 import { gatewayApi } from '../lib/gatewayApi'
-import type { GatewayConnection } from '../lib/gatewayApi'
+import type { GatewayConnection, GatewayMcpServer, GatewayWorkspace } from '../lib/gatewayApi'
 import { useGatewayStream } from '../lib/useGatewayStream'
-import type { GatewayStatus } from '../lib/useGatewayStream'
+import type { GatewayPermissionRequest, GatewayStatus } from '../lib/useGatewayStream'
 import { usePanes, MAX_PANES } from '../lib/usePanes'
 import type { Pane } from '../lib/usePanes'
 import { useRuns } from '../lib/runs'
 import { cn } from '../lib/cn'
-import type { Agent, Run } from '../types'
+import type { Agent, GatewayProvider, Run } from '../types'
 
 const statusMeta: Record<GatewayStatus, { label: string; dot: string }> = {
   idle: { label: 'Idle', dot: 'bg-ink/30' },
@@ -28,6 +28,10 @@ const statusMeta: Record<GatewayStatus, { label: string; dot: string }> = {
 function lineClass(line: string): string {
   if (line.startsWith('> ')) return 'text-mustard font-bold'
   if (line.startsWith('[stderr]') || line.startsWith('[error]')) return 'term-error'
+  if (line.startsWith('[tool]') || line.startsWith('[tool:update]')) return 'text-sky'
+  if (line.startsWith('[plan]')) return 'text-mustard'
+  if (line.startsWith('[diagnostic]')) return 'term-dim2'
+  if (line.startsWith('[thinking]')) return 'term-dim'
   if (line.startsWith('system:') || line.startsWith('[gateway]')) return 'term-dim2'
   return ''
 }
@@ -40,11 +44,33 @@ function nowTime(): string {
   })
 }
 
+function eventText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value === null || value === undefined) return '-'
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function eventLines(prefix: string, value: unknown): string[] {
+  const lines = eventText(value).split('\n')
+  return lines.map((line, index) => `${index === 0 ? prefix : ' '.repeat(prefix.length)} ${line}`)
+}
+
+function providerFor(providers: GatewayProvider[], id: Agent['providerId']): GatewayProvider | undefined {
+  return providers.find((provider) => provider.id === id)
+}
+
 interface PaneCardProps {
   pane: Pane
   agent: Agent
   kiroConnections: GatewayConnection[]
   connectionsError: string
+  workspaces: GatewayWorkspace[]
+  mcpServers: GatewayMcpServer[]
+  agenticError: string
   canClose: boolean
   onRemove: (id: string) => void
   onReset: (id: string) => void
@@ -55,6 +81,8 @@ interface PaneCardProps {
   onAgent: (id: string, agentId: string) => void
   onConnection: (id: string, connectionId: string) => void
   onModel: (id: string, modelId: string) => void
+  onWorkspace: (id: string, workspaceId: string) => void
+  onMcpServers: (id: string, mcpServerIds: string[]) => void
 }
 
 function PaneCard({
@@ -62,6 +90,9 @@ function PaneCard({
   agent,
   kiroConnections,
   connectionsError,
+  workspaces,
+  mcpServers,
+  agenticError,
   canClose,
   onRemove,
   onReset,
@@ -72,18 +103,40 @@ function PaneCard({
   onAgent,
   onConnection,
   onModel,
+  onWorkspace,
+  onMcpServers,
 }: PaneCardProps) {
   const [prompt, setPrompt] = useState('')
-  const { run, stop, status } = useGatewayStream()
+  const [permission, setPermission] = useState<GatewayPermissionRequest | null>(null)
+  const permissionResolverRef = useRef<((optionId: string | null) => void) | null>(null)
+  const { run, stop, status, providers, providersError } = useGatewayStream()
   const { addRun, appendLog, updateRun } = useRuns()
   const terminalRef = useRef<HTMLDivElement>(null)
   const busy = status === 'connecting' || status === 'running'
-  const persistentSession = agent.providerId !== 'kiro-cli'
+  const isAgenticKiro = agent.providerId === 'kiro-agent'
+  const isKiroInference = agent.providerId === 'kiro-cli' || agent.providerId === 'kiro-inference'
+  const persistentSession = agent.providerId !== 'kiro-cli' && agent.providerId !== 'kiro-inference'
   const meta = statusMeta[status]
+  const provider = providerFor(providers, agent.providerId)
+  const providerUnavailable = isAgenticKiro && provider?.capabilities.available !== true
+  const unavailableReason = provider?.capabilities.unavailableReason
+    ?? (providersError || 'Sedang memeriksa runtime Kiro Agent…')
   const selectedConnection = kiroConnections.find(
     (connection) => connection.id === pane.connectionId,
   )
   const availableModels = selectedConnection?.models ?? []
+  const compatibleMcpServers = mcpServers.filter((server) =>
+    server.enabled && server.trusted && (agent.toolPolicy !== 'read-only' || server.readOnly),
+  )
+
+  const settlePermission = useCallback((optionId: string | null) => {
+    const resolve = permissionResolverRef.current
+    permissionResolverRef.current = null
+    setPermission(null)
+    resolve?.(optionId)
+  }, [])
+
+  useEffect(() => () => settlePermission(null), [settlePermission])
 
   useEffect(() => {
     if (terminalRef.current) terminalRef.current.scrollTop = terminalRef.current.scrollHeight
@@ -91,22 +144,24 @@ function PaneCard({
 
   function handleRun() {
     const task = prompt.trim()
-    if (!task || busy) return
-    if (agent.providerId === 'kiro-cli' && !pane.connectionId) {
+    if (!task || busy || providerUnavailable) return
+    if (isKiroInference && !pane.connectionId) {
       onAppend(pane.id, ['[error] Pilih connection Kiro aktif sebelum mengirim prompt.'])
       return
     }
-    if (
-      agent.providerId === 'kiro-cli'
-      && (!pane.modelId || !availableModels.includes(pane.modelId))
-    ) {
+    if (isKiroInference && (!pane.modelId || !availableModels.includes(pane.modelId))) {
       onAppend(pane.id, ['[error] Pilih model Kiro aktif sebelum mengirim prompt.'])
+      return
+    }
+    if (isAgenticKiro && !pane.workspaceId) {
+      onAppend(pane.id, ['[error] Pilih workspace sebelum menjalankan Kiro Agent.'])
       return
     }
 
     const startedAt = new Date()
     const runId = newRunId()
     let output = ''
+    const selectedModel = isKiroInference ? pane.modelId : agent.model
     const gatewayRun: Run = {
       id: runId,
       task,
@@ -123,7 +178,7 @@ function PaneCard({
           ts: nowTime(),
           level: 'info',
           agent: agent.name,
-          message: `Memulai ${agent.providerId} dengan model ${agent.providerId === 'kiro-cli' ? pane.modelId : agent.model || 'Auto'}`,
+          message: `Memulai ${agent.providerId} dengan model ${selectedModel || 'Auto'}`,
         },
       ],
     }
@@ -135,12 +190,14 @@ function PaneCard({
       task,
       {
         providerId: agent.providerId,
-        connectionId: agent.providerId === 'kiro-cli' ? pane.connectionId : undefined,
+        connectionId: isKiroInference ? pane.connectionId : undefined,
+        workspaceId: isAgenticKiro ? pane.workspaceId : undefined,
         agent: {
           id: agent.id,
-          model: agent.providerId === 'kiro-cli' ? pane.modelId : agent.model,
+          model: selectedModel,
           systemPrompt: agent.systemPrompt,
           toolPolicy: agent.toolPolicy,
+          mcpServerIds: isAgenticKiro ? pane.mcpServerIds : undefined,
         },
         sessionId: pane.sessionId,
         resume: persistentSession && pane.turns > 0,
@@ -163,6 +220,17 @@ function PaneCard({
             })
           }
         },
+        onThought: (text) => onAppend(pane.id, eventLines('[thinking]', text)),
+        onPlan: ({ plan }) => onAppend(pane.id, eventLines('[plan]', plan)),
+        onToolCall: ({ toolCall }) => onAppend(pane.id, eventLines('[tool]', toolCall)),
+        onToolCallUpdate: ({ toolCall }) => onAppend(pane.id, eventLines('[tool:update]', toolCall)),
+        onDiagnostic: ({ diagnostic }) => onAppend(pane.id, eventLines('[diagnostic]', diagnostic)),
+        onPermissionRequest: (request) => new Promise<string | null>((resolve) => {
+          permissionResolverRef.current?.(null)
+          permissionResolverRef.current = resolve
+          setPermission(request)
+        }),
+        onPermissionCancelled: () => settlePermission(null),
         onDone: (result) => {
           const success = result.code === 0 && result.reason === 'completed'
           if (success) onBump(pane.id)
@@ -255,9 +323,71 @@ function PaneCard({
           </select>
           <Badge color="sky">{agent.providerId}</Badge>
           <Badge color="neutral">tools: {agent.toolPolicy}</Badge>
+          {provider?.capabilities.runtime?.version && (
+            <Badge color="neutral">runtime {provider.capabilities.runtime.version}</Badge>
+          )}
         </div>
 
-        {agent.providerId === 'kiro-cli' && (
+        {isAgenticKiro && providerUnavailable && (
+          <div role="alert" className="rounded-lg border-2 border-ink bg-danger p-3 text-xs font-semibold">
+            <div className="font-bold">Kiro Agent belum tersedia</div>
+            <div className="mt-1">{unavailableReason}</div>
+          </div>
+        )}
+
+        {isAgenticKiro && (
+          <div className="space-y-3 rounded-lg border-2 border-dashed border-ink/30 bg-cream p-3">
+            <div className="space-y-1">
+              <label htmlFor={`workspace-${pane.id}`} className="text-[10px] font-bold uppercase tracking-wider text-ink/60">
+                Workspace
+              </label>
+              <select
+                id={`workspace-${pane.id}`}
+                value={pane.workspaceId}
+                onChange={(event) => onWorkspace(pane.id, event.target.value)}
+                disabled={busy || workspaces.length === 0}
+                className="w-full rounded-lg border-2 border-ink bg-paper px-2 py-1.5 text-xs font-bold outline-none disabled:opacity-60"
+              >
+                <option value="">Pilih workspace</option>
+                {workspaces.map((workspace) => (
+                  <option key={workspace.id} value={workspace.id}>{workspace.name} · {workspace.id}</option>
+                ))}
+              </select>
+            </div>
+            <fieldset disabled={busy}>
+              <legend className="text-[10px] font-bold uppercase tracking-wider text-ink/60">MCP server</legend>
+              {compatibleMcpServers.length === 0 ? (
+                <p className="mt-1 text-xs text-ink/60">Belum ada MCP server enabled + trusted yang cocok dengan policy ini.</p>
+              ) : (
+                <div className="mt-1 grid gap-1 sm:grid-cols-2">
+                  {compatibleMcpServers.map((server) => (
+                    <label key={server.id} className="flex items-start gap-2 rounded-md border border-ink/20 bg-paper p-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={pane.mcpServerIds.includes(server.id)}
+                        onChange={(event) => onMcpServers(
+                          pane.id,
+                          event.target.checked
+                            ? [...pane.mcpServerIds, server.id]
+                            : pane.mcpServerIds.filter((id) => id !== server.id),
+                        )}
+                      />
+                      <span>
+                        <strong>{server.name}</strong>
+                        <span className="block text-[10px] text-ink/50">
+                          {server.transport}{server.readOnly ? ' · read-only' : ''}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </fieldset>
+            {agenticError && <p className="text-xs font-bold text-danger">{agenticError}</p>}
+          </div>
+        )}
+
+        {isKiroInference && (
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="space-y-1">
               <label htmlFor={`kiro-connection-${pane.id}`} className="text-[10px] font-bold uppercase tracking-wider text-ink/60">
@@ -308,8 +438,13 @@ function PaneCard({
         <details className="rounded-lg border-2 border-dashed border-ink/30 bg-cream px-3 py-2 text-xs">
           <summary className="cursor-pointer font-bold">Konfigurasi agent</summary>
           <div className="mt-2 space-y-1 text-ink/60">
-            <p>Model: {agent.providerId === 'kiro-cli' ? pane.modelId || 'Belum dipilih' : agent.model || 'Auto'}</p>
+            <p>Model: {isKiroInference ? pane.modelId || 'Belum dipilih' : agent.model || 'Auto'}</p>
             <p>System prompt: {agent.systemPrompt}</p>
+            {provider && (
+              <p>
+                Capability: streaming {provider.capabilities.streaming ? 'ya' : 'tidak'} · sesi {provider.capabilities.sessions ? 'ya' : 'tidak'} · cancel {provider.capabilities.cancellation ? 'ya' : 'tidak'} · tools {provider.capabilities.tools ? 'ya' : 'tidak'}
+              </p>
+            )}
           </div>
         </details>
 
@@ -337,6 +472,30 @@ function PaneCard({
           )}
         </div>
 
+        {permission && (
+          <div role="alertdialog" aria-live="assertive" className="rounded-lg border-2 border-ink bg-mustard p-3 shadow-hard-sm">
+            <div className="text-sm font-bold">Kiro minta permission tool</div>
+            <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-md border-2 border-ink bg-paper p-2 text-[11px]">
+              {eventText(permission.toolCall)}
+            </pre>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {permission.options.map((option) => (
+                <Button
+                  key={option.optionId}
+                  size="sm"
+                  variant={option.kind.startsWith('reject') ? 'danger' : 'secondary'}
+                  onClick={() => settlePermission(option.optionId)}
+                >
+                  {option.name || option.kind}
+                </Button>
+              ))}
+            </div>
+            <p className="mt-2 text-[10px] font-semibold text-ink/60">
+              Kalau lo nggak memilih sampai timeout, server akan menolak otomatis.
+            </p>
+          </div>
+        )}
+
         <textarea
           value={prompt}
           onChange={(event) => setPrompt(event.target.value)}
@@ -347,7 +506,7 @@ function PaneCard({
             }
           }}
           rows={2}
-          disabled={busy}
+          disabled={busy || providerUnavailable}
           placeholder={pane.turns > 0 ? 'Lanjutkan percakapan...' : `Ketik prompt untuk ${agent.name}...`}
           className="w-full resize-none rounded-lg border-2 border-ink bg-cream px-3 py-2 font-mono text-sm outline-none placeholder:text-ink/40 focus:bg-paper disabled:opacity-60"
         />
@@ -368,7 +527,9 @@ function PaneCard({
               onClick={handleRun}
               disabled={
                 !prompt.trim()
-                || (agent.providerId === 'kiro-cli'
+                || providerUnavailable
+                || (isAgenticKiro && !pane.workspaceId)
+                || (isKiroInference
                   && (!pane.connectionId || !pane.modelId || !availableModels.includes(pane.modelId)))
               }
             >
@@ -395,37 +556,64 @@ export function Playground() {
     setAgent,
     setConnection,
     setModel,
+    setWorkspace,
+    setMcpServers,
   } = usePanes()
   const [searchParams, setSearchParams] = useSearchParams()
   const [kiroConnections, setKiroConnections] = useState<GatewayConnection[]>([])
   const [connectionsError, setConnectionsError] = useState('')
+  const [workspaces, setWorkspaces] = useState<GatewayWorkspace[]>([])
+  const [mcpServers, setMcpServersState] = useState<GatewayMcpServer[]>([])
+  const [agenticError, setAgenticError] = useState('')
   const consumedAgent = useRef(false)
   const full = panes.length >= MAX_PANES
 
   useEffect(() => {
     let active = true
-    gatewayApi.listConnections().then(
-      (connections) => {
-        if (!active) return
+    void Promise.allSettled([
+      gatewayApi.listConnections(),
+      gatewayApi.listWorkspaces(),
+      gatewayApi.listMcpServers(),
+    ]).then(([connectionsResult, workspacesResult, mcpResult]) => {
+      if (!active) return
+      if (connectionsResult.status === 'fulfilled') {
         setKiroConnections(
-          connections.filter(
+          connectionsResult.value.filter(
             (connection) => connection.kind === 'kiro-cli' && connection.enabled && connection.hasApiKey,
           ),
         )
         setConnectionsError('')
-      },
-      (error) => {
-        if (!active) return
-        setConnectionsError(error instanceof Error ? error.message : 'Gagal membaca connection Kiro')
-      },
-    )
+      } else {
+        setConnectionsError(connectionsResult.reason instanceof Error ? connectionsResult.reason.message : 'Gagal membaca connection Kiro')
+      }
+      const errors: string[] = []
+      if (workspacesResult.status === 'fulfilled') setWorkspaces(workspacesResult.value)
+      else errors.push(workspacesResult.reason instanceof Error ? workspacesResult.reason.message : 'Gagal membaca workspace')
+      if (mcpResult.status === 'fulfilled') setMcpServersState(mcpResult.value)
+      else errors.push(mcpResult.reason instanceof Error ? mcpResult.reason.message : 'Gagal membaca MCP server')
+      setAgenticError(errors.join(' · '))
+    })
     return () => { active = false }
   }, [])
 
   useEffect(() => {
     for (const pane of panes) {
       const agent = agents.find((candidate) => candidate.id === pane.agentId)
-      if (agent?.providerId !== 'kiro-cli') continue
+      if (agent?.providerId === 'kiro-agent') {
+        if (!workspaces.some((workspace) => workspace.id === pane.workspaceId) && workspaces.length > 0) {
+          setWorkspace(pane.id, workspaces[0].id)
+          continue
+        }
+        const compatibleIds = new Set(
+          mcpServers
+            .filter((server) => server.enabled && server.trusted && (agent.toolPolicy !== 'read-only' || server.readOnly))
+            .map((server) => server.id),
+        )
+        const nextIds = pane.mcpServerIds.filter((id) => compatibleIds.has(id))
+        if (nextIds.length !== pane.mcpServerIds.length) setMcpServers(pane.id, nextIds)
+        continue
+      }
+      if (agent?.providerId !== 'kiro-cli' && agent?.providerId !== 'kiro-inference') continue
 
       if (!pane.connectionId && kiroConnections.length === 1) {
         setConnection(pane.id, kiroConnections[0].id)
@@ -445,7 +633,7 @@ export function Playground() {
         )
       }
     }
-  }, [kiroConnections, panes, setConnection, setModel])
+  }, [kiroConnections, mcpServers, panes, setConnection, setMcpServers, setModel, setWorkspace, workspaces])
 
   useEffect(() => {
     if (consumedAgent.current) return
@@ -461,7 +649,7 @@ export function Playground() {
     <div className="space-y-6">
       <PageTitle
         title="AI Playground"
-        subtitle="Claude berjalan via CLI lokal; Kiro streaming via HTTPS dengan credential connection tersimpan."
+        subtitle="Kiro Assistant jalan agentic via ACP dengan workspace, permission interaktif, dan MCP pilihan lo."
         action={
           <Button variant="primary" size="sm" onClick={() => addPane()} disabled={full}>
             <PlusIcon width={16} height={16} />
@@ -471,7 +659,7 @@ export function Playground() {
       />
 
       <div className="flex items-center gap-2">
-        <Badge color="ok">CLI + HTTPS</Badge>
+        <Badge color="ok">CLI + ACP + HTTPS</Badge>
         <span className="text-xs font-bold uppercase tracking-wider text-ink/60">
           {panes.length} / {MAX_PANES} sesi
         </span>
@@ -481,7 +669,7 @@ export function Playground() {
         <Card>
           <CardBody className="flex flex-col items-center gap-3 py-12 text-center">
             <p className="text-sm text-ink/60">
-              Belum ada sesi. Credential provider tetap tersimpan aman di server.
+              Belum ada sesi. Credential provider dan secret MCP tetap tersimpan aman di server.
             </p>
             <Button variant="primary" onClick={() => addPane()}>
               <PlusIcon width={16} height={16} />
@@ -500,6 +688,9 @@ export function Playground() {
                 agent={agent}
                 kiroConnections={kiroConnections}
                 connectionsError={connectionsError}
+                workspaces={workspaces}
+                mcpServers={mcpServers}
+                agenticError={agenticError}
                 canClose={panes.length > 1}
                 onRemove={removePane}
                 onReset={resetPane}
@@ -510,6 +701,8 @@ export function Playground() {
                 onAgent={setAgent}
                 onConnection={setConnection}
                 onModel={setModel}
+                onWorkspace={setWorkspace}
+                onMcpServers={setMcpServers}
               />
             )
           })}

@@ -116,6 +116,46 @@ export interface GatewayWsTicket {
   expiresAt: number
 }
 
+export interface GatewayWorkspace {
+  id: string
+  name: string
+}
+
+export type McpTransport = 'stdio' | 'http' | 'sse'
+
+/** Metadata MCP yang aman ditampilkan. Secret env/header tidak pernah dikembalikan server. */
+export interface GatewayMcpServer {
+  id: string
+  name: string
+  transport: McpTransport
+  enabled: boolean
+  trusted: boolean
+  readOnly: boolean
+  command?: string
+  args?: string[]
+  url?: string
+  hasSecrets: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface GatewayMcpServerInput {
+  id: string
+  name: string
+  transport: McpTransport
+  enabled: boolean
+  trusted: boolean
+  readOnly: boolean
+  command?: string
+  args?: string[]
+  url?: string
+  /** Write-only. Nilai ini tidak pernah tersedia dari list/get. */
+  env?: Record<string, string>
+  /** Write-only. Nilai ini tidak pernah tersedia dari list/get. */
+  headers?: Record<string, string>
+  clearSecrets?: boolean
+}
+
 export type UsageRange = '24h' | '7d' | '30d'
 
 export interface GatewayUsageEvent {
@@ -212,6 +252,22 @@ export const gatewayApi = {
   logout: () => request<{ ok: boolean }>('/admin/logout', { method: 'POST' }),
   session: () => request<{ authenticated: boolean }>('/admin/session'),
   issueWsTicket: () => request<GatewayWsTicket>('/admin/ws-ticket', { method: 'POST' }),
+  listWorkspaces: () => request<GatewayWorkspace[]>('/admin/workspaces'),
+  listMcpServers: () => request<GatewayMcpServer[]>('/admin/mcp-servers'),
+  createMcpServer: (input: GatewayMcpServerInput) =>
+    request<GatewayMcpServer>('/admin/mcp-servers', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  updateMcpServer: (id: string, input: Partial<GatewayMcpServerInput>) =>
+    request<GatewayMcpServer>(`/admin/mcp-servers/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    }),
+  deleteMcpServer: (id: string) =>
+    request<GatewayMcpServer>(`/admin/mcp-servers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
   listConnections: () => request<GatewayConnection[]>('/admin/connections'),
   createConnection: (input: ConnectionInput) =>
     request<GatewayConnection>('/admin/connections', {

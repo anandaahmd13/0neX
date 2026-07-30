@@ -151,6 +151,19 @@ function updateKind(update) {
   return String(update?.sessionUpdate ?? update?.type ?? '').replaceAll(/[_-]/g, '').toLowerCase()
 }
 
+function assertMcpTransports(mcpServers, initialized) {
+  const capabilities = initialized?.agentCapabilities?.mcpCapabilities ?? {}
+  for (const server of mcpServers) {
+    const transport = server?.type ?? 'stdio'
+    if (transport === 'stdio') continue
+    if (transport === 'http' && capabilities.http === true) continue
+    if (transport === 'sse' && capabilities.sse === true) continue
+    throw new KiroRunnerError(`Kiro ACP tidak mendukung MCP transport ${transport}.`, {
+      code: 'KIRO_MCP_TRANSPORT_UNSUPPORTED',
+    })
+  }
+}
+
 function composePrompt(prompt, systemPrompt) {
   if (!systemPrompt) return String(prompt ?? '')
   // ACP v1 exposes user content but no system-role content. Preserve the
@@ -386,7 +399,11 @@ export function createKiroRunner(options = {}) {
         supports: {
           acp: true,
           loadSession: initialized.agentCapabilities?.loadSession === true,
-          mcpTransports: [],
+          mcpTransports: [
+            'stdio',
+            ...(initialized.agentCapabilities?.mcpCapabilities?.http === true ? ['http'] : []),
+            ...(initialized.agentCapabilities?.mcpCapabilities?.sse === true ? ['sse'] : []),
+          ],
         },
       }
     } catch (error) {
@@ -616,6 +633,8 @@ export function createKiroRunner(options = {}) {
     const onSession = handlers.onSession ?? (() => {})
     const onDone = handlers.onDone ?? (() => {})
     const onError = handlers.onError ?? (() => {})
+    const clientServices = request?.clientServices ?? null
+    const mcpServers = Array.isArray(request?.mcpServers) ? request.mcpServers : []
     const allowTools = request?.allowTools ?? options.allowTools ?? false
     let child = null
     let transport = null
@@ -650,6 +669,7 @@ export function createKiroRunner(options = {}) {
     }
 
     const closeProcess = () => {
+      clientServices?.dispose?.()
       transport?.close()
       scheduleKill()
     }
@@ -785,13 +805,16 @@ export function createKiroRunner(options = {}) {
       if (message.method === 'session/request_permission') {
         if (!allowTools) return permissionDenial(message.params)
         if (typeof handlers.onPermissionRequest !== 'function') return permissionDenial(message.params)
-        const decision = await handlers.onPermissionRequest(message.params)
-        if (decision?.outcome) return decision
-        if (typeof decision === 'string') {
-          return { outcome: { outcome: 'selected', optionId: decision } }
-        }
-        return permissionDenial(message.params)
+        const requestedDecision = await handlers.onPermissionRequest(message.params)
+        const decision = requestedDecision?.outcome
+          ? requestedDecision
+          : typeof requestedDecision === 'string'
+            ? { outcome: { outcome: 'selected', optionId: requestedDecision } }
+            : permissionDenial(message.params)
+        clientServices?.guard?.recordPermission?.(message.params, decision)
+        return decision
       }
+      if (clientServices?.handle) return clientServices.handle(message)
       throw new KiroRunnerError(`Unsupported ACP client method: ${message.method}`, {
         code: 'KIRO_ACP_UNSUPPORTED_METHOD',
       })
@@ -871,7 +894,7 @@ export function createKiroRunner(options = {}) {
 
         const initialized = await transport.request('initialize', {
           protocolVersion: 1,
-          clientCapabilities: {},
+          clientCapabilities: clientServices?.capabilities ?? {},
           clientInfo: CLIENT_INFO,
         })
         if (terminal || stopped) return
@@ -881,6 +904,7 @@ export function createKiroRunner(options = {}) {
             { code: 'KIRO_ACP_VERSION' },
           )
         }
+        assertMcpTransports(mcpServers, initialized)
 
         if (request.resume) {
           if (!initialized?.agentCapabilities?.loadSession) {
@@ -891,13 +915,13 @@ export function createKiroRunner(options = {}) {
           await transport.request('session/load', {
             sessionId: request.sessionId,
             cwd,
-            mcpServers: [],
+            mcpServers,
           })
           if (terminal || stopped) return
           activeSessionId = request.sessionId
           onSession(activeSessionId)
         } else {
-          const created = await transport.request('session/new', { cwd, mcpServers: [] })
+          const created = await transport.request('session/new', { cwd, mcpServers })
           if (terminal || stopped) return
           if (typeof created?.sessionId !== 'string' || !created.sessionId) {
             throw new KiroRunnerError('Kiro ACP session/new tidak mengembalikan sessionId.', {

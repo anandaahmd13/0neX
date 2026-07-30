@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -116,6 +116,7 @@ async function setupGateway(t, overrides = {}) {
           ...process.env,
           KIRO_FIXTURE_MODE: overrides.kiroFixtureMode,
           KIRO_FIXTURE_RECORD: kiroRecordFile,
+          KIRO_FIXTURE_TOOL_PATH: overrides.kiroFixtureToolPath,
         },
         dataDir: gatewayDataDir,
         timeoutMs: 2_000,
@@ -146,6 +147,7 @@ async function setupGateway(t, overrides = {}) {
     kiroHttpClient,
     kiroRunner,
     kiroAcpCwd: overrides.kiroAcpCwd,
+    workspaces: overrides.workspaces,
     providers: overrides.providers,
     env: {
       ...process.env,
@@ -427,9 +429,10 @@ test('Kiro Agent probes ACP and supports new and resumed sessions over ticketed 
       streaming: true,
       sessions: true,
       cancellation: true,
-      tools: false,
+      tools: true,
+      toolPolicies: ['none', 'read-only', 'standard'],
       available: true,
-      runtime: { version: '1.0.0', acpProtocolVersion: 1 },
+      runtime: { version: '1.0.0', acpProtocolVersion: 1, mcpTransports: ['stdio'] },
     },
   })
 
@@ -499,6 +502,129 @@ test('Kiro Agent probes ACP and supports new and resumed sessions over ticketed 
     'initialize', 'session/new', 'session/prompt',
     'initialize', 'session/load', 'session/prompt',
   ])
+})
+
+test('Kiro Agent sends selected encrypted MCP config using the exact ACP schema', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), '0nex-kiro-mcp-workspace-'))
+  const secret = 'mcp-secret-must-stay-server-side'
+  const { baseUrl, wsUrl, kiroRecordFile, gatewayDataDir } = await setupGateway(t, {
+    kiroFixtureMode: 'normal',
+    kiroAcpCwd: workspace,
+    workspaces: [{ id: 'mcp-workspace', name: 'MCP workspace', root: workspace }],
+  })
+
+  const created = await jsonRequest(`${baseUrl}/admin/mcp-servers`, ADMIN_TOKEN, {
+    method: 'POST',
+    body: JSON.stringify({
+      id: 'fixture-mcp',
+      name: 'Fixture MCP',
+      transport: 'stdio',
+      command: process.execPath,
+      args: ['fixture-server.mjs'],
+      env: { FIXTURE_TOKEN: secret },
+      enabled: true,
+      trusted: true,
+      readOnly: true,
+    }),
+  })
+  assert.equal(created.response.status, 201, JSON.stringify(created.payload))
+  assert.equal(created.payload.data.hasSecrets, true)
+  assert.equal('env' in created.payload.data, false)
+  const persisted = await readFile(join(gatewayDataDir, 'mcp-servers.json'), 'utf8')
+  assert.equal(persisted.includes(secret), false)
+
+  const ticket = await issueWsTicket(baseUrl)
+  const client = connect(ticketUrl(wsUrl, ticket))
+  t.after(() => client.socket.close())
+  await client.opened
+  await client.next((message) => message.type === 'hello')
+  client.socket.send(JSON.stringify(runMessage({
+    runId: 'run-mcp-config',
+    providerId: 'kiro-agent',
+    workspaceId: 'mcp-workspace',
+    prompt: 'use the selected MCP server',
+    agent: {
+      id: 'agt_kiro',
+      model: '',
+      systemPrompt: '',
+      toolPolicy: 'standard',
+      mcpServerIds: ['fixture-mcp'],
+    },
+  })))
+  await client.next((message) => message.type === 'done')
+
+  const entries = await fixtureRecords(kiroRecordFile)
+  const sessionNew = fixtureRpcMessages(entries).find((message) => message.method === 'session/new')
+  assert.deepEqual(sessionNew.params.mcpServers, [{
+    name: 'Fixture MCP',
+    command: process.execPath,
+    args: ['fixture-server.mjs'],
+    env: [{ name: 'FIXTURE_TOKEN', value: secret }],
+  }])
+})
+
+test('Kiro Agent writes inside the selected workspace after allow-once permission', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), '0nex-kiro-workspace-'))
+  const target = join(workspace, 'generated.txt')
+  const { baseUrl, wsUrl, kiroRecordFile } = await setupGateway(t, {
+    kiroFixtureMode: 'tool-write',
+    kiroAcpCwd: workspace,
+    kiroFixtureToolPath: target,
+    workspaces: [{ id: 'workspace-test', name: 'Workspace test', root: workspace }],
+  })
+
+  const listed = await jsonRequest(`${baseUrl}/admin/workspaces`, ADMIN_TOKEN)
+  assert.equal(listed.response.status, 200)
+  assert.deepEqual(listed.payload.data, [{ id: 'workspace-test', name: 'Workspace test' }])
+
+  const ticket = await issueWsTicket(baseUrl)
+  const client = connect(ticketUrl(wsUrl, ticket))
+  t.after(() => client.socket.close())
+  await client.opened
+  await client.next((message) => message.type === 'hello')
+
+  const runId = 'run-tool-write'
+  client.socket.send(JSON.stringify(runMessage({
+    runId,
+    providerId: 'kiro-agent',
+    workspaceId: 'workspace-test',
+    prompt: 'write the generated file',
+    agent: { id: 'agt_kiro', model: '', systemPrompt: '', toolPolicy: 'standard' },
+  })))
+
+  const permission = await client.next((message) => message.type === 'permission_request')
+  assert.equal(permission.runId, runId)
+  assert.equal(permission.toolCall.kind, 'write')
+  await assert.rejects(readFile(target, 'utf8'), (error) => error.code === 'ENOENT')
+
+  client.socket.send(JSON.stringify({
+    type: 'permission_response',
+    runId,
+    requestId: permission.requestId,
+    optionId: 'allow',
+  }))
+  const toolUpdate = await client.next(
+    (message) => message.type === 'tool_call_update' && message.toolCall.status === 'completed',
+  )
+  assert.equal(toolUpdate.toolCall.toolCallId, 'tool-write-1')
+  assert.equal(
+    (await client.next((message) => message.type === 'message_delta')).text,
+    'write completed',
+  )
+  const done = await client.next((message) => message.type === 'done')
+  assert.equal(done.reason, 'completed')
+  assert.equal(await readFile(target, 'utf8'), 'written through ACP\n')
+
+  const entries = await fixtureRecords(kiroRecordFile)
+  const runInitialize = fixtureRpcMessages(entries)
+    .filter((message) => message.method === 'initialize')
+    .at(-1)
+  assert.deepEqual(runInitialize.params.clientCapabilities, {
+    fs: { readTextFile: true, writeTextFile: true },
+    terminal: true,
+  })
+  const created = fixtureRpcMessages(entries).find((message) => message.method === 'session/new')
+  assert.equal(await realpath(created.params.cwd), await realpath(workspace))
 })
 
 test('Kiro Agent cancellation reaches the ACP subprocess', async (t) => {

@@ -4,12 +4,14 @@
 
 Tampilan menggunakan gaya **neo-brutalist** dengan React, TypeScript, dan Tailwind CSS.
 
-> Status: **v0.3** — OpenAI-compatible gateway, encrypted provider connections, usage telemetry, serta Playground Claude CLI dan Kiro HTTPS. Data workflow/agent utama masih dipersist di browser.
+> Status: **v0.4** — OpenAI-compatible gateway, encrypted provider connections, usage telemetry, Playground Claude CLI, Kiro HTTPS inference, dan **Kiro Agent (ACP)** dengan tools: workspace filesystem, terminal, permission interaktif, dan MCP server. Data workflow/agent utama masih dipersist di browser.
 
 ## Fitur
 
 - **Personal AI Gateway** — endpoint `POST /v1/chat/completions` dan `GET /v1/models` yang kompatibel dengan SDK OpenAI.
 - **Provider Connections** — kelola provider OpenAI-compatible dan Kiro HTTPS; API key terenkripsi AES-256-GCM di server.
+- **Kiro Agent (ACP)** — jalankan Kiro CLI lewat Agent Client Protocol untuk agentic tools: workspace filesystem read/write, terminal, permission interaktif per tool call, dan MCP server pilihan. Runtime di-probe otomatis; kalau binary tidak ada, provider agent dilaporkan unavailable dan inference HTTPS tetap jalan.
+- **MCP Servers** — daftarkan MCP server (stdio/http/sse) dengan env/header terenkripsi, flag enabled/trusted/read-only. Hanya server yang enabled, trusted, dan kompatibel policy yang diteruskan ke session ACP.
 - **Gateway API Keys** — terbitkan key `onex_sk_…` per client lewat dashboard, dengan scope, expiry, rate limit, rotate/revoke, dan atribusi usage per key. Server hanya menyimpan hash-nya.
 - **Usage Overview** — request, model, connection, status, latency, token usage, time series, dan request terbaru dari telemetry aktual.
 - **AI Playground** — percakapan multi-sesi lewat Claude Code CLI atau Kiro HTTPS dengan streaming, cancel, dan pencatatan otomatis ke Runs.
@@ -41,7 +43,18 @@ pnpm dev                     # terminal 2: UI di localhost:5199
 
 Buka halaman **AI Gateway → Connections**, pilih **OpenAI-compatible HTTP** atau **Kiro HTTPS**, lalu jalankan **Test API key**. Connection Kiro memvalidasi API key ke CodeWhisperer lewat HTTPS dan menyimpannya terenkripsi di host gateway.
 
-Kiro tidak membutuhkan binary atau environment key global. Inference melakukan HTTPS langsung ke `runtime.<region>.kiro.dev/generateAssistantResponse` dengan region, profile ARN, dan credential milik connection yang dipilih. Di **AI Playground**, pilih connection Kiro tersimpan; browser hanya mengirim ID connection dan tidak pernah menerima API key.
+Kiro HTTPS inference tidak membutuhkan binary atau environment key global. Inference melakukan HTTPS langsung ke `runtime.<region>.kiro.dev/generateAssistantResponse` dengan region, profile ARN, dan credential milik connection yang dipilih. Di **AI Playground**, pilih connection Kiro tersimpan; browser hanya mengirim ID connection dan tidak pernah menerima API key.
+
+### Kiro Agent (ACP)
+
+Provider `kiro-agent` menjalankan Kiro CLI lewat Agent Client Protocol (stdio JSON-RPC) untuk agentic tools. Berbeda dari inference HTTPS, mode ini butuh binary Kiro CLI (`KIRO_CLI_COMMAND`, default `kiro-cli`). Saat gateway start, runtime di-probe lewat `initialize` ACP; kalau binary tidak ada atau protokol tidak cocok, provider dilaporkan `available: false` dengan alasannya dan inference HTTPS tetap berfungsi normal.
+
+Boundary keamanan:
+
+- **WebSocket ticket** — run `kiro-agent` wajib memakai ticket sekali-pakai dari sesi dashboard (`POST /admin/ws-ticket`), bukan token statis. Filesystem/terminal tidak pernah dibuka lewat token yang tertanam di bundle.
+- **Tool policy** deny-by-default: `none` menolak semua tool; `read-only` hanya membaca file di workspace; `standard` mengizinkan read/write/terminal setelah **permission allow-once interaktif** per tool call. Timeout, disconnect, replay, atau opsi yang tidak ditawarkan selalu gagal aman.
+- **Workspace-scoped** — filesystem read/write dan terminal dibatasi ke root workspace terpilih; path traversal, symlink escape, dan absolute path asing ditolak. Terminal dijalankan tanpa shell, dengan env allowlist, dan dibersihkan pada exit/cancel/disconnect. Secret provider tidak diwariskan ke command.
+- **MCP** — hanya server yang enabled, trusted, dan kompatibel policy yang diteruskan ke `session/new`/`session/load` dalam schema ACP resmi. Env/header terenkripsi di server dan tidak pernah dikirim ke browser. Remote MCP wajib HTTPS dan lolos guard SSRF (termasuk DNS rebinding).
 
 ### Batas kompatibilitas Kiro Connection
 
@@ -147,12 +160,17 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ## Arsitektur Gateway
 
 ```text
-OpenAI SDK / app ── HTTPS ──> /v1/* ──> connection router ──> HTTP upstream
-                                  │                  └──> Kiro HTTPS runtime
+OpenAI SDK / app ── HTTPS ──> /v1/* ──> connection driver registry ──> HTTP upstream
+                                  │                        └──> Kiro HTTPS runtime
                                   └──> usage metadata JSONL
 
-Private dashboard ───────────> /admin/* ──> encrypted connection store
-AI Playground ──── WebSocket ─> provider registry ──> Claude CLI / Kiro HTTPS
+Private dashboard ───────────> /admin/* ──> encrypted connection + MCP store
+AI Playground ──── WebSocket ─> provider registry ──> Claude CLI
+                                        │            └──> Kiro HTTPS inference
+                                        └──> Kiro Agent ──> Kiro CLI (ACP stdio)
+                                                 │              ├─ filesystem/terminal (workspace-scoped)
+                                                 │              └─ MCP servers (stdio/http/sse)
+                                                 └──> permission broker (allow-once)
 ```
 
 - [`server/gateway-server.mjs`](server/gateway-server.mjs) melayani HTTP dan WebSocket pada host/port yang sama, termasuk auth, CORS, body/output limits, timeout, dan routing.
@@ -163,7 +181,13 @@ AI Playground ──── WebSocket ─> provider registry ──> Claude CLI /
 - [`server/gateway/openai-compatible.mjs`](server/gateway/openai-compatible.mjs) menangani model routing, safe upstream errors, dan ekstraksi usage SSE.
 - [`server/gateway/providers/claude-cli.mjs`](server/gateway/providers/claude-cli.mjs) menangani lifecycle Claude CLI lokal.
 - [`server/gateway/kiro-http.mjs`](server/gateway/kiro-http.mjs) membangun request `GenerateAssistantResponse`, memanggil runtime regional, dan mem-parse AWS EventStream secara incremental.
-- [`server/gateway/providers/kiro-cli.mjs`](server/gateway/providers/kiro-cli.mjs) mempertahankan provider ID lama demi kompatibilitas, tetapi menjalankan Kiro HTTPS memakai connection terenkripsi yang dipilih di Playground.
+- [`server/gateway/providers/kiro-inference.mjs`](server/gateway/providers/kiro-inference.mjs) provider Kiro HTTPS inference (`kiro-inference`) plus alias `kiro-cli` demi kompatibilitas state lama, memakai connection terenkripsi yang dipilih di Playground.
+- [`server/gateway/providers/kiro-acp.mjs`](server/gateway/providers/kiro-acp.mjs) provider `kiro-agent`: probe runtime, resolve workspace/MCP, dan jembatani permission broker ke ACP.
+- [`server/gateway/kiro-runner.mjs`](server/gateway/kiro-runner.mjs) lifecycle child Kiro CLI, transport ACP, session/prompt/cancel, dan capability gating MCP transport.
+- [`server/gateway/acp-client-services.mjs`](server/gateway/acp-client-services.mjs) filesystem/terminal service workspace-scoped dengan tool policy guard.
+- [`server/gateway/mcp-store.mjs`](server/gateway/mcp-store.mjs) registry MCP terenkripsi dengan guard trusted/read-only dan SSRF, dinormalisasi ke schema ACP resmi.
+- [`server/gateway/workspace-registry.mjs`](server/gateway/workspace-registry.mjs) resolusi workspace root yang aman dari ID yang dikirim browser.
+- [`server/gateway/ws-permission-broker.mjs`](server/gateway/ws-permission-broker.mjs) permission allow-once dengan validasi run/option, timeout, dan anti-replay.
 
 Data server default berada di `.data/gateway/` dan diabaikan Git. Jangan mengubah `GATEWAY_MASTER_KEY` setelah connection dibuat; key baru tidak bisa mendekripsi secret lama.
 
@@ -198,14 +222,24 @@ Test integrasi mencakup encrypted connection storage, migrasi schema, auth/CORS,
 server/
 ├── gateway-server.mjs
 └── gateway/
+    ├── acp-client-services.mjs
     ├── api-key-store.mjs
+    ├── connection-driver-registry.mjs
     ├── connection-store.mjs
+    ├── kiro-inference-driver.mjs
+    ├── kiro-runner.mjs
+    ├── kiro-transport.mjs
+    ├── mcp-store.mjs
     ├── openai-compatible.mjs
     ├── provider-registry.mjs
     ├── secrets.mjs
     ├── usage-store.mjs
+    ├── workspace-registry.mjs
+    ├── ws-permission-broker.mjs
     └── providers/
-        └── claude-cli.mjs
+        ├── claude-cli.mjs
+        ├── kiro-acp.mjs
+        └── kiro-inference.mjs
 src/
 ├── components/
 ├── pages/

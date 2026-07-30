@@ -6,6 +6,7 @@ import { appendFileSync } from 'node:fs'
 const args = process.argv.slice(2)
 const mode = process.env.KIRO_FIXTURE_MODE ?? 'normal'
 const recordFile = process.env.KIRO_FIXTURE_RECORD
+const toolPath = process.env.KIRO_FIXTURE_TOOL_PATH
 
 function record(type, data = {}) {
   if (!recordFile) return
@@ -169,12 +170,38 @@ function runAcp() {
     if (Object.hasOwn(message, 'result') || Object.hasOwn(message, 'error')) {
       if (message.id === 900 && promptRequest) {
         record('permission-response', { message })
+        if (mode === 'tool-write' && message.result?.outcome?.optionId === 'allow') {
+          send({
+            jsonrpc: '2.0',
+            id: 901,
+            method: 'fs/write_text_file',
+            params: { path: toolPath, content: 'written through ACP\n' },
+          })
+          return
+        }
         sendTogether([
           notification(activeSessionId, {
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: 'permission denied safely' },
           }),
           notification(activeSessionId, { sessionUpdate: 'turn_end', stopReason: 'end_turn' }),
+          response(promptRequest.id, { stopReason: 'end_turn' }),
+        ])
+        promptRequest = null
+        return
+      }
+      if (message.id === 901 && promptRequest && mode === 'tool-write') {
+        record('tool-response', { message })
+        sendTogether([
+          notification(activeSessionId, {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'tool-write-1',
+            status: message.error ? 'failed' : 'completed',
+          }),
+          notification(activeSessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: message.error ? 'write failed' : 'write completed' },
+          }),
           response(promptRequest.id, { stopReason: 'end_turn' }),
         ])
         promptRequest = null
@@ -235,12 +262,14 @@ function runAcp() {
         }))
         return
       }
-      if (mode === 'permission') {
+      if (mode === 'permission' || mode === 'tool-write') {
+        const toolCall = mode === 'tool-write'
+          ? { toolCallId: 'tool-write-1', title: 'Write workspace file', kind: 'write' }
+          : { toolCallId: 'tool-1', title: 'Dangerous tool' }
         sendTogether([
           notification(activeSessionId, {
             sessionUpdate: 'tool_call',
-            toolCallId: 'tool-1',
-            title: 'Dangerous tool',
+            ...toolCall,
             status: 'pending',
           }),
           {
@@ -249,7 +278,7 @@ function runAcp() {
             method: 'session/request_permission',
             params: {
               sessionId: activeSessionId,
-              toolCall: { toolCallId: 'tool-1' },
+              toolCall,
               options: [
                 { optionId: 'allow', kind: 'allow_once', name: 'Allow' },
                 { optionId: 'reject', kind: 'reject_once', name: 'Reject' },

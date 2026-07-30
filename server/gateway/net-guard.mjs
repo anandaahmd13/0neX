@@ -48,31 +48,41 @@ export function isPrivateAddress(address) {
  * kalau nama domain, resolusi DNS dulu dan tolak bila ADA satu saja jawaban
  * yang mengarah ke ruang alamat internal (mitigasi DNS rebinding sederhana).
  */
-export async function assertPublicHost(hostname, { allowLocalhost = false } = {}) {
+function isLoopbackAddress(address) {
+  const normalized = String(address).toLowerCase().replace(/^\[|\]$/g, '').split('%')[0]
+  if (normalized === '::1') return true
+  if (isIP(normalized) !== 4) return false
+  return normalized.split('.')[0] === '127'
+}
+
+export async function assertPublicHost(hostname, {
+  allowLocalhost = false,
+  lookupFn = lookup,
+} = {}) {
   const family = isIP(hostname)
   if (family) {
-    if (!allowLocalhost && isPrivateAddress(hostname)) {
+    if (isPrivateAddress(hostname) && !(allowLocalhost && isLoopbackAddress(hostname))) {
       throw new Error(`Host ${hostname} mengarah ke alamat jaringan internal`)
     }
     return
   }
 
   const lower = hostname.toLowerCase()
-  if (lower === 'localhost' || lower.endsWith('.localhost')) {
+  const localhostName = lower === 'localhost' || lower.endsWith('.localhost')
+  if (localhostName) {
     if (allowLocalhost) return
     throw new Error('Host localhost tidak diizinkan')
   }
 
   let records
   try {
-    records = await lookup(hostname, { all: true })
+    records = await lookupFn(hostname, { all: true })
   } catch {
     throw new Error(`Gagal resolve host: ${hostname}`)
   }
   if (!records.length) throw new Error(`Host tidak punya alamat: ${hostname}`)
   for (const record of records) {
     if (isPrivateAddress(record.address)) {
-      if (allowLocalhost) continue
       throw new Error(`Host ${hostname} me-resolve ke alamat internal ${record.address}`)
     }
   }

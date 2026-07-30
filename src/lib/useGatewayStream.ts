@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AgentToolPolicy, ProviderId } from '../types'
+import type { AgentToolPolicy, GatewayProvider, ProviderId } from '../types'
 import { gatewayApi } from './gatewayApi'
 
 export type GatewayStatus = 'idle' | 'connecting' | 'running' | 'done' | 'error'
@@ -54,6 +54,18 @@ export interface GatewayPermissionRequest {
   expiresAt: number
 }
 
+export interface GatewayPlanEvent {
+  plan: unknown
+}
+
+export interface GatewayToolEvent {
+  toolCall: unknown
+}
+
+export interface GatewayDiagnosticEvent {
+  diagnostic: unknown
+}
+
 interface SequencedMessage {
   runId?: string
   seq?: number
@@ -61,6 +73,7 @@ interface SequencedMessage {
 interface HelloMessage extends SequencedMessage {
   type: 'hello'
   protocolVersion: number
+  providers: GatewayProvider[]
 }
 interface SessionMessage extends SequencedMessage {
   type: 'session'
@@ -76,6 +89,15 @@ interface ChunkMessage extends SequencedMessage {
 type PermissionMessage = GatewayPermissionRequest & SequencedMessage & {
   type: 'permission_request'
 }
+interface PlanMessage extends SequencedMessage, GatewayPlanEvent {
+  type: 'plan'
+}
+interface ToolMessage extends SequencedMessage, GatewayToolEvent {
+  type: 'tool_call' | 'tool_call_update'
+}
+interface DiagnosticMessage extends SequencedMessage, GatewayDiagnosticEvent {
+  type: 'diagnostic'
+}
 interface DoneMessage extends GatewayResult, SequencedMessage {
   type: 'done'
 }
@@ -84,29 +106,30 @@ interface ErrorMessage extends SequencedMessage {
   text: string
   code?: string
 }
-interface IgnoredStructuredMessage extends SequencedMessage {
-  type: 'plan' | 'tool_call' | 'tool_call_update' | 'diagnostic'
-}
 type ServerMessage =
   | HelloMessage
   | SessionMessage
   | ChunkMessage
   | PermissionMessage
+  | PlanMessage
+  | ToolMessage
+  | DiagnosticMessage
   | DoneMessage
   | ErrorMessage
-  | IgnoredStructuredMessage
 
 export interface GatewayAgentConfig {
   id: string
   model: string
   systemPrompt: string
   toolPolicy: AgentToolPolicy
+  mcpServerIds?: string[]
 }
 
 export interface RunOptions {
   providerId: ProviderId
   agent: GatewayAgentConfig
   connectionId?: string
+  workspaceId?: string
   sessionId?: string
   resume?: boolean
 }
@@ -114,22 +137,36 @@ export interface RunOptions {
 export interface RunHandlers {
   onSession?: (sessionId: string) => void
   onChunk?: (text: string, level?: 'error') => void
+  onThought?: (text: string) => void
+  onPlan?: (event: GatewayPlanEvent) => void
+  onToolCall?: (event: GatewayToolEvent) => void
+  onToolCallUpdate?: (event: GatewayToolEvent) => void
+  onDiagnostic?: (event: GatewayDiagnosticEvent) => void
   onPermissionRequest?: (
     request: GatewayPermissionRequest,
   ) => Promise<string | null> | string | null
+  onPermissionCancelled?: () => void
   onDone?: (result: GatewayResult) => void
   onError?: (text: string) => void
 }
 
 export function useGatewayStream() {
   const [status, setStatus] = useState<GatewayStatus>('idle')
+  const [providers, setProviders] = useState<GatewayProvider[]>([])
+  const [providersError, setProvidersError] = useState('')
   const socketRef = useRef<WebSocket | null>(null)
+  const discoverySocketRef = useRef<WebSocket | null>(null)
   const handlersRef = useRef<RunHandlers>({})
   const activeRef = useRef(false)
   const generationRef = useRef(0)
   const runIdRef = useRef<string | null>(null)
 
+  const cancelPendingPermission = useCallback(() => {
+    handlersRef.current.onPermissionCancelled?.()
+  }, [])
+
   const cleanup = useCallback(() => {
+    cancelPendingPermission()
     const socket = socketRef.current
     if (!socket) return
     socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null
@@ -139,6 +176,43 @@ export function useGatewayStream() {
       // Socket sudah tertutup.
     }
     socketRef.current = null
+  }, [cancelPendingPermission])
+
+  useEffect(() => {
+    let active = true
+    void gatewayApi.issueWsTicket().then(({ ticket }) => {
+      if (!active) return
+      const socket = new WebSocket(buildWsUrl(ticket))
+      discoverySocketRef.current = socket
+      socket.onmessage = (event) => {
+        if (!active) return
+        try {
+          const message = JSON.parse(String(event.data)) as ServerMessage
+          if (message.type !== 'hello') return
+          setProviders(message.providers)
+          setProvidersError('')
+          socket.close()
+        } catch {
+          setProvidersError('Gateway mengirim capability provider yang tidak valid')
+        }
+      }
+      socket.onerror = () => {
+        if (active) setProvidersError('Tidak bisa membaca capability provider Gateway')
+      }
+    }).catch((error) => {
+      if (active) {
+        setProvidersError(error instanceof Error ? error.message : 'Gagal meminta capability provider')
+      }
+    })
+    return () => {
+      active = false
+      const socket = discoverySocketRef.current
+      if (socket) {
+        socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null
+        socket.close()
+        discoverySocketRef.current = null
+      }
+    }
   }, [])
 
   const run = useCallback(
@@ -160,6 +234,7 @@ export function useGatewayStream() {
         if (terminal || generation !== generationRef.current) return
         terminal = true
         activeRef.current = false
+        cancelPendingPermission()
         setStatus('error')
         handlersRef.current.onError?.(message)
         cleanup()
@@ -186,6 +261,7 @@ export function useGatewayStream() {
               providerId: options.providerId,
               agent: options.agent,
               connectionId: options.connectionId,
+              workspaceId: options.workspaceId,
               sessionId: options.sessionId,
               resume: options.resume === true,
             }),
@@ -201,7 +277,11 @@ export function useGatewayStream() {
             return
           }
 
-          if (message.type === 'hello') return
+          if (message.type === 'hello') {
+            setProviders(message.providers)
+            setProvidersError('')
+            return
+          }
           if (message.runId && message.runId !== runId) return
           if (message.type === 'session') {
             handlersRef.current.onSession?.(message.sessionId)
@@ -212,29 +292,43 @@ export function useGatewayStream() {
             return
           }
           if (message.type === 'thought_delta') {
-            handlersRef.current.onChunk?.(`[thinking] ${message.text}`)
+            handlersRef.current.onThought?.(message.text)
+            return
+          }
+          if (message.type === 'plan') {
+            handlersRef.current.onPlan?.({ plan: message.plan })
+            return
+          }
+          if (message.type === 'tool_call') {
+            handlersRef.current.onToolCall?.({ toolCall: message.toolCall })
+            return
+          }
+          if (message.type === 'tool_call_update') {
+            handlersRef.current.onToolCallUpdate?.({ toolCall: message.toolCall })
+            return
+          }
+          if (message.type === 'diagnostic') {
+            handlersRef.current.onDiagnostic?.({ diagnostic: message.diagnostic })
             return
           }
           if (message.type === 'permission_request') {
-            void Promise.resolve(handlersRef.current.onPermissionRequest?.(message) ?? null)
-              .then((optionId) => {
-                const reject = message.options.find((option) => option.kind.startsWith('reject'))
-                const selected = optionId && message.options.some((option) => option.optionId === optionId)
-                  ? optionId
-                  : reject?.optionId
-                if (!selected || socket?.readyState !== WebSocket.OPEN) return
-                socket.send(JSON.stringify({
-                  type: 'permission_response',
-                  runId,
-                  requestId: message.requestId,
-                  optionId: selected,
-                }))
-              })
-              .catch(() => {})
+            const handler = handlersRef.current.onPermissionRequest
+            if (!handler) return
+            void Promise.resolve(handler(message)).then((optionId) => {
+              if (
+                !optionId
+                || !message.options.some((option) => option.optionId === optionId)
+                || socket?.readyState !== WebSocket.OPEN
+              ) return
+              socket.send(JSON.stringify({
+                type: 'permission_response',
+                runId,
+                requestId: message.requestId,
+                optionId,
+              }))
+            }).catch(() => {})
             return
           }
-          if (message.type === 'plan' || message.type === 'tool_call'
-            || message.type === 'tool_call_update' || message.type === 'diagnostic') return
           if (message.type === 'error') {
             fail(message.text)
             return
@@ -243,6 +337,7 @@ export function useGatewayStream() {
 
           terminal = true
           activeRef.current = false
+          cancelPendingPermission()
           setStatus('done')
           handlersRef.current.onDone?.({
             code: message.code,
@@ -264,10 +359,11 @@ export function useGatewayStream() {
         fail(error instanceof Error ? error.message : 'Gagal meminta WebSocket ticket')
       })
     },
-    [cleanup],
+    [cancelPendingPermission, cleanup],
   )
 
   const stop = useCallback(() => {
+    cancelPendingPermission()
     const socket = socketRef.current
     if (socket?.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: 'cancel', runId: runIdRef.current }))
@@ -284,19 +380,20 @@ export function useGatewayStream() {
     setStatus((current) =>
       current === 'running' || current === 'connecting' ? 'idle' : current,
     )
-  }, [cleanup])
+  }, [cancelPendingPermission, cleanup])
 
   useEffect(
     () => () => {
       generationRef.current += 1
+      cancelPendingPermission()
       if (activeRef.current) {
         activeRef.current = false
         handlersRef.current.onDone?.({ code: null, reason: 'cancelled' })
       }
       cleanup()
     },
-    [cleanup],
+    [cancelPendingPermission, cleanup],
   )
 
-  return { run, stop, status, cleanup }
+  return { run, stop, status, providers, providersError, cleanup }
 }

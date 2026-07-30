@@ -21,19 +21,23 @@ import {
   type GatewayApiKey,
   type GatewayApiKeyScope,
   type GatewayConnection,
+  type GatewayMcpServer,
+  type GatewayMcpServerInput,
   type GatewayUsageData,
   type KiroRegion,
+  type McpTransport,
   type UsageRange,
 } from '../lib/gatewayApi'
 import { fmtCompact, fmtInt, fmtTime, fmtUsd } from '../lib/format'
 import { useToast } from '../lib/toast'
 import { cn } from '../lib/cn'
 
-type Tab = 'overview' | 'connections' | 'api-keys'
+type Tab = 'overview' | 'connections' | 'mcp' | 'api-keys'
 
 const tabs: Array<{ id: Tab; label: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'connections', label: 'Connections' },
+  { id: 'mcp', label: 'MCP Servers' },
   { id: 'api-keys', label: 'API Keys' },
 ]
 
@@ -161,6 +165,7 @@ export function Gateway() {
         />
       )}
 
+      {tab === 'mcp' && <McpServersPanel />}
       {tab === 'api-keys' && <ApiKeysPanel />}
     </div>
   )
@@ -801,6 +806,371 @@ function ConnectionsPanel({
                     ? 'Validating against AWS...'
                     : kiroEditingId ? 'Validate & update' : 'Add API Key'}
                 </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface McpDraft {
+  id: string
+  name: string
+  transport: McpTransport
+  command: string
+  argsText: string
+  url: string
+  envText: string
+  headersText: string
+  enabled: boolean
+  trusted: boolean
+  readOnly: boolean
+  clearSecrets: boolean
+}
+
+const emptyMcpDraft: McpDraft = {
+  id: '',
+  name: '',
+  transport: 'stdio',
+  command: '',
+  argsText: '',
+  url: '',
+  envText: '',
+  headersText: '',
+  enabled: true,
+  trusted: false,
+  readOnly: false,
+  clearSecrets: false,
+}
+
+function parseSecretLines(value: string, label: string): Record<string, string> | undefined {
+  if (!value.trim()) return undefined
+  const entries: Array<[string, string]> = []
+  for (const line of value.split('\n')) {
+    if (!line.trim()) continue
+    const separator = line.indexOf('=')
+    if (separator <= 0) throw new Error(`${label} harus memakai format NAMA=nilai, satu per baris.`)
+    const name = line.slice(0, separator).trim()
+    if (!name) throw new Error(`${label} punya nama kosong.`)
+    entries.push([name, line.slice(separator + 1)])
+  }
+  return Object.fromEntries(entries)
+}
+
+function McpServersPanel() {
+  const { push } = useToast()
+  const [servers, setServers] = useState<GatewayMcpServer[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [formOpen, setFormOpen] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [draft, setDraft] = useState<McpDraft>({ ...emptyMcpDraft })
+  const [formError, setFormError] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [busyId, setBusyId] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    try {
+      setServers(await gatewayApi.listMcpServers())
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Gagal membaca MCP servers')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  function openCreate() {
+    setEditingId(null)
+    setDraft({ ...emptyMcpDraft })
+    setFormError('')
+    setFormOpen(true)
+  }
+
+  function openEdit(server: GatewayMcpServer) {
+    setEditingId(server.id)
+    setDraft({
+      id: server.id,
+      name: server.name,
+      transport: server.transport,
+      command: server.command ?? '',
+      argsText: (server.args ?? []).join('\n'),
+      url: server.url ?? '',
+      // Secret bersifat write-only; edit selalu dimulai kosong.
+      envText: '',
+      headersText: '',
+      enabled: server.enabled,
+      trusted: server.trusted,
+      readOnly: server.readOnly,
+      clearSecrets: false,
+    })
+    setFormError('')
+    setFormOpen(true)
+  }
+
+  function closeForm() {
+    setDraft({ ...emptyMcpDraft })
+    setEditingId(null)
+    setFormError('')
+    setFormOpen(false)
+  }
+
+  async function submit() {
+    if (!draft.id.trim() || !draft.name.trim()) {
+      setFormError('ID dan nama MCP server wajib diisi.')
+      return
+    }
+    if (draft.transport === 'stdio' && !draft.command.trim()) {
+      setFormError('Command wajib untuk transport stdio.')
+      return
+    }
+    if (draft.transport !== 'stdio' && !draft.url.trim()) {
+      setFormError('URL wajib untuk transport HTTP/SSE.')
+      return
+    }
+
+    let env: Record<string, string> | undefined
+    let headers: Record<string, string> | undefined
+    try {
+      env = parseSecretLines(draft.envText, 'Environment secret')
+      headers = parseSecretLines(draft.headersText, 'Header secret')
+    } catch (caught) {
+      setFormError(caught instanceof Error ? caught.message : 'Format secret tidak valid.')
+      return
+    }
+
+    const payload: GatewayMcpServerInput = {
+      id: draft.id.trim().toLowerCase(),
+      name: draft.name.trim(),
+      transport: draft.transport,
+      enabled: draft.enabled,
+      trusted: draft.trusted,
+      readOnly: draft.readOnly,
+      ...(draft.transport === 'stdio'
+        ? {
+            command: draft.command.trim(),
+            args: draft.argsText.split('\n').map((arg) => arg.trim()).filter(Boolean),
+            ...(env ? { env } : {}),
+          }
+        : {
+            url: draft.url.trim(),
+            ...(headers ? { headers } : {}),
+          }),
+      ...(editingId && draft.clearSecrets ? { clearSecrets: true } : {}),
+    }
+
+    setSaving(true)
+    setFormError('')
+    try {
+      if (editingId) await gatewayApi.updateMcpServer(editingId, payload)
+      else await gatewayApi.createMcpServer(payload)
+      closeForm()
+      push(editingId ? 'MCP server diperbarui' : 'MCP server ditambahkan', 'success')
+      await load()
+    } catch (caught) {
+      setFormError(caught instanceof Error ? caught.message : 'Gagal menyimpan MCP server')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function toggle(server: GatewayMcpServer, field: 'enabled' | 'trusted' | 'readOnly') {
+    setBusyId(server.id)
+    try {
+      await gatewayApi.updateMcpServer(server.id, { [field]: !server[field] })
+      await load()
+    } catch (caught) {
+      push(caught instanceof Error ? caught.message : 'Gagal memperbarui MCP server', 'error')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  async function remove(server: GatewayMcpServer) {
+    if (!window.confirm(`Hapus MCP server “${server.name}”?`)) return
+    setBusyId(server.id)
+    try {
+      await gatewayApi.deleteMcpServer(server.id)
+      push('MCP server dihapus', 'success')
+      await load()
+    } catch (caught) {
+      push(caught instanceof Error ? caught.message : 'Gagal menghapus MCP server', 'error')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  if (loading && servers.length === 0) return <StateCard message="Membaca MCP servers..." />
+  if (error && servers.length === 0) return <ErrorCard message={error} onRetry={() => void load()} />
+
+  return (
+    <div className="space-y-5">
+      <Card>
+        <CardBody className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="font-bold">MCP servers untuk agent</div>
+            <p className="mt-1 text-xs text-ink/60">
+              Hanya server enabled + trusted yang bisa dipilih. Env dan header secret dienkripsi server-side dan tidak pernah dirender balik.
+            </p>
+          </div>
+          <Button onClick={openCreate}><PlusIcon width={15} height={15} />Tambah MCP</Button>
+        </CardBody>
+      </Card>
+
+      {error && <ErrorCard message={error} onRetry={() => void load()} />}
+      {servers.length === 0 ? (
+        <Card><CardBody><EmptyText text="Belum ada MCP server. Tambahkan stdio, HTTP, atau SSE." /></CardBody></Card>
+      ) : (
+        <div className="grid gap-4 lg:grid-cols-2">
+          {servers.map((server) => {
+            const busy = busyId === server.id
+            return (
+              <Card key={server.id}>
+                <CardHeader
+                  title={server.name}
+                  action={<Badge color={server.enabled ? 'ok' : 'idle'}>{server.enabled ? 'Enabled' : 'Disabled'}</Badge>}
+                />
+                <CardBody className="space-y-4">
+                  <div>
+                    <code className="text-sm font-bold">{server.id}</code>
+                    <div className="mt-1 break-all text-xs text-ink/60">
+                      {server.transport === 'stdio'
+                        ? `${server.command ?? '-'} ${(server.args ?? []).join(' ')}`.trim()
+                        : server.url}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Badge color="sky">{server.transport}</Badge>
+                    <Badge color={server.trusted ? 'ok' : 'warn'}>{server.trusted ? 'Trusted' : 'Belum trusted'}</Badge>
+                    <Badge color={server.readOnly ? 'sky' : 'neutral'}>{server.readOnly ? 'Read-only' : 'Write allowed'}</Badge>
+                    {server.hasSecrets && <Badge color="neutral">Secret tersimpan</Badge>}
+                  </div>
+                  <p className="text-[10px] font-semibold text-ink/50">Diperbarui {fmtTime(server.updatedAt)}</p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => void toggle(server, 'enabled')}>
+                      {server.enabled ? 'Disable' : 'Enable'}
+                    </Button>
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => void toggle(server, 'trusted')}>
+                      {server.trusted ? 'Cabut trust' : 'Trust'}
+                    </Button>
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => void toggle(server, 'readOnly')}>
+                      {server.readOnly ? 'Izinkan write' : 'Jadikan read-only'}
+                    </Button>
+                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => openEdit(server)}>Edit</Button>
+                    <Button size="sm" variant="danger" disabled={busy} onClick={() => void remove(server)}>
+                      <TrashIcon width={14} height={14} />Hapus
+                    </Button>
+                  </div>
+                </CardBody>
+              </Card>
+            )
+          })}
+        </div>
+      )}
+
+      {formOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !saving) closeForm()
+        }}>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mcp-modal-title"
+            className="max-h-[calc(100vh-2rem)] w-full max-w-2xl overflow-y-auto rounded-xl border-2 border-ink bg-paper p-5 shadow-hard"
+          >
+            <div className="space-y-4">
+              <div>
+                <h2 id="mcp-modal-title" className="font-brand text-lg font-bold">
+                  {editingId ? `Edit MCP ${editingId}` : 'Tambah MCP server'}
+                </h2>
+                <p className="mt-1 text-xs text-ink/60">Secret baru bersifat write-only. Kosongkan untuk mempertahankan secret lama.</p>
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <label className="space-y-1 text-xs font-bold">
+                  <span>ID server</span>
+                  <input className={fieldClass} value={draft.id} disabled={Boolean(editingId)} placeholder="filesystem" onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))} />
+                </label>
+                <label className="space-y-1 text-xs font-bold">
+                  <span>Nama</span>
+                  <input className={fieldClass} value={draft.name} placeholder="Filesystem workspace" onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} />
+                </label>
+              </div>
+
+              <label className="block space-y-1 text-xs font-bold">
+                <span>Transport</span>
+                <select className={fieldClass} value={draft.transport} onChange={(event) => setDraft((current) => ({ ...current, transport: event.target.value as McpTransport }))}>
+                  <option value="stdio">stdio</option>
+                  <option value="http">http</option>
+                  <option value="sse">sse</option>
+                </select>
+              </label>
+
+              {draft.transport === 'stdio' ? (
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <label className="space-y-1 text-xs font-bold">
+                    <span>Command</span>
+                    <input className={fieldClass} value={draft.command} placeholder="npx" onChange={(event) => setDraft((current) => ({ ...current, command: event.target.value }))} />
+                  </label>
+                  <label className="space-y-1 text-xs font-bold">
+                    <span>Args — satu per baris</span>
+                    <textarea className={fieldClass} rows={4} value={draft.argsText} placeholder={'-y\n@modelcontextprotocol/server-filesystem'} onChange={(event) => setDraft((current) => ({ ...current, argsText: event.target.value }))} />
+                  </label>
+                </div>
+              ) : (
+                <label className="block space-y-1 text-xs font-bold">
+                  <span>URL HTTPS</span>
+                  <input className={fieldClass} type="url" value={draft.url} placeholder="https://mcp.example.com" onChange={(event) => setDraft((current) => ({ ...current, url: event.target.value }))} />
+                </label>
+              )}
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <label className="space-y-1 text-xs font-bold">
+                  <span>Environment secret — NAMA=nilai</span>
+                  <textarea
+                    className={fieldClass}
+                    rows={4}
+                    value={draft.envText}
+                    disabled={draft.transport !== 'stdio'}
+                    autoComplete="off"
+                    placeholder="API_TOKEN=..."
+                    onChange={(event) => setDraft((current) => ({ ...current, envText: event.target.value }))}
+                  />
+                </label>
+                <label className="space-y-1 text-xs font-bold">
+                  <span>Header secret — NAMA=nilai</span>
+                  <textarea
+                    className={fieldClass}
+                    rows={4}
+                    value={draft.headersText}
+                    disabled={draft.transport === 'stdio'}
+                    autoComplete="off"
+                    placeholder="Authorization=Bearer ..."
+                    onChange={(event) => setDraft((current) => ({ ...current, headersText: event.target.value }))}
+                  />
+                </label>
+              </div>
+
+              <div className="flex flex-wrap gap-4 text-sm font-bold">
+                <label className="flex items-center gap-2"><input type="checkbox" checked={draft.enabled} onChange={(event) => setDraft((current) => ({ ...current, enabled: event.target.checked }))} />Enabled</label>
+                <label className="flex items-center gap-2"><input type="checkbox" checked={draft.trusted} onChange={(event) => setDraft((current) => ({ ...current, trusted: event.target.checked }))} />Trusted</label>
+                <label className="flex items-center gap-2"><input type="checkbox" checked={draft.readOnly} onChange={(event) => setDraft((current) => ({ ...current, readOnly: event.target.checked }))} />Read-only</label>
+                {editingId && (
+                  <label className="flex items-center gap-2 text-danger"><input type="checkbox" checked={draft.clearSecrets} onChange={(event) => setDraft((current) => ({ ...current, clearSecrets: event.target.checked }))} />Hapus secret tersimpan</label>
+                )}
+              </div>
+
+              {formError && <div role="alert" className="rounded-lg border-2 border-ink bg-danger p-3 text-sm font-semibold">{formError}</div>}
+              <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <Button variant="ghost" onClick={closeForm} disabled={saving}>Batal</Button>
+                <Button onClick={() => void submit()} disabled={saving}>{saving ? 'Menyimpan...' : 'Simpan MCP server'}</Button>
               </div>
             </div>
           </div>

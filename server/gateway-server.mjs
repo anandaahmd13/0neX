@@ -34,6 +34,8 @@ import { createConnectionDriverRegistry } from './gateway/connection-driver-regi
 import { createKiroInferenceDriver } from './gateway/kiro-inference-driver.mjs'
 import { createWsTicketStore } from './gateway/ws-ticket-store.mjs'
 import { createPermissionBroker } from './gateway/ws-permission-broker.mjs'
+import { createWorkspaceRegistry } from './gateway/workspace-registry.mjs'
+import { McpStore } from './gateway/mcp-store.mjs'
 import { API_KEY_SCOPES, ApiKeyStore, looksLikeManagedKey } from './gateway/api-key-store.mjs'
 
 for (const provider of [claudeCliProvider, kiroInferenceProvider, kiroInferenceAlias]) {
@@ -106,6 +108,8 @@ function parseRun(message, limits, providerForId = getProvider) {
   if (connectionId && !SAFE_ID_PATTERN.test(connectionId)) {
     throw new Error('connectionId tidak valid')
   }
+  const workspaceId = cleanText(message.workspaceId || 'default', 100)
+  if (!SAFE_ID_PATTERN.test(workspaceId)) throw new Error('workspaceId tidak valid')
 
   const agent = message.agent && typeof message.agent === 'object' ? message.agent : {}
   const agentId = cleanText(agent.id || 'personal-assistant', 100)
@@ -120,6 +124,15 @@ function parseRun(message, limits, providerForId = getProvider) {
   if (rawToolPolicy !== undefined && !TOOL_POLICIES.has(rawToolPolicy)) {
     throw new Error('agent.toolPolicy tidak valid')
   }
+  const rawMcpServerIds = agent.mcpServerIds ?? []
+  if (
+    !Array.isArray(rawMcpServerIds)
+    || rawMcpServerIds.length > 50
+    || rawMcpServerIds.some((id) => typeof id !== 'string' || !SAFE_ID_PATTERN.test(id))
+  ) {
+    throw new Error('agent.mcpServerIds tidak valid')
+  }
+  const mcpServerIds = [...new Set(rawMcpServerIds)]
 
   return {
     provider,
@@ -127,10 +140,12 @@ function parseRun(message, limits, providerForId = getProvider) {
       prompt,
       sessionId,
       connectionId,
+      workspaceId,
       resume: message.resume === true,
       model,
       systemPrompt,
       toolPolicy: rawToolPolicy ?? 'none',
+      mcpServerIds,
       agentId,
     },
   }
@@ -316,6 +331,15 @@ export function createGatewayServer(options = {}) {
     fetchImpl: options.kiroFetchImpl ?? fetchImpl,
     assertHost: skipKiroHostGuard ? async () => {} : assertPublicHost,
   })
+  const workspaceRegistry = options.workspaceRegistry ?? createWorkspaceRegistry({
+    workspaces: options.workspaces,
+    defaultRoot: options.kiroAcpCwd ?? process.cwd(),
+  })
+  const mcpStore = options.mcpStore ?? new McpStore({
+    dataDir,
+    masterKey,
+    allowInsecureLocalhost,
+  })
   const getKiroConnection = (id) => id ? connectionStore.getWithSecret(id) : null
   const kiroProviderOptions = {
     client: kiroHttpClient,
@@ -331,6 +355,8 @@ export function createGatewayServer(options = {}) {
     createKiroAcpProvider({
       runner: kiroAcpRunner,
       getConnection: getKiroConnection,
+      getWorkspace: (id) => workspaceRegistry.get(id),
+      getMcpServers: (ids, context) => mcpStore.resolveForRun(ids, context),
       cwd: options.kiroAcpCwd,
     }),
     createKiroInferenceProvider(kiroProviderOptions),
@@ -867,6 +893,31 @@ export function createGatewayServer(options = {}) {
           sendJson(response, 201, {
             data: wsTickets.issue({ origin, subject: 'admin' }),
           }, headers)
+          return
+        }
+        if (request.method === 'GET' && url.pathname === '/admin/workspaces') {
+          sendJson(response, 200, { data: workspaceRegistry.list() }, headers)
+          return
+        }
+        if (url.pathname === '/admin/mcp-servers') {
+          if (request.method === 'GET') {
+            sendJson(response, 200, { data: await mcpStore.list() }, headers)
+            return
+          }
+          if (request.method === 'POST') {
+            const input = await readJson(request, limits.maxBodyBytes)
+            sendJson(response, 201, { data: await mcpStore.create(input) }, headers)
+            return
+          }
+        }
+        const mcpServerMatch = url.pathname.match(/^\/admin\/mcp-servers\/([a-z0-9._-]+)$/i)
+        if (mcpServerMatch && request.method === 'PATCH') {
+          const input = await readJson(request, limits.maxBodyBytes)
+          sendJson(response, 200, { data: await mcpStore.update(mcpServerMatch[1], input) }, headers)
+          return
+        }
+        if (mcpServerMatch && request.method === 'DELETE') {
+          sendJson(response, 200, { data: await mcpStore.delete(mcpServerMatch[1]) }, headers)
           return
         }
         if (request.method === 'GET' && url.pathname === '/admin/connections') {

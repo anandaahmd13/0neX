@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { ConnectionStore, normalizeBaseUrl } from '../server/gateway/connection-store.mjs'
 import { decryptSecret, encryptSecret } from '../server/gateway/secrets.mjs'
-import { isPrivateAddress } from '../server/gateway/net-guard.mjs'
+import { assertPublicHost, isPrivateAddress } from '../server/gateway/net-guard.mjs'
 import { UsageStore } from '../server/gateway/usage-store.mjs'
 
 const MASTER_KEY = '0123456789abcdef0123456789abcdef'
@@ -76,6 +76,27 @@ test('SSRF guard: normalizeBaseUrl rejects internal IP literals', () => {
   assert.equal(
     normalizeBaseUrl('http://127.0.0.1:9876/v1', { allowInsecureLocalhost: true }),
     'http://127.0.0.1:9876/v1',
+  )
+})
+
+test('SSRF guard rejects DNS rebinding even when localhost development is allowed', async () => {
+  await assert.rejects(
+    assertPublicHost('attacker.example', {
+      allowLocalhost: true,
+      lookupFn: async () => [{ address: '10.0.0.9', family: 4 }],
+    }),
+    /alamat internal/,
+  )
+  await assert.doesNotReject(
+    assertPublicHost('public.example', {
+      allowLocalhost: true,
+      lookupFn: async () => [{ address: '8.8.8.8', family: 4 }],
+    }),
+  )
+  await assert.doesNotReject(assertPublicHost('127.0.0.1', { allowLocalhost: true }))
+  await assert.rejects(
+    assertPublicHost('10.0.0.9', { allowLocalhost: true }),
+    /alamat jaringan internal/,
   )
 })
 

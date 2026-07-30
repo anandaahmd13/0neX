@@ -4,6 +4,28 @@ export type AgentStatus = 'active' | 'idle' | 'error' | 'paused'
 export type ProviderId = 'claude-cli' | 'kiro-agent' | 'kiro-inference' | 'kiro-cli'
 export type AgentToolPolicy = 'none' | 'read-only' | 'standard'
 
+export interface ProviderRuntime {
+  version: string | null
+  acpProtocolVersion: number | string | null
+}
+
+export interface ProviderCapabilities {
+  streaming: boolean
+  sessions: boolean
+  cancellation: boolean
+  tools: boolean
+  available?: boolean
+  unavailableReason?: string
+  toolPolicies?: AgentToolPolicy[]
+  runtime?: ProviderRuntime
+}
+
+export interface GatewayProvider {
+  id: ProviderId
+  label: string
+  capabilities: ProviderCapabilities
+}
+
 export interface Agent {
   id: string
   name: string

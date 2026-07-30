@@ -6,6 +6,8 @@ export interface Pane {
   agentId: string
   connectionId: string
   modelId: string
+  workspaceId: string
+  mcpServerIds: string[]
   title: string
   transcript: string[]
   turns: number
@@ -31,6 +33,10 @@ function load(): Pane[] {
         agentId: typeof pane.agentId === 'string' ? pane.agentId : DEFAULT_AGENT_ID,
         connectionId: typeof pane.connectionId === 'string' ? pane.connectionId : '',
         modelId: typeof pane.modelId === 'string' ? pane.modelId : '',
+        workspaceId: typeof pane.workspaceId === 'string' ? pane.workspaceId : 'default',
+        mcpServerIds: Array.isArray(pane.mcpServerIds)
+          ? pane.mcpServerIds.filter((id: unknown): id is string => typeof id === 'string')
+          : [],
         transcript: Array.isArray(pane.transcript) ? pane.transcript.slice(-MAX_LINES) : [],
         turns: typeof pane.turns === 'number' ? pane.turns : 0,
       })) as Pane[]
@@ -55,6 +61,8 @@ function makePane(agentId = DEFAULT_AGENT_ID): Pane {
     agentId,
     connectionId: '',
     modelId: '',
+    workspaceId: 'default',
+    mcpServerIds: [],
     title: 'Sesi baru',
     transcript: [],
     turns: 0,
@@ -222,6 +230,48 @@ export function usePanes() {
     [persist],
   )
 
+  const setWorkspace = useCallback(
+    (id: string, workspaceId: string) =>
+      setPanes((previous) =>
+        persist(
+          previous.map((pane) =>
+            pane.id === id && pane.workspaceId !== workspaceId
+              ? {
+                  ...pane,
+                  workspaceId,
+                  sessionId: crypto.randomUUID(),
+                  transcript: [],
+                  turns: 0,
+                  title: 'Sesi baru',
+                }
+              : pane,
+          ),
+        ),
+      ),
+    [persist],
+  )
+
+  const setMcpServers = useCallback(
+    (id: string, mcpServerIds: string[]) =>
+      setPanes((previous) =>
+        persist(
+          previous.map((pane) =>
+            pane.id === id
+              ? {
+                  ...pane,
+                  mcpServerIds: [...new Set(mcpServerIds)],
+                  sessionId: crypto.randomUUID(),
+                  transcript: [],
+                  turns: 0,
+                  title: 'Sesi baru',
+                }
+              : pane,
+          ),
+        ),
+      ),
+    [persist],
+  )
+
   return {
     panes,
     addPane,
@@ -234,5 +284,7 @@ export function usePanes() {
     setAgent,
     setConnection,
     setModel,
+    setWorkspace,
+    setMcpServers,
   }
 }
