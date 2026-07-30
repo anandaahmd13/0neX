@@ -146,6 +146,7 @@ async function setupGateway(t, overrides = {}) {
     kiroHttpClient,
     kiroRunner,
     kiroAcpCwd: overrides.kiroAcpCwd,
+    providers: overrides.providers,
     env: {
       ...process.env,
       GATEWAY_RATE_CAPACITY: '0',
@@ -182,6 +183,22 @@ async function jsonRequest(url, token, init = {}) {
   })
   const payload = await response.json()
   return { response, payload }
+}
+
+async function issueWsTicket(baseUrl) {
+  const result = await jsonRequest(`${baseUrl}/admin/ws-ticket`, ADMIN_TOKEN, {
+    method: 'POST',
+  })
+  assert.equal(result.response.status, 201, JSON.stringify(result.payload))
+  assert.match(result.payload.data.ticket, /^wst_/)
+  return result.payload.data.ticket
+}
+
+function ticketUrl(wsUrl, ticket) {
+  const url = new URL(wsUrl)
+  url.searchParams.delete('token')
+  url.searchParams.set('ticket', ticket)
+  return url.toString()
 }
 
 async function createKiroConnection(baseUrl, overrides = {}) {
@@ -284,16 +301,124 @@ function fixtureRpcMessages(entries) {
   return entries.filter((entry) => entry.type === 'rpc').map((entry) => entry.message)
 }
 
-test('Kiro Agent probes ACP and supports new and resumed sessions over WebSocket', async (t) => {
-  const { wsUrl, kiroRecordFile } = await setupGateway(t, {
+test('WebSocket tickets are one-time and cannot be replayed', async (t) => {
+  const { baseUrl, wsUrl } = await setupGateway(t)
+  const ticket = await issueWsTicket(baseUrl)
+  const authorizedUrl = ticketUrl(wsUrl, ticket)
+  const first = connect(authorizedUrl)
+  t.after(() => first.socket.close())
+  await first.opened
+  const hello = await first.next((message) => message.type === 'hello')
+  assert.equal(hello.protocolVersion, 2)
+
+  const replay = new WebSocket(authorizedUrl, { origin: ORIGIN })
+  const rejected = await new Promise((resolve) => {
+    replay.once('unexpected-response', (_request, response) => resolve(response.statusCode))
+    replay.once('error', () => resolve(401))
+  })
+  assert.equal(rejected, 401)
+  replay.terminate()
+})
+
+test('ticketed WebSocket rejects forged and replayed permission responses', async (t) => {
+  let releaseProvider
+  const release = new Promise((resolve) => { releaseProvider = resolve })
+  const permissionProvider = {
+    id: 'permission-fixture',
+    label: 'Permission Fixture',
+    capabilities: { streaming: true, sessions: false, cancellation: true, tools: true },
+    start(request, handlers) {
+      let disposed = false
+      Promise.resolve().then(async () => {
+        const decision = await handlers.onPermissionRequest({
+          toolCall: { toolCallId: 'tool-1', title: 'Read config', kind: 'read' },
+          options: [
+            { optionId: 'allow', kind: 'allow_once', name: 'Allow once' },
+            { optionId: 'reject', kind: 'reject_once', name: 'Reject' },
+          ],
+        })
+        await release
+        if (!disposed) {
+          handlers.onDone({
+            code: 0,
+            reason: 'completed',
+            sessionId: request.sessionId,
+            permissionDecision: decision,
+          })
+        }
+      })
+      return {
+        cancel() {},
+        dispose() { disposed = true },
+      }
+    },
+  }
+  const { baseUrl, wsUrl } = await setupGateway(t, { providers: [permissionProvider] })
+  const ticket = await issueWsTicket(baseUrl)
+  const client = connect(ticketUrl(wsUrl, ticket))
+  t.after(() => client.socket.close())
+  await client.opened
+  await client.next((message) => message.type === 'hello')
+
+  const runId = 'run-permission'
+  client.socket.send(JSON.stringify(runMessage({
+    runId,
+    providerId: permissionProvider.id,
+    agent: { id: 'agt_permission', model: '', systemPrompt: '', toolPolicy: 'standard' },
+  })))
+  const permission = await client.next((message) => message.type === 'permission_request')
+  assert.equal(permission.runId, runId)
+  assert.deepEqual(permission.options.map((option) => option.optionId), ['allow', 'reject'])
+
+  client.socket.send(JSON.stringify({
+    type: 'permission_response',
+    runId: 'run-forged',
+    requestId: permission.requestId,
+    optionId: 'allow',
+  }))
+  assert.equal(
+    (await client.next((message) => message.code === 'permission_run_mismatch')).runId,
+    runId,
+  )
+
+  client.socket.send(JSON.stringify({
+    type: 'permission_response',
+    runId,
+    requestId: permission.requestId,
+    optionId: 'not-offered',
+  }))
+  await client.next((message) => message.code === 'permission_option_invalid')
+
+  const accepted = {
+    type: 'permission_response',
+    runId,
+    requestId: permission.requestId,
+    optionId: 'allow',
+  }
+  client.socket.send(JSON.stringify(accepted))
+  client.socket.send(JSON.stringify(accepted))
+  await client.next((message) => message.code === 'permission_already_settled')
+
+  releaseProvider()
+  const done = await client.next((message) => message.type === 'done')
+  assert.deepEqual(done.permissionDecision, {
+    outcome: { outcome: 'selected', optionId: 'allow' },
+  })
+})
+
+test('Kiro Agent probes ACP and supports new and resumed sessions over ticketed WebSocket v2', async (t) => {
+  const { baseUrl, wsUrl, kiroRecordFile } = await setupGateway(t, {
     kiroFixtureMode: 'normal',
     kiroAcpCwd: TEST_DIR,
   })
-  const client = connect(wsUrl)
+  const ticket = await issueWsTicket(baseUrl)
+  const client = connect(ticketUrl(wsUrl, ticket))
   t.after(() => client.socket.close())
   await client.opened
 
   const hello = await client.next((message) => message.type === 'hello')
+  assert.equal(hello.protocolVersion, 2)
+  assert.equal(hello.seq, 1)
   const provider = hello.providers.find((entry) => entry.id === 'kiro-agent')
   assert.deepEqual(provider, {
     id: 'kiro-agent',
@@ -308,7 +433,9 @@ test('Kiro Agent probes ACP and supports new and resumed sessions over WebSocket
     },
   })
 
+  const firstRunId = 'run-new-session'
   client.socket.send(JSON.stringify(runMessage({
+    runId: firstRunId,
     providerId: 'kiro-agent',
     sessionId: 'new-correlation',
     agent: {
@@ -318,22 +445,29 @@ test('Kiro Agent probes ACP and supports new and resumed sessions over WebSocket
       toolPolicy: 'none',
     },
   })))
-  await client.next((message) => message.type === 'session' && message.sessionId === 'new-correlation')
+  const initialSession = await client.next(
+    (message) => message.type === 'session' && message.sessionId === 'new-correlation',
+  )
+  assert.equal(initialSession.runId, firstRunId)
   const created = await client.next(
     (message) => message.type === 'session' && message.sessionId === 'fixture-new-session',
   )
   assert.equal(created.providerId, 'kiro-agent')
+  assert.equal(created.runId, firstRunId)
   assert.deepEqual([
-    (await client.next((message) => message.type === 'chunk')).text,
-    (await client.next((message) => message.type === 'chunk')).text,
+    (await client.next((message) => message.type === 'message_delta')).text,
+    (await client.next((message) => message.type === 'message_delta')).text,
   ], ['hello ', 'from fixture'])
   const firstDone = await client.next((message) => message.type === 'done')
   assert.equal(firstDone.providerId, 'kiro-agent')
+  assert.equal(firstDone.runId, firstRunId)
   assert.equal(firstDone.reason, 'completed')
   assert.equal(firstDone.sessionId, 'fixture-new-session')
   assert.equal(firstDone.stopReason, 'end_turn')
 
+  const resumedRunId = 'run-resumed-session'
   client.socket.send(JSON.stringify(runMessage({
+    runId: resumedRunId,
     providerId: 'kiro-agent',
     sessionId: 'existing-session',
     resume: true,
@@ -344,10 +478,14 @@ test('Kiro Agent probes ACP and supports new and resumed sessions over WebSocket
       toolPolicy: 'none',
     },
   })))
-  await client.next((message) => message.type === 'session' && message.sessionId === 'existing-session')
-  await client.next((message) => message.type === 'chunk')
-  await client.next((message) => message.type === 'chunk')
+  const resumedSession = await client.next(
+    (message) => message.type === 'session' && message.sessionId === 'existing-session',
+  )
+  assert.equal(resumedSession.runId, resumedRunId)
+  await client.next((message) => message.type === 'message_delta')
+  await client.next((message) => message.type === 'message_delta')
   const resumedDone = await client.next((message) => message.type === 'done')
+  assert.equal(resumedDone.runId, resumedRunId)
   assert.equal(resumedDone.reason, 'completed')
   assert.equal(resumedDone.sessionId, 'existing-session')
 
@@ -364,25 +502,32 @@ test('Kiro Agent probes ACP and supports new and resumed sessions over WebSocket
 })
 
 test('Kiro Agent cancellation reaches the ACP subprocess', async (t) => {
-  const { wsUrl, kiroRecordFile } = await setupGateway(t, {
+  const { baseUrl, wsUrl, kiroRecordFile } = await setupGateway(t, {
     kiroFixtureMode: 'cancel',
     kiroAcpCwd: TEST_DIR,
   })
-  const client = connect(wsUrl)
+  const ticket = await issueWsTicket(baseUrl)
+  const client = connect(ticketUrl(wsUrl, ticket))
   t.after(() => client.socket.close())
   await client.opened
-  await client.next((message) => message.type === 'hello')
+  const hello = await client.next((message) => message.type === 'hello')
+  assert.equal(hello.protocolVersion, 2)
 
+  const runId = 'run-cancel-session'
   client.socket.send(JSON.stringify(runMessage({
+    runId,
     providerId: 'kiro-agent',
     sessionId: 'cancel-session',
     prompt: 'wait',
     agent: { id: 'agt_kiro', model: '', systemPrompt: '', toolPolicy: 'none' },
   })))
-  await client.next((message) => message.type === 'chunk' && message.text === 'waiting for cancel')
-  client.socket.send(JSON.stringify({ type: 'cancel' }))
+  await client.next(
+    (message) => message.type === 'message_delta' && message.text === 'waiting for cancel',
+  )
+  client.socket.send(JSON.stringify({ type: 'cancel', runId }))
   const done = await client.next((message) => message.type === 'done')
   assert.equal(done.providerId, 'kiro-agent')
+  assert.equal(done.runId, runId)
   assert.equal(done.reason, 'cancelled')
   assert.equal(done.code, null)
 

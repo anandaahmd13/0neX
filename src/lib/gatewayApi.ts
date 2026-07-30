@@ -111,6 +111,11 @@ export interface GatewayApiKeyInput {
   enabled?: boolean
 }
 
+export interface GatewayWsTicket {
+  ticket: string
+  expiresAt: number
+}
+
 export type UsageRange = '24h' | '7d' | '30d'
 
 export interface GatewayUsageEvent {
@@ -206,6 +211,7 @@ export const gatewayApi = {
     }),
   logout: () => request<{ ok: boolean }>('/admin/logout', { method: 'POST' }),
   session: () => request<{ authenticated: boolean }>('/admin/session'),
+  issueWsTicket: () => request<GatewayWsTicket>('/admin/ws-ticket', { method: 'POST' }),
   listConnections: () => request<GatewayConnection[]>('/admin/connections'),
   createConnection: (input: ConnectionInput) =>
     request<GatewayConnection>('/admin/connections', {

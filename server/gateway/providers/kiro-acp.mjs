@@ -131,6 +131,7 @@ export function createKiroAcpProvider({
           onPlan: handlers.onPlan,
           onToolCall: handlers.onToolCall,
           onDiagnostic: handlers.onDiagnostic,
+          onPermissionRequest: handlers.onPermissionRequest,
           onDone: done,
           onError: (message, error) => fail(error ?? new Error(message)),
         })

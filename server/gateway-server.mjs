@@ -32,6 +32,8 @@ import { loadAliases } from './gateway/aliases.mjs'
 import { createKiroHttpClient } from './gateway/kiro-http.mjs'
 import { createConnectionDriverRegistry } from './gateway/connection-driver-registry.mjs'
 import { createKiroInferenceDriver } from './gateway/kiro-inference-driver.mjs'
+import { createWsTicketStore } from './gateway/ws-ticket-store.mjs'
+import { createPermissionBroker } from './gateway/ws-permission-broker.mjs'
 import { API_KEY_SCOPES, ApiKeyStore, looksLikeManagedKey } from './gateway/api-key-store.mjs'
 
 for (const provider of [claudeCliProvider, kiroInferenceProvider, kiroInferenceAlias]) {
@@ -114,6 +116,10 @@ function parseRun(message, limits, providerForId = getProvider) {
   if (systemPrompt.length > limits.maxSystemPromptLength) {
     throw new Error(`System prompt melebihi batas ${limits.maxSystemPromptLength} karakter`)
   }
+  const rawToolPolicy = agent.toolPolicy
+  if (rawToolPolicy !== undefined && !TOOL_POLICIES.has(rawToolPolicy)) {
+    throw new Error('agent.toolPolicy tidak valid')
+  }
 
   return {
     provider,
@@ -124,7 +130,7 @@ function parseRun(message, limits, providerForId = getProvider) {
       resume: message.resume === true,
       model,
       systemPrompt,
-      toolPolicy: TOOL_POLICIES.has(agent.toolPolicy) ? agent.toolPolicy : 'standard',
+      toolPolicy: rawToolPolicy ?? 'none',
       agentId,
     },
   }
@@ -248,6 +254,7 @@ export function createGatewayServer(options = {}) {
     maxOutputBytes: Number(env.GATEWAY_MAX_OUTPUT_BYTES ?? 2_000_000),
     maxBodyBytes: Number(env.GATEWAY_MAX_BODY_BYTES ?? 1_000_000),
     upstreamTimeoutMs: Number(env.GATEWAY_UPSTREAM_TIMEOUT_MS ?? 120_000),
+    permissionTimeoutMs: Number(env.GATEWAY_PERMISSION_TIMEOUT_MS ?? 30_000),
     // Rate limit token bucket: kapasitas burst + laju refill per detik, per
     // kombinasi (API key + connection). 0 = nonaktif.
     rateCapacity: Number(env.GATEWAY_RATE_CAPACITY ?? 60),
@@ -375,6 +382,9 @@ export function createGatewayServer(options = {}) {
   // dari admin token + master key, jadi tidak perlu env var tambahan dan tetap
   // stabil lintas restart selama kedua nilai itu tidak berubah.
   const sessions = createSessionManager({ secret: `${adminToken}:${masterKey}` })
+  const wsTickets = options.wsTicketStore ?? createWsTicketStore({
+    ttlMs: Number(env.GATEWAY_WS_TICKET_TTL_MS ?? 30_000),
+  })
   const dashboardPassword = options.dashboardPassword ?? env.GATEWAY_DASHBOARD_PASSWORD ?? adminToken
 
   function verifyOrigin(origin) {
@@ -853,6 +863,12 @@ export function createGatewayServer(options = {}) {
           apiError(response, 401, 'Sesi admin tidak valid', 'invalid_admin_token', headers)
           return
         }
+        if (request.method === 'POST' && url.pathname === '/admin/ws-ticket') {
+          sendJson(response, 201, {
+            data: wsTickets.issue({ origin, subject: 'admin' }),
+          }, headers)
+          return
+        }
         if (request.method === 'GET' && url.pathname === '/admin/connections') {
           sendJson(response, 200, { data: await connectionStore.list() }, headers)
           return
@@ -1127,29 +1143,62 @@ export function createGatewayServer(options = {}) {
         return
       }
       let token = ''
+      let ticket = ''
       try {
-        token = new URL(req.url, 'http://localhost').searchParams.get('token') ?? ''
+        const params = new URL(req.url, 'http://localhost').searchParams
+        token = params.get('token') ?? ''
+        ticket = params.get('ticket') ?? ''
       } catch {
-        // URL invalid ditolak sebagai token kosong.
+        // URL invalid ditolak sebagai credential kosong.
+      }
+
+      if (ticket) {
+        const authorization = wsTickets.consume(ticket, { origin: origin ?? '' })
+        if (!authorization) {
+          done(false, 401, 'WebSocket ticket tidak valid atau sudah dipakai')
+          return
+        }
+        req.gatewayWsAuth = { mode: 'ticket', protocolVersion: 2, authorization }
+        done(true)
+        return
       }
       if (!safeEqual(token, wsToken)) {
         done(false, 401, 'Token tidak valid')
         return
       }
+      req.gatewayWsAuth = { mode: 'legacy-token', protocolVersion: 1 }
       done(true)
     },
   })
 
-  wss.on('connection', (socket) => {
+  wss.on('connection', (socket, request) => {
     if (wss.clients.size > limits.maxClients) {
       sendSocket(socket, { type: 'error', text: `Gateway penuh (maks ${limits.maxClients} koneksi)` })
       socket.close()
       return
     }
 
+    const wsAuth = request.gatewayWsAuth ?? { mode: 'legacy-token', protocolVersion: 1 }
+    const protocolVersion = wsAuth.protocolVersion
+    let sequence = 0
     let activeRun = null
+
+    const sendConnection = (payload) => {
+      sendSocket(socket, protocolVersion >= 2 ? { ...payload, seq: ++sequence } : payload)
+    }
+    const sendRun = (runState, payload) => {
+      sendSocket(socket, protocolVersion >= 2
+        ? { ...payload, runId: runState.runId, seq: ++sequence }
+        : payload)
+    }
+    const sendError = (text, runState = activeRun, code) => {
+      const payload = { type: 'error', text, ...(code ? { code } : {}) }
+      if (protocolVersion >= 2 && runState) sendRun(runState, payload)
+      else sendConnection(payload)
+    }
+
     providersReady.then(() => {
-      sendSocket(socket, { type: 'hello', protocolVersion: 1, providers: providerSummaries() })
+      sendConnection({ type: 'hello', protocolVersion, providers: providerSummaries() })
     })
 
     socket.on('message', (raw) => {
@@ -1157,78 +1206,176 @@ export function createGatewayServer(options = {}) {
       try {
         message = JSON.parse(raw.toString())
       } catch {
-        sendSocket(socket, { type: 'error', text: 'Pesan bukan JSON valid' })
+        sendError('Pesan bukan JSON valid', null, 'invalid_json')
         return
       }
+
+      if (message?.type === 'permission_response') {
+        if (protocolVersion < 2 || !activeRun?.permissionBroker) {
+          sendError('Tidak ada permission request yang aktif', activeRun, 'permission_not_active')
+          return
+        }
+        const result = activeRun.permissionBroker.respond(message)
+        if (!result.ok) sendError('Permission response ditolak', activeRun, result.code)
+        return
+      }
+
       if (message?.type === 'cancel') {
-        if (activeRun?.controller) activeRun.controller.cancel()
-        else sendSocket(socket, { type: 'error', text: 'Tidak ada run yang aktif' })
+        if (!activeRun?.controller) {
+          sendError('Tidak ada run yang aktif', activeRun, 'run_not_active')
+          return
+        }
+        if (protocolVersion >= 2 && message.runId !== activeRun.runId) {
+          sendError('runId cancel tidak cocok', activeRun, 'run_id_mismatch')
+          return
+        }
+        activeRun.controller.cancel()
         return
       }
       if (message?.type !== 'run') {
-        sendSocket(socket, { type: 'error', text: `Tipe pesan tidak didukung: ${message?.type ?? 'unknown'}` })
+        sendError(`Tipe pesan tidak didukung: ${message?.type ?? 'unknown'}`, activeRun, 'unsupported_message')
         return
       }
       if (activeRun) {
-        sendSocket(socket, { type: 'error', text: 'Masih ada run yang aktif' })
+        sendError('Masih ada run yang aktif', activeRun, 'run_already_active')
         return
+      }
+
+      let runId = null
+      if (protocolVersion >= 2) {
+        runId = cleanText(message.runId, 100)
+        if (!runId || !SAFE_ID_PATTERN.test(runId)) {
+          sendError('runId wajib dan harus valid untuk protocol v2', null, 'invalid_run_id')
+          return
+        }
       }
 
       let parsed
       try {
         parsed = parseRun(message, limits, providerForId)
       } catch (error) {
-        sendSocket(socket, { type: 'error', text: error.message })
+        sendError(error.message, null, 'invalid_run')
         return
       }
 
-      const { provider, request } = parsed
-      const runState = { controller: null, outputBytes: 0, terminal: false }
+      const { provider, request: runRequest } = parsed
+      if (provider.id === 'kiro-agent' && wsAuth.mode !== 'ticket') {
+        sendError(
+          'Kiro Agent membutuhkan WebSocket ticket dari sesi dashboard.',
+          null,
+          'agent_ticket_required',
+        )
+        return
+      }
+
+      const runState = {
+        controller: null,
+        outputBytes: 0,
+        terminal: false,
+        runId: runId ?? runRequest.sessionId,
+        permissionBroker: null,
+      }
+      runState.permissionBroker = createPermissionBroker({
+        runId: runState.runId,
+        policy: runRequest.toolPolicy,
+        timeoutMs: limits.permissionTimeoutMs,
+        send: (event) => {
+          if (activeRun === runState && !runState.terminal) sendRun(runState, event)
+        },
+      })
       activeRun = runState
-      sendSocket(socket, { type: 'session', sessionId: request.sessionId, providerId: provider.id, agentId: request.agentId })
+      sendRun(runState, {
+        type: 'session',
+        sessionId: runRequest.sessionId,
+        providerId: provider.id,
+        agentId: runRequest.agentId,
+      })
+
+      const finishRun = () => {
+        runState.permissionBroker.close()
+        if (activeRun === runState) activeRun = null
+      }
+
       try {
-        const controller = provider.start(request, {
+        const controller = provider.start(runRequest, {
           onSession(sessionId) {
             if (activeRun !== runState || runState.terminal) return
-            sendSocket(socket, { type: 'session', sessionId, providerId: provider.id, agentId: request.agentId })
+            sendRun(runState, {
+              type: 'session',
+              sessionId,
+              providerId: provider.id,
+              agentId: runRequest.agentId,
+            })
           },
           onChunk(text, level) {
             if (activeRun !== runState || runState.terminal) return
             runState.outputBytes += Buffer.byteLength(text, 'utf8')
             if (runState.outputBytes > limits.maxOutputBytes) {
               runState.terminal = true
-              sendSocket(socket, { type: 'error', text: `Output melebihi batas ${limits.maxOutputBytes} byte` })
+              sendError(`Output melebihi batas ${limits.maxOutputBytes} byte`, runState, 'max_output')
               runState.controller?.dispose()
-              if (activeRun === runState) activeRun = null
+              finishRun()
               return
             }
-            sendSocket(socket, { type: 'chunk', text, level })
+            sendRun(runState, protocolVersion >= 2
+              ? { type: 'message_delta', text, level }
+              : { type: 'chunk', text, level })
+          },
+          onThought(text) {
+            if (protocolVersion >= 2 && activeRun === runState && !runState.terminal) {
+              sendRun(runState, { type: 'thought_delta', text })
+            }
+          },
+          onPlan(plan) {
+            if (protocolVersion >= 2 && activeRun === runState && !runState.terminal) {
+              sendRun(runState, { type: 'plan', plan })
+            }
+          },
+          onToolCall(toolCall) {
+            if (protocolVersion >= 2 && activeRun === runState && !runState.terminal) {
+              const updateKind = String(toolCall?.sessionUpdate ?? toolCall?.type ?? '')
+                .replaceAll(/[-_]/g, '')
+                .toLowerCase()
+              sendRun(runState, {
+                type: updateKind === 'toolcallupdate' ? 'tool_call_update' : 'tool_call',
+                toolCall,
+              })
+            }
+          },
+          onDiagnostic(diagnostic) {
+            if (protocolVersion >= 2 && activeRun === runState && !runState.terminal) {
+              sendRun(runState, { type: 'diagnostic', diagnostic })
+            }
+          },
+          onPermissionRequest(params) {
+            return runState.permissionBroker.request(params)
           },
           onDone(result) {
             if (activeRun !== runState || runState.terminal) return
             runState.terminal = true
-            sendSocket(socket, { type: 'done', providerId: provider.id, ...result })
-            if (activeRun === runState) activeRun = null
+            sendRun(runState, { type: 'done', providerId: provider.id, ...result })
+            finishRun()
           },
           onError(text) {
             if (activeRun !== runState || runState.terminal) return
             runState.terminal = true
-            sendSocket(socket, { type: 'error', text })
-            if (activeRun === runState) activeRun = null
+            sendError(text, runState, 'provider_error')
+            finishRun()
           },
         })
         runState.controller = controller
         if (runState.terminal) controller?.dispose?.()
       } catch (error) {
         runState.terminal = true
-        if (activeRun === runState) activeRun = null
-        sendSocket(socket, { type: 'error', text: `Provider gagal dimulai: ${error.message}` })
+        sendError(`Provider gagal dimulai: ${error.message}`, runState, 'provider_start_failed')
+        finishRun()
       }
     })
 
     const disposeActiveRun = () => {
       const runState = activeRun
       activeRun = null
+      runState?.permissionBroker?.close()
       runState?.controller?.dispose()
     }
     socket.on('close', disposeActiveRun)
