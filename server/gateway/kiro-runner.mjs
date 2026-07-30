@@ -14,10 +14,17 @@ const DEFAULT_KIRO_REGION = 'us-east-1'
 const KIRO_REGIONS = new Set([DEFAULT_KIRO_REGION, 'eu-central-1'])
 
 export class KiroRunnerError extends Error {
-  constructor(message, { code = 'KIRO_RUNNER_ERROR', cause } = {}) {
+  constructor(message, {
+    code = 'KIRO_RUNNER_ERROR',
+    cause,
+    remoteCode,
+    remoteData,
+  } = {}) {
     super(message, { cause })
     this.name = 'KiroRunnerError'
     this.code = code
+    if (remoteCode !== undefined) this.remoteCode = remoteCode
+    if (remoteData !== undefined) this.remoteData = remoteData
   }
 }
 
@@ -549,6 +556,7 @@ export function createKiroRunner(options = {}) {
     let promptActive = false
     let runTimer = null
     let killTimer = null
+    let turnEndFallbackTimer = null
     let turnEndReason = null
     let stderr = ''
     let resolveDone
@@ -557,8 +565,10 @@ export function createKiroRunner(options = {}) {
     const clearTimers = () => {
       if (runTimer) clearTimeout(runTimer)
       if (killTimer) clearTimeout(killTimer)
+      if (turnEndFallbackTimer) clearTimeout(turnEndFallbackTimer)
       runTimer = null
       killTimer = null
+      turnEndFallbackTimer = null
     }
 
     const scheduleKill = () => {
@@ -596,11 +606,22 @@ export function createKiroRunner(options = {}) {
       const rawError = error instanceof KiroRunnerError
         ? error
         : error instanceof AcpTransportError
-          ? new KiroRunnerError(error.message, { code: error.code, cause: error })
+          ? new KiroRunnerError(error.message, {
+              code: error.code,
+              cause: error,
+              remoteCode: error.remoteCode,
+              remoteData: error.remoteData,
+            })
           : new KiroRunnerError('Kiro runner gagal.', { cause: error })
+      if (rawError.code === 'KIRO_ACP_REQUEST_TIMEOUT') timedOut = true
       const safeError = new KiroRunnerError(
         sanitizeText(rawError.message, [authSecret(request?.auth)]) || 'Kiro runner gagal.',
-        { code: rawError.code, cause: rawError },
+        {
+          code: timedOut ? 'KIRO_TIMEOUT' : rawError.code,
+          cause: rawError,
+          remoteCode: rawError.remoteCode,
+          remoteData: rawError.remoteData,
+        },
       )
       const payload = {
         sessionId: activeSessionId,
@@ -636,7 +657,14 @@ export function createKiroRunner(options = {}) {
     }
 
     const handleNotification = (message) => {
-      if (message.method !== 'session/update' && message.method !== 'session/notification') return
+      if (message.method !== 'session/update' && message.method !== 'session/notification') {
+        handlers.onDiagnostic?.({
+          type: 'unknown_notification',
+          method: message.method,
+          params: message.params,
+        })
+        return
+      }
       // session/load may replay the complete conversation before it resolves.
       // Only forward updates belonging to the newly submitted prompt turn.
       if (!promptActive) return
@@ -648,9 +676,27 @@ export function createKiroRunner(options = {}) {
         if (text) onChunk(text)
         return
       }
+      if (kind === 'agentthoughtchunk') {
+        const text = contentText(update.content)
+        if (text) handlers.onThought?.(text, update)
+        return
+      }
+      if (kind === 'plan') {
+        handlers.onPlan?.(update)
+        return
+      }
       if (kind === 'turnend') {
+        // `session/prompt`'s response is the ACP completion boundary. Some Kiro
+        // versions also emit this extension (or only emit it), so keep it as a
+        // short compatibility fallback without racing the canonical response.
         turnEndReason = update.stopReason ?? update.reason ?? 'end_turn'
-        finishDone({ stopReason: turnEndReason })
+        if (!turnEndFallbackTimer) {
+          turnEndFallbackTimer = setTimeout(() => {
+            turnEndFallbackTimer = null
+            if (!terminal) finishDone({ stopReason: turnEndReason })
+          }, 25)
+          turnEndFallbackTimer.unref?.()
+        }
         return
       }
       if (kind === 'toolcall' || kind === 'toolcallupdate') {
@@ -659,7 +705,9 @@ export function createKiroRunner(options = {}) {
         if (!allowTools && (status === 'in_progress' || status === 'completed')) {
           cancelForUnsupportedTool()
         }
+        return
       }
+      handlers.onDiagnostic?.({ type: 'unknown_session_update', update })
     }
 
     const handleClientRequest = async (message) => {
@@ -734,6 +782,7 @@ export function createKiroRunner(options = {}) {
 
         transport = (options.createTransport ?? createNdjsonRpcTransport)(child, {
           maxOutputBytes,
+          requestTimeoutMs: timeoutMs,
           onNotification: handleNotification,
           onRequest: handleClientRequest,
           onError: finishError,

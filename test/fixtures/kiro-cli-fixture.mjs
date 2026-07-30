@@ -171,10 +171,10 @@ function runAcp() {
         record('permission-response', { message })
         sendTogether([
           notification(activeSessionId, {
-            sessionUpdate: 'AgentMessageChunk',
+            sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: 'permission denied safely' },
           }),
-          notification(activeSessionId, { sessionUpdate: 'TurnEnd', stopReason: 'end_turn' }),
+          notification(activeSessionId, { sessionUpdate: 'turn_end', stopReason: 'end_turn' }),
           response(promptRequest.id, { stopReason: 'end_turn' }),
         ])
         promptRequest = null
@@ -212,7 +212,7 @@ function runAcp() {
       activeSessionId = message.params.sessionId
       if (mode === 'load-replay') {
         send(notification(activeSessionId, {
-          sessionUpdate: 'AgentMessageChunk',
+          sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: 'old replayed output' },
         }))
       }
@@ -230,7 +230,7 @@ function runAcp() {
       if (mode === 'prompt-timeout') return
       if (mode === 'cancel') {
         send(notification(activeSessionId, {
-          sessionUpdate: 'AgentMessageChunk',
+          sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: 'waiting for cancel' },
         }))
         return
@@ -238,7 +238,7 @@ function runAcp() {
       if (mode === 'permission') {
         sendTogether([
           notification(activeSessionId, {
-            sessionUpdate: 'ToolCall',
+            sessionUpdate: 'tool_call',
             toolCallId: 'tool-1',
             title: 'Dangerous tool',
             status: 'pending',
@@ -261,15 +261,33 @@ function runAcp() {
       }
       if (mode === 'active-tool') {
         send(notification(activeSessionId, {
-          sessionUpdate: 'ToolCallUpdate',
+          sessionUpdate: 'tool_call_update',
           toolCallId: 'tool-2',
           status: 'in_progress',
         }))
         return
       }
 
+      if (mode === 'structured-events') {
+        sendTogether([
+          notification(activeSessionId, {
+            sessionUpdate: 'agent_thought_chunk',
+            content: { type: 'text', text: 'thinking safely' },
+          }),
+          notification(activeSessionId, {
+            sessionUpdate: 'plan',
+            entries: [{ content: 'inspect files', status: 'pending' }],
+          }),
+          notification(activeSessionId, {
+            sessionUpdate: 'future_extension',
+            value: 42,
+          }),
+        ])
+      }
+
+      const legacyEvents = mode === 'legacy-events'
       const first = notification(activeSessionId, {
-        sessionUpdate: 'AgentMessageChunk',
+        sessionUpdate: legacyEvents ? 'AgentMessageChunk' : 'agent_message_chunk',
         content: { type: 'text', text: 'hello ' },
       })
       const second = notification(activeSessionId, {
@@ -278,7 +296,7 @@ function runAcp() {
       })
       sendTogether([first, second])
       const end = notification(activeSessionId, {
-        sessionUpdate: 'TurnEnd',
+        sessionUpdate: legacyEvents ? 'TurnEnd' : 'turn_end',
         stopReason: 'end_turn',
       })
       if (mode === 'turnend-only') {

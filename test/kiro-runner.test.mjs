@@ -325,6 +325,52 @@ test('new session initializes ACP, sets model, streams fragmented chunks, and co
   }])
 })
 
+test('forwards structured ACP events and reports unknown extensions diagnostically', async () => {
+  const { runner } = await setup('structured-events')
+  const thoughts = []
+  const plans = []
+  const diagnostics = []
+  const chunks = []
+  const controller = runner.start({
+    resume: false,
+    prompt: 'inspect the workspace',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  }, {
+    onChunk: (chunk) => chunks.push(chunk),
+    onThought: (text, update) => thoughts.push({ text, update }),
+    onPlan: (plan) => plans.push(plan),
+    onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+  })
+
+  const result = await controller.done
+  assert.equal(result.reason, 'end_turn')
+  assert.deepEqual(chunks, ['hello ', 'from fixture'])
+  assert.equal(thoughts[0].text, 'thinking safely')
+  assert.equal(thoughts[0].update.sessionUpdate, 'agent_thought_chunk')
+  assert.deepEqual(plans[0].entries, [{ content: 'inspect files', status: 'pending' }])
+  assert.deepEqual(diagnostics, [{
+    type: 'unknown_session_update',
+    update: {
+      sessionUpdate: 'future_extension',
+      value: 42,
+    },
+  }])
+})
+
+test('normalizes legacy Kiro event casing as a compatibility fallback', async () => {
+  const { runner } = await setup('legacy-events')
+  const execution = await runStart(runner, {
+    resume: false,
+    prompt: 'legacy events',
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+
+  assert.deepEqual(execution.chunks, ['hello ', 'from fixture'])
+  assert.equal(execution.result.reason, 'end_turn')
+})
+
 test('resume uses session/load and preserves requested session ID', async () => {
   const { runner, recordFile } = await setup()
   const execution = await runStart(runner, {

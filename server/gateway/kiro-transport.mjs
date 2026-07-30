@@ -1,11 +1,24 @@
 const JSON_RPC_VERSION = '2.0'
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 
 export class AcpTransportError extends Error {
-  constructor(message, { code = 'KIRO_ACP_ERROR', cause } = {}) {
+  constructor(message, {
+    code = 'KIRO_ACP_ERROR',
+    cause,
+    remoteCode,
+    remoteData,
+  } = {}) {
     super(message, { cause })
     this.name = 'AcpTransportError'
     this.code = code
+    if (remoteCode !== undefined) this.remoteCode = remoteCode
+    if (remoteData !== undefined) this.remoteData = remoteData
   }
+}
+
+function positiveNumber(value, fallback) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
 /**
@@ -16,6 +29,7 @@ export class AcpTransportError extends Error {
 export class NdjsonRpcTransport {
   constructor(child, {
     maxOutputBytes = 2_000_000,
+    requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
     onNotification = () => {},
     onRequest = async (message) => {
       throw new AcpTransportError(`Unsupported ACP client method: ${message.method}`, {
@@ -26,6 +40,7 @@ export class NdjsonRpcTransport {
   } = {}) {
     this.child = child
     this.maxOutputBytes = maxOutputBytes
+    this.requestTimeoutMs = positiveNumber(requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS)
     this.onNotification = onNotification
     this.onRequest = onRequest
     this.onError = onError
@@ -33,6 +48,9 @@ export class NdjsonRpcTransport {
     this.outputBytes = 0
     this.nextId = 0
     this.pending = new Map()
+    this.writeQueue = []
+    this.backpressured = false
+    this.drainListener = null
     this.closed = false
     this.failed = false
 
@@ -40,14 +58,16 @@ export class NdjsonRpcTransport {
     child.stdout.on('data', (chunk) => this.#consume(chunk))
     child.stdout.on('end', () => this.#flush())
     child.stdin.on('error', (cause) => {
-      if (this.closed) return
+      if (this.closed || this.failed) return
       this.#fail(new AcpTransportError('Kiro ACP stdin closed unexpectedly.', {
         code: 'KIRO_ACP_CLOSED',
         cause,
       }))
     })
     child.once('close', (code, signal) => {
+      if (this.closed) return
       this.closed = true
+      this.#discardWrites()
       const error = new AcpTransportError(
         `Kiro ACP process closed before completing a request (code ${code ?? 'null'}, signal ${signal ?? 'none'}).`,
         { code: 'KIRO_ACP_CLOSED' },
@@ -56,22 +76,41 @@ export class NdjsonRpcTransport {
     })
   }
 
-  request(method, params) {
+  request(method, params, { timeoutMs = this.requestTimeoutMs } = {}) {
     if (this.closed || this.failed) {
       return Promise.reject(new AcpTransportError('Kiro ACP transport is closed.', {
         code: 'KIRO_ACP_CLOSED',
       }))
     }
+    if (typeof method !== 'string' || !method) {
+      return Promise.reject(new AcpTransportError('Kiro ACP request method harus berupa string.', {
+        code: 'KIRO_ACP_INVALID_REQUEST',
+      }))
+    }
 
     const id = this.nextId++
+    const key = String(id)
+    const effectiveTimeoutMs = positiveNumber(timeoutMs, this.requestTimeoutMs)
     const promise = new Promise((resolve, reject) => {
-      this.pending.set(String(id), { resolve, reject, method })
+      const timer = setTimeout(() => {
+        const pending = this.pending.get(key)
+        if (!pending) return
+        this.pending.delete(key)
+        pending.reject(new AcpTransportError(
+          `Kiro ACP ${method} timeout setelah ${effectiveTimeoutMs}ms.`,
+          { code: 'KIRO_ACP_REQUEST_TIMEOUT' },
+        ))
+      }, effectiveTimeoutMs)
+      timer.unref?.()
+      this.pending.set(key, { resolve, reject, method, timer })
     })
 
     try {
       this.#write({ jsonrpc: JSON_RPC_VERSION, id, method, params })
     } catch (error) {
-      this.pending.delete(String(id))
+      const pending = this.pending.get(key)
+      if (pending) clearTimeout(pending.timer)
+      this.pending.delete(key)
       return Promise.reject(error)
     }
     return promise
@@ -90,6 +129,7 @@ export class NdjsonRpcTransport {
   close(error = new AcpTransportError('Kiro ACP transport was disposed.', { code: 'KIRO_ACP_CLOSED' })) {
     if (this.closed) return
     this.closed = true
+    this.#discardWrites()
     this.#rejectPending(error)
     try {
       this.child.stdin.end()
@@ -99,20 +139,69 @@ export class NdjsonRpcTransport {
   }
 
   #write(message) {
-    if (!this.child.stdin?.writable) {
+    if (this.closed || this.failed || !this.child.stdin?.writable) {
       throw new AcpTransportError('Kiro ACP stdin is not writable.', { code: 'KIRO_ACP_CLOSED' })
     }
-    this.child.stdin.write(`${JSON.stringify(message)}\n`, (cause) => {
-      if (!cause || this.closed) return
-      this.#fail(new AcpTransportError('Kiro ACP stdin closed unexpectedly.', {
-        code: 'KIRO_ACP_CLOSED',
+
+    let line
+    try {
+      line = `${JSON.stringify(message)}\n`
+    } catch (cause) {
+      throw new AcpTransportError('Kiro ACP request tidak dapat diserialisasi.', {
+        code: 'KIRO_ACP_INVALID_REQUEST',
         cause,
-      }))
-    })
+      })
+    }
+    this.writeQueue.push(line)
+    this.#pumpWrites()
+  }
+
+  #pumpWrites() {
+    if (this.closed || this.failed || this.backpressured) return
+
+    while (this.writeQueue.length > 0 && !this.closed && !this.failed) {
+      const line = this.writeQueue.shift()
+      let accepted
+      try {
+        accepted = this.child.stdin.write(line, (cause) => {
+          if (!cause || this.closed || this.failed) return
+          this.#fail(new AcpTransportError('Kiro ACP stdin closed unexpectedly.', {
+            code: 'KIRO_ACP_CLOSED',
+            cause,
+          }))
+        })
+      } catch (cause) {
+        this.#fail(new AcpTransportError('Kiro ACP stdin closed unexpectedly.', {
+          code: 'KIRO_ACP_CLOSED',
+          cause,
+        }))
+        return
+      }
+
+      if (!accepted) {
+        this.backpressured = true
+        this.drainListener = () => {
+          this.drainListener = null
+          this.backpressured = false
+          this.#pumpWrites()
+        }
+        this.child.stdin.once('drain', this.drainListener)
+        return
+      }
+    }
+  }
+
+  #discardWrites() {
+    this.writeQueue = []
+    this.backpressured = false
+    if (this.drainListener) {
+      this.child.stdin.off?.('drain', this.drainListener)
+      this.drainListener = null
+    }
   }
 
   #consume(chunk) {
-    if (this.failed) return
+    if (this.failed || this.closed) return
     this.outputBytes += Buffer.byteLength(chunk)
     if (this.outputBytes > this.maxOutputBytes) {
       this.#fail(new AcpTransportError(
@@ -128,12 +217,12 @@ export class NdjsonRpcTransport {
       const line = this.buffer.slice(0, newline)
       this.buffer = this.buffer.slice(newline + 1)
       this.#parseLine(line)
-      if (this.failed) return
+      if (this.failed || this.closed) return
     }
   }
 
   #flush() {
-    if (!this.failed && this.buffer.trim()) this.#parseLine(this.buffer)
+    if (!this.failed && !this.closed && this.buffer.trim()) this.#parseLine(this.buffer)
     this.buffer = ''
   }
 
@@ -159,14 +248,17 @@ export class NdjsonRpcTransport {
         }))
         return
       }
-      for (const item of message) this.#handle(item)
+      for (const item of message) {
+        this.#handle(item)
+        if (this.failed || this.closed) return
+      }
       return
     }
     this.#handle(message)
   }
 
   #handle(message) {
-    if (!message || typeof message !== 'object' || message.jsonrpc !== JSON_RPC_VERSION) {
+    if (!message || typeof message !== 'object' || Array.isArray(message) || message.jsonrpc !== JSON_RPC_VERSION) {
       this.#fail(new AcpTransportError('Kiro ACP returned an invalid JSON-RPC message.', {
         code: 'KIRO_ACP_INVALID_MESSAGE',
       }))
@@ -174,23 +266,48 @@ export class NdjsonRpcTransport {
     }
 
     const hasId = Object.hasOwn(message, 'id')
-    const isResponse = hasId && (Object.hasOwn(message, 'result') || Object.hasOwn(message, 'error'))
-    if (isResponse) {
-      const pending = this.pending.get(String(message.id))
-      if (!pending) return
-      this.pending.delete(String(message.id))
-      if (message.error) {
-        const detail = typeof message.error.message === 'string' ? message.error.message : 'Unknown ACP error'
-        pending.reject(new AcpTransportError(`Kiro ACP ${pending.method} failed: ${detail}`, {
-          code: 'KIRO_ACP_REMOTE_ERROR',
+    const hasResult = Object.hasOwn(message, 'result')
+    const hasError = Object.hasOwn(message, 'error')
+    if (hasResult || hasError) {
+      if (!hasId || hasResult === hasError || typeof message.method === 'string') {
+        this.#fail(new AcpTransportError('Kiro ACP returned an invalid JSON-RPC response.', {
+          code: 'KIRO_ACP_INVALID_MESSAGE',
         }))
+        return
+      }
+      if (hasError && (
+        !message.error
+        || typeof message.error !== 'object'
+        || !Number.isInteger(message.error.code)
+        || typeof message.error.message !== 'string'
+      )) {
+        this.#fail(new AcpTransportError('Kiro ACP returned an invalid JSON-RPC error response.', {
+          code: 'KIRO_ACP_INVALID_MESSAGE',
+        }))
+        return
+      }
+
+      const key = String(message.id)
+      const pending = this.pending.get(key)
+      if (!pending) return
+      this.pending.delete(key)
+      clearTimeout(pending.timer)
+      if (hasError) {
+        pending.reject(new AcpTransportError(
+          `Kiro ACP ${pending.method} failed: ${message.error.message}`,
+          {
+            code: 'KIRO_ACP_REMOTE_ERROR',
+            remoteCode: message.error.code,
+            remoteData: message.error.data,
+          },
+        ))
       } else {
         pending.resolve(message.result)
       }
       return
     }
 
-    if (typeof message.method !== 'string') {
+    if (typeof message.method !== 'string' || !message.method || (hasId && message.id === null)) {
       this.#fail(new AcpTransportError('Kiro ACP returned an invalid JSON-RPC message.', {
         code: 'KIRO_ACP_INVALID_MESSAGE',
       }))
@@ -232,14 +349,22 @@ export class NdjsonRpcTransport {
   }
 
   #fail(error) {
-    if (this.failed) return
+    if (this.failed || this.closed) return
     this.failed = true
+    this.#discardWrites()
     this.#rejectPending(error)
-    this.onError(error)
+    try {
+      this.onError(error)
+    } catch {
+      // The transport error remains authoritative.
+    }
   }
 
   #rejectPending(error) {
-    for (const pending of this.pending.values()) pending.reject(error)
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    }
     this.pending.clear()
   }
 }
