@@ -20,6 +20,8 @@ import {
   kiroInferenceAlias,
   kiroInferenceProvider,
 } from './gateway/providers/kiro-inference.mjs'
+import { createKiroAcpProvider } from './gateway/providers/kiro-acp.mjs'
+import { createKiroRunner } from './gateway/kiro-runner.mjs'
 import { UsageStore } from './gateway/usage-store.mjs'
 import { createSessionManager, parseCookies, serializeSessionCookie } from './gateway/session.mjs'
 import { assertPublicHost } from './gateway/net-guard.mjs'
@@ -307,18 +309,36 @@ export function createGatewayServer(options = {}) {
     fetchImpl: options.kiroFetchImpl ?? fetchImpl,
     assertHost: skipKiroHostGuard ? async () => {} : assertPublicHost,
   })
+  const getKiroConnection = (id) => id ? connectionStore.getWithSecret(id) : null
   const kiroProviderOptions = {
     client: kiroHttpClient,
-    getConnection: (id) => id ? connectionStore.getWithSecret(id) : null,
+    getConnection: getKiroConnection,
   }
+  const kiroAcpRunner = options.kiroRunner ?? createKiroRunner({
+    env,
+    dataDir,
+    maxOutputBytes: limits.maxOutputBytes,
+  })
   const providers = options.providers ?? [
     claudeCliProvider,
+    createKiroAcpProvider({
+      runner: kiroAcpRunner,
+      getConnection: getKiroConnection,
+      cwd: options.kiroAcpCwd,
+    }),
     createKiroInferenceProvider(kiroProviderOptions),
     createKiroInferenceAlias(kiroProviderOptions),
   ]
   const providerMap = new Map(providers.map((provider) => [provider.id, provider]))
   const providerForId = (id) => providerMap.get(id) ?? null
-  const providerSummaries = providers.map(({ id, label, capabilities }) => ({ id, label, capabilities }))
+  const providersReady = Promise.allSettled(
+    providers.map((provider) => provider.ready).filter(Boolean),
+  )
+  const providerSummaries = () => providers.map(({ id, label, capabilities }) => ({
+    id,
+    label,
+    capabilities,
+  }))
   const connectionDrivers = options.connectionDrivers ?? [
     {
       id: 'openai-http',
@@ -1128,7 +1148,9 @@ export function createGatewayServer(options = {}) {
     }
 
     let activeRun = null
-    sendSocket(socket, { type: 'hello', protocolVersion: 1, providers: providerSummaries })
+    providersReady.then(() => {
+      sendSocket(socket, { type: 'hello', protocolVersion: 1, providers: providerSummaries() })
+    })
 
     socket.on('message', (raw) => {
       let message

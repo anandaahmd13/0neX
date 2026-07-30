@@ -341,6 +341,77 @@ export function createKiroRunner(options = {}) {
     return parseKiroModelList(parseJsonOutput(stdout, 'model listing'))
   }
 
+  async function probe({ auth = { type: 'account-session' }, cwd } = {}) {
+    let child = null
+    let transport = null
+    let killTimer = null
+    try {
+      const resolvedCwd = resolve(cwd ?? options.cwd ?? process.cwd())
+      const env = await environmentFor(auth)
+      child = spawnFn(executable, commandArgs(['acp']), {
+        cwd: resolvedCwd,
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: false,
+        windowsHide: true,
+      })
+      const spawnFailure = new Promise((_, rejectPromise) => {
+        child.once('error', (error) => rejectPromise(mapSpawnError(error, executable)))
+      })
+      transport = (options.createTransport ?? createNdjsonRpcTransport)(child, {
+        maxOutputBytes,
+        requestTimeoutMs: Math.min(timeoutMs, 10_000),
+      })
+      const initialized = await Promise.race([
+        transport.request('initialize', {
+          protocolVersion: 1,
+          clientCapabilities: {},
+          clientInfo: CLIENT_INFO,
+        }),
+        spawnFailure,
+      ])
+      if (initialized?.protocolVersion !== 1) {
+        throw new KiroRunnerError(
+          `Kiro ACP protocol version ${String(initialized?.protocolVersion)} tidak didukung.`,
+          { code: 'KIRO_ACP_VERSION' },
+        )
+      }
+      return {
+        available: true,
+        executable,
+        version: typeof initialized.agentInfo?.version === 'string'
+          ? initialized.agentInfo.version
+          : null,
+        acpProtocolVersion: initialized.protocolVersion,
+        supports: {
+          acp: true,
+          loadSession: initialized.agentCapabilities?.loadSession === true,
+          mcpTransports: [],
+        },
+      }
+    } catch (error) {
+      const mapped = error instanceof KiroRunnerError
+        ? error
+        : error instanceof AcpTransportError
+          ? new KiroRunnerError(error.message, { code: error.code, cause: error })
+          : mapSpawnError(error, executable)
+      return {
+        available: false,
+        executable,
+        reason: sanitizeText(mapped.message, [authSecret(auth)]),
+        code: mapped.code,
+        supports: { acp: false, loadSession: false, mcpTransports: [] },
+      }
+    } finally {
+      transport?.close()
+      if (child && child.exitCode === null && child.signalCode === null) {
+        terminateChild(child, 'SIGTERM')
+        killTimer = setTimeout(() => terminateChild(child, 'SIGKILL'), killGraceMs)
+        killTimer.unref?.()
+      }
+    }
+  }
+
   async function validateApiKey({ apiKey, region = DEFAULT_KIRO_REGION, cwd } = {}) {
     const secret = typeof apiKey === 'string' ? apiKey.trim() : ''
     if (!secret) {
@@ -899,7 +970,7 @@ export function createKiroRunner(options = {}) {
     }
   }
 
-  return { checkAuth, whoami, listModels, validateApiKey, startHeadless, start }
+  return { probe, checkAuth, whoami, listModels, validateApiKey, startHeadless, start }
 }
 
 export const kiroRunner = createKiroRunner()

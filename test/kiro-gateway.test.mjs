@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import WebSocket from 'ws'
 import { createGatewayServer } from '../server/gateway-server.mjs'
+import { createKiroRunner } from '../server/gateway/kiro-runner.mjs'
 
+const TEST_DIR = dirname(fileURLToPath(import.meta.url))
+const KIRO_FIXTURE = join(TEST_DIR, 'fixtures', 'kiro-cli-fixture.mjs')
 const MASTER_KEY = '0123456789abcdef0123456789abcdef'
 const ORIGIN = 'http://localhost:5199'
 const WS_TOKEN = 'gateway-ws-kiro-test'
@@ -98,11 +102,36 @@ function createFakeKiroHttpClient() {
   }
 }
 
-async function setupGateway(t) {
+async function setupGateway(t, overrides = {}) {
   const root = await mkdtemp(join(tmpdir(), '0nex-kiro-gateway-'))
   const gatewayDataDir = join(root, 'gateway-data')
   const kiroBearerValidator = createFakeKiroBearerValidator()
   const kiroHttpClient = createFakeKiroHttpClient()
+  const kiroRecordFile = join(root, 'kiro-acp.jsonl')
+  const kiroRunner = overrides.kiroFixtureMode
+    ? createKiroRunner({
+        executable: process.execPath,
+        executableArgs: [KIRO_FIXTURE],
+        env: {
+          ...process.env,
+          KIRO_FIXTURE_MODE: overrides.kiroFixtureMode,
+          KIRO_FIXTURE_RECORD: kiroRecordFile,
+        },
+        dataDir: gatewayDataDir,
+        timeoutMs: 2_000,
+        killGraceMs: 30,
+        maxOutputBytes: 100_000,
+      })
+    : overrides.kiroRunner ?? {
+        async probe() {
+          return {
+            available: false,
+            code: 'KIRO_CLI_NOT_FOUND',
+            reason: 'fixture runtime unavailable',
+            supports: { acp: false, loadSession: false, mcpTransports: [] },
+          }
+        },
+      }
   const gateway = createGatewayServer({
     host: '127.0.0.1',
     port: 0,
@@ -115,6 +144,8 @@ async function setupGateway(t) {
     allowInsecureLocalhost: true,
     kiroBearerValidator,
     kiroHttpClient,
+    kiroRunner,
+    kiroAcpCwd: overrides.kiroAcpCwd,
     env: {
       ...process.env,
       GATEWAY_RATE_CAPACITY: '0',
@@ -125,6 +156,7 @@ async function setupGateway(t) {
   t.after(() => gateway.close())
   return {
     gatewayDataDir,
+    kiroRecordFile,
     kiroBearerValidator,
     kiroHttpClient,
     baseUrl: `http://127.0.0.1:${address.port}`,
@@ -242,6 +274,128 @@ function parseSse(text) {
     .filter(Boolean)
     .map((block) => block.replace(/^data: /, ''))
 }
+
+async function fixtureRecords(path) {
+  const raw = await readFile(path, 'utf8')
+  return raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+}
+
+function fixtureRpcMessages(entries) {
+  return entries.filter((entry) => entry.type === 'rpc').map((entry) => entry.message)
+}
+
+test('Kiro Agent probes ACP and supports new and resumed sessions over WebSocket', async (t) => {
+  const { wsUrl, kiroRecordFile } = await setupGateway(t, {
+    kiroFixtureMode: 'normal',
+    kiroAcpCwd: TEST_DIR,
+  })
+  const client = connect(wsUrl)
+  t.after(() => client.socket.close())
+  await client.opened
+
+  const hello = await client.next((message) => message.type === 'hello')
+  const provider = hello.providers.find((entry) => entry.id === 'kiro-agent')
+  assert.deepEqual(provider, {
+    id: 'kiro-agent',
+    label: 'Kiro Agent (ACP)',
+    capabilities: {
+      streaming: true,
+      sessions: true,
+      cancellation: true,
+      tools: false,
+      available: true,
+      runtime: { version: '1.0.0', acpProtocolVersion: 1 },
+    },
+  })
+
+  client.socket.send(JSON.stringify(runMessage({
+    providerId: 'kiro-agent',
+    sessionId: 'new-correlation',
+    agent: {
+      id: 'agt_kiro',
+      model: '',
+      systemPrompt: 'answer briefly',
+      toolPolicy: 'none',
+    },
+  })))
+  await client.next((message) => message.type === 'session' && message.sessionId === 'new-correlation')
+  const created = await client.next(
+    (message) => message.type === 'session' && message.sessionId === 'fixture-new-session',
+  )
+  assert.equal(created.providerId, 'kiro-agent')
+  assert.deepEqual([
+    (await client.next((message) => message.type === 'chunk')).text,
+    (await client.next((message) => message.type === 'chunk')).text,
+  ], ['hello ', 'from fixture'])
+  const firstDone = await client.next((message) => message.type === 'done')
+  assert.equal(firstDone.providerId, 'kiro-agent')
+  assert.equal(firstDone.reason, 'completed')
+  assert.equal(firstDone.sessionId, 'fixture-new-session')
+  assert.equal(firstDone.stopReason, 'end_turn')
+
+  client.socket.send(JSON.stringify(runMessage({
+    providerId: 'kiro-agent',
+    sessionId: 'existing-session',
+    resume: true,
+    agent: {
+      id: 'agt_kiro',
+      model: '',
+      systemPrompt: '',
+      toolPolicy: 'none',
+    },
+  })))
+  await client.next((message) => message.type === 'session' && message.sessionId === 'existing-session')
+  await client.next((message) => message.type === 'chunk')
+  await client.next((message) => message.type === 'chunk')
+  const resumedDone = await client.next((message) => message.type === 'done')
+  assert.equal(resumedDone.reason, 'completed')
+  assert.equal(resumedDone.sessionId, 'existing-session')
+
+  const entries = await fixtureRecords(kiroRecordFile)
+  const processes = entries.filter((entry) => entry.type === 'spawn')
+  assert.equal(processes.length, 3)
+  assert.equal(processes.every((entry) => entry.args[0] === 'acp'), true)
+  const methods = fixtureRpcMessages(entries).map((message) => message.method)
+  assert.deepEqual(methods, [
+    'initialize',
+    'initialize', 'session/new', 'session/prompt',
+    'initialize', 'session/load', 'session/prompt',
+  ])
+})
+
+test('Kiro Agent cancellation reaches the ACP subprocess', async (t) => {
+  const { wsUrl, kiroRecordFile } = await setupGateway(t, {
+    kiroFixtureMode: 'cancel',
+    kiroAcpCwd: TEST_DIR,
+  })
+  const client = connect(wsUrl)
+  t.after(() => client.socket.close())
+  await client.opened
+  await client.next((message) => message.type === 'hello')
+
+  client.socket.send(JSON.stringify(runMessage({
+    providerId: 'kiro-agent',
+    sessionId: 'cancel-session',
+    prompt: 'wait',
+    agent: { id: 'agt_kiro', model: '', systemPrompt: '', toolPolicy: 'none' },
+  })))
+  await client.next((message) => message.type === 'chunk' && message.text === 'waiting for cancel')
+  client.socket.send(JSON.stringify({ type: 'cancel' }))
+  const done = await client.next((message) => message.type === 'done')
+  assert.equal(done.providerId, 'kiro-agent')
+  assert.equal(done.reason, 'cancelled')
+  assert.equal(done.code, null)
+
+  await waitFor(async () => {
+    const entries = await fixtureRecords(kiroRecordFile)
+    return entries.some((entry) => entry.type === 'cancel')
+  })
+  const entries = await fixtureRecords(kiroRecordFile)
+  assert.equal(
+    fixtureRpcMessages(entries).some((message) => message.method === 'session/cancel'),
+    true,
+  )
+})
 
 test('Kiro Playground requires a selected connection and streams with its stored credential', async (t) => {
   const { baseUrl, wsUrl, kiroHttpClient } = await setupGateway(t)

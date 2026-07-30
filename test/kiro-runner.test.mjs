@@ -99,6 +99,47 @@ test('parseKiroModelList only returns explicit IDs from known containers', () =>
   }), ['model-a', 'model-b', 'model-c', 'model-d'])
 })
 
+test('probe performs a real ACP initialize handshake and reports runtime capabilities', async () => {
+  const { runner, recordFile } = await setup()
+
+  const status = await runner.probe({
+    auth: { type: 'account-session' },
+    cwd: TEST_DIR,
+  })
+
+  assert.deepEqual(status, {
+    available: true,
+    executable: process.execPath,
+    version: '1.0.0',
+    acpProtocolVersion: 1,
+    supports: {
+      acp: true,
+      loadSession: true,
+      mcpTransports: [],
+    },
+  })
+  const entries = await records(recordFile)
+  assert.deepEqual(entries[0].args, ['acp'])
+  assert.equal(entries[0].cwd, TEST_DIR)
+  assert.deepEqual(rpcMessages(entries).map((message) => message.method), ['initialize'])
+})
+
+test('probe reports a missing executable without throwing', async () => {
+  const { runner } = await setup('normal', {
+    executable: join(tmpdir(), 'definitely-missing-kiro-cli-probe'),
+  })
+
+  const status = await runner.probe({ auth: { type: 'account-session' } })
+  assert.equal(status.available, false)
+  assert.equal(status.code, 'KIRO_CLI_NOT_FOUND')
+  assert.match(status.reason, /tidak ditemukan/)
+  assert.deepEqual(status.supports, {
+    acp: false,
+    loadSession: false,
+    mcpTransports: [],
+  })
+})
+
 test('whoami/checkAuth and model listing use real CLI subprocesses', async () => {
   const { runner, recordFile, env } = await setup()
 
