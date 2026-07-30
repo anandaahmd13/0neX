@@ -14,7 +14,12 @@ import {
 } from './gateway/openai-compatible.mjs'
 import { getProvider, listProviders, registerProvider } from './gateway/provider-registry.mjs'
 import { claudeCliProvider } from './gateway/providers/claude-cli.mjs'
-import { createKiroCliProvider, kiroCliProvider } from './gateway/providers/kiro-cli.mjs'
+import {
+  createKiroInferenceAlias,
+  createKiroInferenceProvider,
+  kiroInferenceAlias,
+  kiroInferenceProvider,
+} from './gateway/providers/kiro-inference.mjs'
 import { UsageStore } from './gateway/usage-store.mjs'
 import { createSessionManager, parseCookies, serializeSessionCookie } from './gateway/session.mjs'
 import { assertPublicHost } from './gateway/net-guard.mjs'
@@ -23,9 +28,11 @@ import { RateLimiter } from './gateway/rate-limiter.mjs'
 import { PricingTable } from './gateway/pricing.mjs'
 import { loadAliases } from './gateway/aliases.mjs'
 import { createKiroHttpClient } from './gateway/kiro-http.mjs'
+import { createConnectionDriverRegistry } from './gateway/connection-driver-registry.mjs'
+import { createKiroInferenceDriver } from './gateway/kiro-inference-driver.mjs'
 import { API_KEY_SCOPES, ApiKeyStore, looksLikeManagedKey } from './gateway/api-key-store.mjs'
 
-for (const provider of [claudeCliProvider, kiroCliProvider]) {
+for (const provider of [claudeCliProvider, kiroInferenceProvider, kiroInferenceAlias]) {
   try {
     registerProvider(provider)
   } catch (error) {
@@ -194,103 +201,6 @@ function categoryForStatus(status) {
   return status >= 500 ? 'upstream_server' : 'upstream_request'
 }
 
-function invalidKiroRequest(message, code = 'kiro_unsupported_request') {
-  return Object.assign(new Error(message), { status: 400, code, retryable: false })
-}
-
-function textMessageContent(content, index) {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) {
-    throw invalidKiroRequest(`messages[${index}].content harus berupa teks`, 'kiro_text_only')
-  }
-  const parts = []
-  for (const part of content) {
-    if (!part || part.type !== 'text' || typeof part.text !== 'string') {
-      throw invalidKiroRequest('Kiro hanya mendukung content part bertipe text; multimodal tidak didukung', 'kiro_text_only')
-    }
-    parts.push(part.text)
-  }
-  return parts.join('')
-}
-
-function roleSeparated(messages) {
-  return messages.map(({ role, text }) => `[${role}]\n${text}`).join('\n\n')
-}
-
-function parseKiroChatRequest(body, limits) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    throw invalidKiroRequest('Body chat Kiro harus berupa object', 'invalid_request')
-  }
-  if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    throw invalidKiroRequest('messages wajib berupa array non-kosong', 'invalid_messages')
-  }
-  if (body.n !== undefined && body.n !== 1) {
-    throw invalidKiroRequest('Kiro hanya mendukung n=1', 'kiro_single_choice_only')
-  }
-  for (const field of ['tools', 'tool_choice', 'functions', 'function_call', 'parallel_tool_calls']) {
-    if (body[field] !== undefined) {
-      throw invalidKiroRequest(`Kiro inference-only tidak mendukung ${field}`, 'kiro_tools_unsupported')
-    }
-  }
-  if (body.response_format !== undefined) {
-    throw invalidKiroRequest('Kiro tidak mendukung jaminan response_format', 'kiro_response_format_unsupported')
-  }
-  if (body.audio !== undefined) {
-    throw invalidKiroRequest('Kiro tidak mendukung output audio', 'kiro_audio_unsupported')
-  }
-  if (body.modalities !== undefined) {
-    if (!Array.isArray(body.modalities) || body.modalities.some((modality) => modality !== 'text')) {
-      throw invalidKiroRequest('Kiro hanya mendukung modality text', 'kiro_text_only')
-    }
-  }
-
-  const system = []
-  const conversation = []
-  for (let index = 0; index < body.messages.length; index += 1) {
-    const message = body.messages[index]
-    if (!message || typeof message !== 'object' || Array.isArray(message)) {
-      throw invalidKiroRequest(`messages[${index}] harus berupa object`, 'invalid_messages')
-    }
-    const role = message.role
-    if (!['system', 'developer', 'user', 'assistant'].includes(role)) {
-      throw invalidKiroRequest(`Role ${String(role)} tidak didukung Kiro`, 'kiro_role_unsupported')
-    }
-    if (message.tool_calls !== undefined || message.function_call !== undefined) {
-      throw invalidKiroRequest('Kiro inference-only tidak mendukung riwayat tool call', 'kiro_tools_unsupported')
-    }
-    const entry = { role, text: textMessageContent(message.content, index) }
-    if (role === 'system' || role === 'developer') system.push(entry)
-    else conversation.push(entry)
-  }
-
-  const prompt = roleSeparated(conversation)
-  const systemPrompt = roleSeparated(system)
-  if (!prompt.trim()) throw invalidKiroRequest('Chat Kiro membutuhkan pesan user atau assistant berisi teks', 'invalid_messages')
-  if (prompt.length > limits.maxPromptLength) {
-    throw invalidKiroRequest(`Prompt melebihi batas ${limits.maxPromptLength} karakter`, 'prompt_too_long')
-  }
-  if (systemPrompt.length > limits.maxSystemPromptLength) {
-    throw invalidKiroRequest(`System prompt melebihi batas ${limits.maxSystemPromptLength} karakter`, 'system_prompt_too_long')
-  }
-  return { messages: conversation, systemPrompt }
-}
-
-function mapKiroHttpError(error) {
-  const known = {
-    KIRO_AUTH_REJECTED: [401, 'kiro_auth_failed', 'Kiro API key ditolak oleh runtime Kiro', false],
-    KIRO_RATE_LIMITED: [429, 'kiro_rate_limited', 'Runtime Kiro sedang membatasi permintaan', true],
-    KIRO_TIMEOUT: [504, 'kiro_timeout', 'Runtime Kiro melewati batas waktu', true],
-    KIRO_UNREACHABLE: [503, 'kiro_unavailable', 'Runtime Kiro tidak dapat dihubungi', true],
-    KIRO_INVALID_REQUEST: [502, 'kiro_invalid_upstream_request', 'Runtime Kiro menolak format permintaan', false],
-    KIRO_MALFORMED_STREAM: [502, 'kiro_malformed_stream', 'Runtime Kiro mengirim stream yang tidak valid', true],
-    KIRO_MAX_OUTPUT: [502, 'kiro_max_output', 'Respons Kiro melebihi batas output', true],
-    KIRO_API_KEY_REQUIRED: [500, 'kiro_auth_configuration', 'Konfigurasi autentikasi Kiro tidak valid', false],
-  }
-  const [status, code, message, retryable] = known[error?.code]
-    ?? [Number(error?.status) || 502, 'kiro_failed', 'Runtime Kiro gagal menyelesaikan permintaan', true]
-  return Object.assign(new Error(message), { status, code, retryable })
-}
-
 /**
  * Petakan error validator bearer HTTPS ke status admin API. Pesan validator
  * sudah teredaksi, jadi aman diteruskan; yang tidak dikenali dijadikan 502
@@ -310,22 +220,6 @@ function mapKiroBearerError(error) {
   const [status, code, message] = known[error?.code]
     ?? [error?.status ?? 502, 'kiro_failed', 'Validasi Kiro API key gagal']
   return Object.assign(new Error(message), { status, code, retryable: status >= 500 })
-}
-
-function sseData(response, payload) {
-  response.write(`data: ${JSON.stringify(payload)}\n\n`)
-}
-
-function openAiUsage(usage) {
-  if (!usage) return null
-  return {
-    prompt_tokens: Number(usage.inputTokens) || 0,
-    completion_tokens: Number(usage.outputTokens) || 0,
-    total_tokens: Number(usage.totalTokens) || 0,
-    ...(Number(usage.cacheReadTokens) > 0
-      ? { prompt_tokens_details: { cached_tokens: Number(usage.cacheReadTokens) } }
-      : {}),
-  }
 }
 
 export function createGatewayServer(options = {}) {
@@ -408,21 +302,34 @@ export function createGatewayServer(options = {}) {
     maxOutputBytes: limits.maxOutputBytes,
   })
   // Validasi dan inference berbagi transport HTTPS, region, dan credential
-  // connection. Tidak ada jalur production yang menjalankan binary Kiro.
+  // connection. Binary Kiro hanya akan hidup pada provider ACP terpisah.
   const kiroBearerValidator = options.kiroBearerValidator ?? createKiroBearerValidator({
     fetchImpl: options.kiroFetchImpl ?? fetchImpl,
     assertHost: skipKiroHostGuard ? async () => {} : assertPublicHost,
   })
+  const kiroProviderOptions = {
+    client: kiroHttpClient,
+    getConnection: (id) => id ? connectionStore.getWithSecret(id) : null,
+  }
   const providers = options.providers ?? [
     claudeCliProvider,
-    createKiroCliProvider({
-      client: kiroHttpClient,
-      getConnection: (id) => id ? connectionStore.getWithSecret(id) : null,
-    }),
+    createKiroInferenceProvider(kiroProviderOptions),
+    createKiroInferenceAlias(kiroProviderOptions),
   ]
   const providerMap = new Map(providers.map((provider) => [provider.id, provider]))
   const providerForId = (id) => providerMap.get(id) ?? null
   const providerSummaries = providers.map(({ id, label, capabilities }) => ({ id, label, capabilities }))
+  const connectionDrivers = options.connectionDrivers ?? [
+    {
+      id: 'openai-http',
+      kinds: ['openai-http'],
+      retryableByStatus: true,
+      attempt: attemptUpstream,
+    },
+    createKiroInferenceDriver({ client: kiroHttpClient, limits }),
+  ]
+  const connectionDriverRegistry = options.connectionDriverRegistry
+    ?? createConnectionDriverRegistry(connectionDrivers)
 
   // Rate limiter per (API key + connection). Nonaktif bila refill/capacity <= 0.
   const rateLimiterEnabled = limits.rateCapacity > 0 && limits.rateRefillPerSec > 0
@@ -632,148 +539,6 @@ export function createGatewayServer(options = {}) {
     }
   }
 
-  async function attemptKiro({ connection, upstreamModel, body, request, response, headers, requestId }) {
-    if (connection.authMode !== 'api-key' || !connection.apiKey) {
-      throw invalidKiroRequest(
-        'Connection Kiro membutuhkan API key tersimpan',
-        'kiro_api_key_required',
-      )
-    }
-    if (!connection.models.includes(upstreamModel)) {
-      throw invalidKiroRequest(
-        `Model Kiro tidak aktif: ${upstreamModel}`,
-        'kiro_model_not_active',
-      )
-    }
-    const { messages, systemPrompt } = parseKiroChatRequest(body, limits)
-    const completionId = `chatcmpl_${randomUUID()}`
-    const created = Math.floor(Date.now() / 1000)
-    const model = body.model
-    const chunks = []
-    const abortController = new AbortController()
-    let responseStarted = false
-    let finished = false
-    let disconnected = false
-
-    const startStream = () => {
-      if (responseStarted || disconnected) return
-      responseStarted = true
-      response.writeHead(200, {
-        ...headers,
-        'content-type': 'text/event-stream; charset=utf-8',
-        'cache-control': 'no-cache',
-        connection: 'keep-alive',
-        'x-request-id': requestId,
-      })
-      sseData(response, {
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-      })
-    }
-
-    const disconnect = () => {
-      if (finished || response.writableEnded) return
-      disconnected = true
-      abortController.abort()
-    }
-    const detach = () => {
-      request.off('aborted', disconnect)
-      response.off('close', disconnect)
-    }
-    request.once('aborted', disconnect)
-    response.once('close', disconnect)
-
-    let usage = null
-    try {
-      const result = await kiroHttpClient.generate({
-        apiKey: connection.apiKey,
-        region: connection.region,
-        profileArn: connection.profileArn,
-        model: upstreamModel,
-        messages,
-        systemPrompt,
-        signal: abortController.signal,
-        onOpen() {
-          if (body.stream === true) startStream()
-        },
-        onChunk(text) {
-          if (disconnected) return
-          if (body.stream === true) {
-            startStream()
-            sseData(response, {
-              id: completionId,
-              object: 'chat.completion.chunk',
-              created,
-              model,
-              choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-            })
-          } else {
-            chunks.push(text)
-          }
-        },
-      })
-      usage = result.usage
-    } catch (error) {
-      if (disconnected || error?.code === 'KIRO_CANCELLED') {
-        finished = true
-        detach()
-        return { done: true, status: 499, usage: null, errorCategory: 'client_disconnected' }
-      }
-      const mapped = mapKiroHttpError(error)
-      finished = true
-      detach()
-      if (!responseStarted) throw mapped
-      sseData(response, {
-        error: {
-          message: mapped.message,
-          type: 'gateway_error',
-          code: mapped.code,
-        },
-      })
-      response.end('data: [DONE]\n\n')
-      return {
-        done: true,
-        status: mapped.status,
-        usage: null,
-        errorCategory: mapped.code,
-      }
-    }
-
-    finished = true
-    detach()
-    if (body.stream === true) {
-      startStream()
-      const finish = {
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      }
-      if (body.stream_options?.include_usage === true && usage) finish.usage = openAiUsage(usage)
-      sseData(response, finish)
-      response.end('data: [DONE]\n\n')
-    } else {
-      const payload = {
-        id: completionId,
-        object: 'chat.completion',
-        created,
-        model,
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: chunks.join('') },
-          finish_reason: 'stop',
-        }],
-      }
-      if (usage) payload.usage = openAiUsage(usage)
-      sendJson(response, 200, payload, { ...headers, 'x-request-id': requestId })
-    }
-    return { done: true, status: 200, usage, errorCategory: null }
-  }
-
   // Proxy generik untuk resource OpenAI-compatible (chat/completions,
   // completions, embeddings). Melakukan resolusi model+alias dan failover
   // ke connection kandidat berikutnya saat kena 429/5xx.
@@ -792,15 +557,11 @@ export function createGatewayServer(options = {}) {
       const separator = resolvedModel.indexOf('/')
       const explicitConnectionId = separator > 0 ? resolvedModel.slice(0, separator) : ''
       const explicit = connections.find((connection) => connection.id === explicitConnectionId)
-      if (
-        explicit?.kind === 'kiro-cli'
-        && !explicit.models.includes(candidates[0].upstreamModel)
-      ) {
-        throw invalidKiroRequest(
-          `Model Kiro tidak aktif: ${candidates[0].upstreamModel}`,
-          'kiro_model_not_active',
-        )
-      }
+      const explicitDriver = connectionDriverRegistry.forConnection(explicit)
+      explicitDriver?.validateCandidate?.({
+        connection: explicit,
+        upstreamModel: candidates[0].upstreamModel,
+      })
 
       let lastError = null
       for (let i = 0; i < candidates.length; i += 1) {
@@ -816,42 +577,35 @@ export function createGatewayServer(options = {}) {
         lastUpstreamModel = candidate.upstreamModel
         const hasMore = i < candidates.length - 1
 
+        const driver = connectionDriverRegistry.forConnection(connection)
+        if (!driver) {
+          throw Object.assign(new Error(`Connection kind tidak didukung: ${connection.kind}`), {
+            status: 400,
+            code: 'unsupported_connection_kind',
+            retryable: false,
+          })
+        }
+
         let result
         try {
-          if (connection.kind === 'kiro-cli') {
-            if (resource !== 'chat/completions') {
-              throw invalidKiroRequest(
-                `Kiro tidak mendukung endpoint /v1/${resource}`,
-                `kiro_${resource.replace('/', '_')}_unsupported`,
-              )
-            }
-            result = await attemptKiro({
-              connection,
-              upstreamModel: candidate.upstreamModel,
-              body,
-              request,
-              response,
-              headers,
-              requestId,
-            })
-          } else {
-            result = await attemptUpstream({
-              resource,
-              connection,
-              upstreamModel: candidate.upstreamModel,
-              body,
-              response,
-              headers,
-              requestId,
-            })
-          }
+          result = await driver.attempt({
+            resource,
+            connection,
+            upstreamModel: candidate.upstreamModel,
+            body,
+            request,
+            response,
+            headers,
+            requestId,
+          })
         } catch (error) {
           status = Number(error.status) || (error.name === 'AbortError' ? 504 : 502)
           errorCategory = error.name === 'AbortError'
             ? 'upstream_timeout'
             : error.code ?? 'gateway_failure'
           lastError = error
-          const retryable = error.retryable ?? (connection.kind !== 'kiro-cli' && isFailoverStatus(status))
+          const retryable = error.retryable
+            ?? (driver.retryableByStatus === true && isFailoverStatus(status))
           if (retryable && hasMore && !response.headersSent) continue
           throw error
         }

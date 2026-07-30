@@ -292,6 +292,36 @@ test('Kiro Playground requires a selected connection and streams with its stored
   assert.deepEqual(inference.messages, [{ role: 'user', text: 'hello' }])
 })
 
+test('canonical Kiro inference provider coexists with the legacy kiro-cli alias', async (t) => {
+  const { baseUrl, wsUrl, kiroHttpClient } = await setupGateway(t)
+  await createKiroConnection(baseUrl)
+  const client = connect(wsUrl)
+  t.after(() => client.socket.close())
+  await client.opened
+
+  const hello = await client.next((message) => message.type === 'hello')
+  const canonical = hello.providers.find((provider) => provider.id === 'kiro-inference')
+  const legacy = hello.providers.find((provider) => provider.id === 'kiro-cli')
+  assert.equal(canonical.label, 'Kiro HTTPS Inference')
+  assert.equal(legacy.label, 'Kiro HTTPS')
+  assert.deepEqual(canonical.capabilities, legacy.capabilities)
+
+  client.socket.send(JSON.stringify(runMessage({
+    providerId: 'kiro-inference',
+    connectionId: 'kiro-main',
+    sessionId: 'canonical-inference',
+  })))
+  const session = await client.next((message) => message.type === 'session')
+  assert.equal(session.providerId, 'kiro-inference')
+  assert.equal(session.sessionId, 'canonical-inference')
+  await client.next((message) => message.type === 'chunk')
+  await client.next((message) => message.type === 'chunk')
+  const done = await client.next((message) => message.type === 'done')
+  assert.equal(done.providerId, 'kiro-inference')
+  assert.equal(done.reason, 'completed')
+  assert.equal(kiroHttpClient.calls.length, 1)
+})
+
 test('Kiro Playground cancellation aborts HTTPS inference', async (t) => {
   const { baseUrl, wsUrl, kiroHttpClient } = await setupGateway(t)
   await createKiroConnection(baseUrl)
