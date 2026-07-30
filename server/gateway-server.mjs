@@ -23,6 +23,7 @@ import { RateLimiter } from './gateway/rate-limiter.mjs'
 import { PricingTable } from './gateway/pricing.mjs'
 import { loadAliases } from './gateway/aliases.mjs'
 import { createKiroHttpClient } from './gateway/kiro-http.mjs'
+import { API_KEY_SCOPES, ApiKeyStore, looksLikeManagedKey } from './gateway/api-key-store.mjs'
 
 for (const provider of [claudeCliProvider, kiroCliProvider]) {
   try {
@@ -389,6 +390,15 @@ export function createGatewayServer(options = {}) {
       .catch(() => {})
   }
   const usageStore = options.usageStore ?? new UsageStore({ dataDir, pricingTable })
+  // API key gateway yang dibuat lewat dashboard. GATEWAY_API_KEY dari env tetap
+  // hidup sebagai bootstrap/emergency key dan tidak tersimpan di store ini.
+  const apiKeyStore = options.apiKeyStore ?? new ApiKeyStore({ dataDir, masterKey })
+  // Statistik pemakaian key di-buffer di memori, lalu di-flush berkala supaya
+  // request /v1 tidak menulis disk satu per satu.
+  const apiKeyUsageFlusher = setInterval(() => {
+    apiKeyStore.flushUsage().catch(() => {})
+  }, 30_000)
+  apiKeyUsageFlusher.unref?.()
   const fetchImpl = options.fetchImpl ?? fetch
   const skipKiroHostGuard = Boolean(options.fetchImpl || options.kiroFetchImpl)
   const kiroHttpClient = options.kiroHttpClient ?? createKiroHttpClient({
@@ -456,6 +466,92 @@ export function createGatewayServer(options = {}) {
     } catch (error) {
       throw mapKiroBearerError(error)
     }
+  }
+
+  /**
+   * Auth untuk /v1/*. Dua jalur:
+   *  - Bootstrap/emergency key dari GATEWAY_API_KEY (env). Selalu penuh scope,
+   *    tidak punya record, keyId null di telemetry.
+   *  - Managed key `onex_sk_…` yang dibuat lewat dashboard: dicek hash-nya,
+   *    lalu scope/expiry/revoke/rate limit-nya diberlakukan.
+   *
+   * Return { ok: true, auth } atau { ok: false, status, message, code }.
+   */
+  async function authorizeApiRequest(request) {
+    const presented = bearerToken(request)
+    if (!presented) {
+      return { ok: false, status: 401, message: 'API key gateway tidak valid', code: 'invalid_api_key' }
+    }
+
+    // Bootstrap key dulu supaya tetap berfungsi meski store bermasalah.
+    if (!looksLikeManagedKey(presented) && safeEqual(presented, apiKey)) {
+      return {
+        ok: true,
+        auth: {
+          keyId: null,
+          keyName: 'Bootstrap (GATEWAY_API_KEY)',
+          scopes: [...API_KEY_SCOPES],
+          rateLimit: null,
+          bootstrap: true,
+        },
+      }
+    }
+
+    let verified
+    try {
+      verified = await apiKeyStore.verify(presented)
+    } catch {
+      return { ok: false, status: 500, message: 'API key store tidak bisa dibaca', code: 'api_key_store_error' }
+    }
+    if (!verified.ok) {
+      const reasons = {
+        revoked: [401, 'API key gateway sudah dicabut', 'api_key_revoked'],
+        disabled: [401, 'API key gateway sedang dinonaktifkan', 'api_key_disabled'],
+        expired: [401, 'API key gateway sudah kedaluwarsa', 'api_key_expired'],
+      }
+      const [status, message, code] = reasons[verified.reason]
+        ?? [401, 'API key gateway tidak valid', 'invalid_api_key']
+      return { ok: false, status, message, code }
+    }
+
+    return {
+      ok: true,
+      auth: {
+        keyId: verified.key.id,
+        keyName: verified.key.name,
+        scopes: verified.key.scopes,
+        rateLimit: verified.key.rateLimit,
+        bootstrap: false,
+      },
+    }
+  }
+
+  function requireScope(auth, scope) {
+    if (auth.scopes.includes(scope)) return null
+    return {
+      status: 403,
+      message: `API key tidak punya scope ${scope}`,
+      code: 'insufficient_scope',
+    }
+  }
+
+  // Rate limiter per key (opsional, dari record key). Dipisah dari limiter
+  // global supaya limit per key tidak saling mencuri token.
+  const perKeyLimiters = new Map()
+  function perKeyLimiterFor(auth) {
+    if (!auth.rateLimit) return null
+    const existing = perKeyLimiters.get(auth.keyId)
+    if (
+      existing
+      && existing.capacity === auth.rateLimit.capacity
+      && existing.refillPerSec === auth.rateLimit.refillPerSec
+    ) return existing.limiter
+    const limiter = new RateLimiter({
+      capacity: auth.rateLimit.capacity,
+      refillPerSec: auth.rateLimit.refillPerSec,
+    })
+    perKeyLimiters.set(auth.keyId, { ...auth.rateLimit, limiter })
+    return limiter
   }
 
   // Admin surface menerima dua jalur auth:
@@ -681,7 +777,7 @@ export function createGatewayServer(options = {}) {
   // Proxy generik untuk resource OpenAI-compatible (chat/completions,
   // completions, embeddings). Melakukan resolusi model+alias dan failover
   // ke connection kandidat berikutnya saat kena 429/5xx.
-  async function proxyResource(request, response, body, headers, resource) {
+  async function proxyResource(request, response, body, headers, resource, auth = null) {
     const requestId = `req_${randomUUID()}`
     const startedAt = Date.now()
     let usage = null
@@ -794,6 +890,8 @@ export function createGatewayServer(options = {}) {
           await usageStore.append({
             requestId,
             connectionId: lastConnectionId,
+            keyId: auth?.keyId ?? null,
+            keyName: auth?.keyName ?? null,
             model: lastUpstreamModel,
             stream: body.stream === true,
             status,
@@ -832,10 +930,25 @@ export function createGatewayServer(options = {}) {
 
     try {
       if (url.pathname.startsWith('/v1/')) {
-        if (!safeEqual(bearerToken(request), apiKey)) {
-          apiError(response, 401, 'API key gateway tidak valid', 'invalid_api_key', headers)
+        const authResult = await authorizeApiRequest(request)
+        if (!authResult.ok) {
+          apiError(response, authResult.status, authResult.message, authResult.code, headers)
           return
         }
+        const auth = authResult.auth
+        // Statistik pemakaian key (buffered, di-flush berkala).
+        apiKeyStore.touch(auth.keyId)
+
+        // Scope: pembacaan katalog model vs. pemakaian inference dipisah.
+        const requiredScope = request.method === 'GET' && url.pathname.startsWith('/v1/models')
+          ? 'models:read'
+          : 'chat:write'
+        const scopeError = requireScope(auth, requiredScope)
+        if (scopeError) {
+          apiError(response, scopeError.status, scopeError.message, scopeError.code, headers)
+          return
+        }
+
         if (request.method === 'GET' && url.pathname === '/v1/models') {
           const connections = (await connectionStore.list()).filter((item) => item.enabled)
           const data = connections.flatMap((connection) => connection.models.map((model) => ({
@@ -890,8 +1003,8 @@ export function createGatewayServer(options = {}) {
           const body = await readJson(request, limits.maxBodyBytes)
           // Rate limit per (API key + connection kandidat pertama). Resolusi model
           // dipakai untuk menentukan connection; kalau gagal, pakai key generik.
-          if (rateLimiter) {
-            let rateKey = 'unknown'
+          let rateKey = 'unknown'
+          if (rateLimiter || auth.rateLimit) {
             try {
               const { candidates } = resolveModelCandidates(body.model, {
                 aliases,
@@ -901,17 +1014,26 @@ export function createGatewayServer(options = {}) {
             } catch {
               // model invalid/tak tersedia → tetap rate limit agar bukan jalur bypass.
             }
-            const { allowed, retryAfterMs } = rateLimiter.take(`v1:${rateKey}`)
+          }
+          // Limit khusus milik key (kalau di-set di dashboard) diperiksa lebih
+          // dulu; batas global tetap berlaku sebagai plafon.
+          const keyLimiter = perKeyLimiterFor(auth)
+          for (const [limiter, bucketKey, label] of [
+            [keyLimiter, `key:${auth.keyId}`, auth.keyName ?? 'API key'],
+            [rateLimiter, `v1:${auth.keyId ?? 'bootstrap'}:${rateKey}`, rateKey],
+          ]) {
+            if (!limiter) continue
+            const { allowed, retryAfterMs } = limiter.take(bucketKey)
             if (!allowed) {
               const retryAfter = Math.ceil(retryAfterMs / 1000)
-              apiError(response, 429, `Rate limit terlampaui untuk ${rateKey}, coba lagi dalam ${retryAfter}s`, 'rate_limited', {
+              apiError(response, 429, `Rate limit terlampaui untuk ${label}, coba lagi dalam ${retryAfter}s`, 'rate_limited', {
                 ...headers,
                 'retry-after': String(retryAfter),
               })
               return
             }
           }
-          await proxyResource(request, response, body, headers, resource)
+          await proxyResource(request, response, body, headers, resource, auth)
           return
         }
         apiError(response, 404, 'Endpoint tidak ditemukan', 'not_found', headers)
@@ -1161,7 +1283,47 @@ export function createGatewayServer(options = {}) {
           }, headers)
           return
         }
+        // --- API key gateway (client-facing) ---
+        // Plaintext hanya dikembalikan sekali, di respons create/rotate.
+        if (url.pathname === '/admin/api-keys') {
+          if (request.method === 'GET') {
+            sendJson(response, 200, {
+              data: { keys: await apiKeyStore.list(), scopes: [...API_KEY_SCOPES] },
+            }, headers)
+            return
+          }
+          if (request.method === 'POST') {
+            const input = await readJson(request, limits.maxBodyBytes)
+            sendJson(response, 201, { data: await apiKeyStore.create(input) }, headers)
+            return
+          }
+        }
+        const apiKeyMatch = url.pathname.match(/^\/admin\/api-keys\/(key_[a-f0-9]{16})$/)
+        if (apiKeyMatch && request.method === 'PATCH') {
+          const input = await readJson(request, limits.maxBodyBytes)
+          sendJson(response, 200, { data: await apiKeyStore.update(apiKeyMatch[1], input) }, headers)
+          return
+        }
+        if (apiKeyMatch && request.method === 'DELETE') {
+          // ?mode=revoke menyimpan record (jejak audit) tapi mematikan key;
+          // default menghapus record sepenuhnya.
+          const revokeOnly = url.searchParams.get('mode') === 'revoke'
+          sendJson(response, 200, {
+            data: revokeOnly
+              ? await apiKeyStore.revoke(apiKeyMatch[1])
+              : await apiKeyStore.delete(apiKeyMatch[1]),
+          }, headers)
+          return
+        }
+        const rotateMatch = url.pathname.match(/^\/admin\/api-keys\/(key_[a-f0-9]{16})\/rotate$/)
+        if (rotateMatch && request.method === 'POST') {
+          sendJson(response, 200, { data: await apiKeyStore.rotate(rotateMatch[1]) }, headers)
+          return
+        }
+
         if (request.method === 'GET' && url.pathname === '/admin/usage') {
+          // Pastikan hitungan pemakaian key terbaru ikut terlihat di dashboard.
+          await apiKeyStore.flushUsage().catch(() => {})
           sendJson(response, 200, { data: await usageStore.aggregate(url.searchParams.get('range') ?? '7d') }, headers)
           return
         }
@@ -1302,6 +1464,7 @@ export function createGatewayServer(options = {}) {
     wss,
     connectionStore,
     usageStore,
+    apiKeyStore,
     config: { host, port, allowedOrigins, generatedTokens, wsToken, apiKey, adminToken, dataDir },
     listen() {
       return new Promise((resolveListen, reject) => {
@@ -1314,6 +1477,9 @@ export function createGatewayServer(options = {}) {
     },
     close() {
       if (rateSweeper) clearInterval(rateSweeper)
+      clearInterval(apiKeyUsageFlusher)
+      // Jangan sampai hitungan pemakaian key yang masih di buffer hilang saat shutdown.
+      apiKeyStore.flushUsage().catch(() => {})
       for (const client of wss.clients) client.terminate()
       return new Promise((resolveClose, reject) => {
         wss.close(() => httpServer.close((error) => (error ? reject(error) : resolveClose())))

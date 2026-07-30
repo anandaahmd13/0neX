@@ -50,6 +50,10 @@ export class UsageStore {
       requestId: String(event.requestId),
       timestamp: event.timestamp ?? new Date().toISOString(),
       connectionId: String(event.connectionId),
+      // Key gateway mana yang memakai token. null = bootstrap key dari
+      // GATEWAY_API_KEY (tidak punya record di api-key store).
+      keyId: event.keyId ? String(event.keyId).slice(0, 100) : null,
+      keyName: event.keyName ? String(event.keyName).slice(0, 100) : null,
       model: String(event.model),
       stream: event.stream === true,
       status: Number(event.status) || 500,
@@ -144,6 +148,7 @@ export class UsageStore {
     )
 
     const groups = new Map()
+    const keyGroups = new Map()
     const timeBuckets = new Map()
     let successes = 0
     let latencyTotal = 0
@@ -182,6 +187,34 @@ export class UsageStore {
       }
       groups.set(key, group)
 
+      // Breakdown per API key gateway: menjawab "key/client mana yang memakai
+      // token". keyId null = bootstrap key dari GATEWAY_API_KEY.
+      const keyId = event.keyId ?? 'bootstrap'
+      const keyGroup = keyGroups.get(keyId) ?? {
+        keyId: event.keyId ?? null,
+        keyName: event.keyName ?? (event.keyId ? null : 'Bootstrap (GATEWAY_API_KEY)'),
+        requests: 0,
+        successes: 0,
+        totalTokens: 0,
+        knownTokenRequests: 0,
+        latencyTotal: 0,
+        totalCostUsd: 0,
+        lastUsedAt: null,
+      }
+      keyGroup.requests += 1
+      keyGroup.successes += event.success ? 1 : 0
+      keyGroup.latencyTotal += Number(event.latencyMs) || 0
+      if (cost != null) keyGroup.totalCostUsd += cost
+      if (event.usage?.totalTokens != null) {
+        keyGroup.totalTokens += event.usage.totalTokens
+        keyGroup.knownTokenRequests += 1
+      }
+      if (event.keyName) keyGroup.keyName = event.keyName
+      if (!keyGroup.lastUsedAt || event.timestamp > keyGroup.lastUsedAt) {
+        keyGroup.lastUsedAt = event.timestamp
+      }
+      keyGroups.set(keyId, keyGroup)
+
       const date = new Date(event.timestamp)
       const bucket = normalizedRange === '24h'
         ? `${date.toISOString().slice(0, 13)}:00:00.000Z`
@@ -210,6 +243,19 @@ export class UsageStore {
           totalTokens: group.totalTokens,
           knownTokenRequests: group.knownTokenRequests,
           totalCostUsd: group.totalCostUsd,
+        }))
+        .sort((left, right) => right.requests - left.requests),
+      keyBreakdown: [...keyGroups.values()]
+        .map((group) => ({
+          keyId: group.keyId,
+          keyName: group.keyName,
+          requests: group.requests,
+          successRate: group.requests ? (group.successes / group.requests) * 100 : 0,
+          averageLatencyMs: group.requests ? group.latencyTotal / group.requests : 0,
+          totalTokens: group.totalTokens,
+          knownTokenRequests: group.knownTokenRequests,
+          totalCostUsd: group.totalCostUsd,
+          lastUsedAt: group.lastUsedAt,
         }))
         .sort((left, right) => right.requests - left.requests),
       timeSeries: [...timeBuckets.entries()]
